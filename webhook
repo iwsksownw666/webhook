@@ -1,0 +1,1046 @@
+local WINDUI_URL = "https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"
+local WINDUI_CACHE = "WindUI_MainCache.lua"
+local WINDUI_MIN_SOURCE_SIZE = 1000
+local WEBHOOK_RUN_TOKEN = {}
+_G.BonesHubWebhookRunToken = WEBHOOK_RUN_TOKEN
+
+local function validWindUI(lib)
+    return type(lib) == "table" and type(lib.CreateWindow) == "function"
+end
+
+local function createFallbackUI()
+    local fallback = {}
+    local UserInputService = game:GetService("UserInputService")
+
+    local parent = game:GetService("CoreGui")
+    pcall(function()
+        if gethui then
+            local executorGui = gethui()
+            if executorGui then parent = executorGui end
+        end
+    end)
+    local old = parent:FindFirstChild("BonesHubWebhookUI")
+    if old then old:Destroy() end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "BonesHubWebhookUI"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    local parented = pcall(function() gui.Parent = parent end)
+    if not parented then
+        gui.Parent = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
+    end
+
+    local function round(instance, radius)
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, radius or 6)
+        corner.Parent = instance
+    end
+
+    local function makeText(parentObject, text, size, color)
+        local label = Instance.new("TextLabel")
+        label.BackgroundTransparency = 1
+        label.Size = size
+        label.Font = Enum.Font.Gotham
+        label.Text = text or ""
+        label.TextColor3 = color or Color3.fromRGB(235, 238, 245)
+        label.TextSize = 14
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = parentObject
+        return label
+    end
+
+    function fallback:SetTheme() end
+
+    function fallback:Notify(config)
+        local notice = Instance.new("TextLabel")
+        notice.AnchorPoint = Vector2.new(0.5, 1)
+        notice.Position = UDim2.new(0.5, 0, 1, -20)
+        notice.Size = UDim2.fromOffset(360, 42)
+        notice.BackgroundColor3 = Color3.fromRGB(35, 38, 46)
+        notice.TextColor3 = Color3.fromRGB(245, 247, 250)
+        notice.Font = Enum.Font.GothamMedium
+        notice.TextSize = 14
+        notice.Text = tostring(config.Title or "") .. "  " .. tostring(config.Content or "")
+        notice.Parent = gui
+        round(notice, 6)
+        task.delay(tonumber(config.Duration) or 2, function()
+            if notice.Parent then notice:Destroy() end
+        end)
+    end
+
+    function fallback:CreateWindow(config)
+        local frame = Instance.new("Frame")
+        frame.Name = "Window"
+        frame.AnchorPoint = Vector2.new(0.5, 0.5)
+        frame.Position = UDim2.fromScale(0.5, 0.5)
+        frame.Size = config.Size or UDim2.fromOffset(500, 420)
+        frame.BackgroundColor3 = Color3.fromRGB(22, 24, 30)
+        frame.BorderSizePixel = 0
+        frame.Parent = gui
+        round(frame, 7)
+
+        local titleBar = Instance.new("Frame")
+        titleBar.Size = UDim2.new(1, 0, 0, 46)
+        titleBar.BackgroundColor3 = Color3.fromRGB(30, 33, 40)
+        titleBar.BorderSizePixel = 0
+        titleBar.Parent = frame
+        round(titleBar, 7)
+
+        local title = makeText(titleBar, config.Title or "bones hub", UDim2.new(1, -56, 1, 0))
+        title.Position = UDim2.fromOffset(16, 0)
+        title.Font = Enum.Font.GothamBold
+        title.TextSize = 17
+
+        local close = Instance.new("TextButton")
+        close.AnchorPoint = Vector2.new(1, 0.5)
+        close.Position = UDim2.new(1, -12, 0.5, 0)
+        close.Size = UDim2.fromOffset(28, 28)
+        close.BackgroundColor3 = Color3.fromRGB(55, 58, 68)
+        close.Text = "X"
+        close.TextColor3 = Color3.fromRGB(235, 238, 245)
+        close.Font = Enum.Font.GothamBold
+        close.TextSize = 13
+        close.Parent = titleBar
+        round(close, 5)
+        close.Activated:Connect(function() gui.Enabled = false end)
+
+        local content = Instance.new("ScrollingFrame")
+        content.Position = UDim2.fromOffset(10, 54)
+        content.Size = UDim2.new(1, -20, 1, -64)
+        content.BackgroundTransparency = 1
+        content.BorderSizePixel = 0
+        content.ScrollBarThickness = 4
+        content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        content.CanvasSize = UDim2.new()
+        content.Parent = frame
+
+        local layout = Instance.new("UIListLayout")
+        layout.Padding = UDim.new(0, 7)
+        layout.SortOrder = Enum.SortOrder.LayoutOrder
+        layout.Parent = content
+
+        local padding = Instance.new("UIPadding")
+        padding.PaddingBottom = UDim.new(0, 8)
+        padding.Parent = content
+
+        local dragging = false
+        local dragStart
+        local startPosition
+        titleBar.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                dragStart = input.Position
+                startPosition = frame.Position
+            end
+        end)
+        UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
+        end)
+        UserInputService.InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                local delta = input.Position - dragStart
+                frame.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+            end
+        end)
+
+        local window = {}
+        function window:Tag() end
+        function window:Tab(tabConfig)
+            local heading = makeText(content, tabConfig.Title or "Webhook", UDim2.new(1, -4, 0, 28), Color3.fromRGB(95, 190, 255))
+            heading.Font = Enum.Font.GothamBold
+            heading.TextSize = 15
+            local tab = {}
+
+            function tab:Toggle(item)
+                local state = item.Default == true
+                local button = Instance.new("TextButton")
+                button.Size = UDim2.new(1, -4, 0, 48)
+                button.BackgroundColor3 = Color3.fromRGB(35, 38, 46)
+                button.TextColor3 = Color3.fromRGB(235, 238, 245)
+                button.Font = Enum.Font.GothamMedium
+                button.TextSize = 14
+                button.TextXAlignment = Enum.TextXAlignment.Left
+                button.Parent = content
+                round(button, 6)
+                local function refresh()
+                    button.Text = "  " .. tostring(item.Title or "Toggle") .. (state and "    [ON]" or "    [OFF]")
+                end
+                refresh()
+                button.Activated:Connect(function()
+                    state = not state
+                    refresh()
+                    if item.Callback then task.spawn(item.Callback, state) end
+                end)
+                return button
+            end
+
+            function tab:Input(item)
+                local holder = Instance.new("Frame")
+                holder.Size = UDim2.new(1, -4, 0, 66)
+                holder.BackgroundColor3 = Color3.fromRGB(35, 38, 46)
+                holder.Parent = content
+                round(holder, 6)
+                local label = makeText(holder, item.Title or "Input", UDim2.new(1, -20, 0, 24))
+                label.Position = UDim2.fromOffset(10, 3)
+                label.Font = Enum.Font.GothamMedium
+                local box = Instance.new("TextBox")
+                box.Position = UDim2.fromOffset(10, 29)
+                box.Size = UDim2.new(1, -20, 0, 28)
+                box.BackgroundColor3 = Color3.fromRGB(23, 25, 31)
+                box.TextColor3 = Color3.fromRGB(235, 238, 245)
+                box.PlaceholderColor3 = Color3.fromRGB(135, 140, 152)
+                box.PlaceholderText = item.Placeholder or ""
+                box.Text = item.Value or ""
+                box.ClearTextOnFocus = false
+                box.Font = Enum.Font.Code
+                box.TextSize = 13
+                box.Parent = holder
+                round(box, 5)
+                box:GetPropertyChangedSignal("Text"):Connect(function()
+                    if item.Callback then item.Callback(box.Text) end
+                end)
+                return box
+            end
+
+            function tab:Button(item)
+                local button = Instance.new("TextButton")
+                button.Size = UDim2.new(1, -4, 0, 42)
+                button.BackgroundColor3 = Color3.fromRGB(40, 105, 165)
+                button.TextColor3 = Color3.fromRGB(250, 252, 255)
+                button.Font = Enum.Font.GothamMedium
+                button.TextSize = 14
+                button.Text = tostring(item.Title or "Button")
+                button.Parent = content
+                round(button, 6)
+                button.Activated:Connect(function()
+                    if item.Callback then task.spawn(item.Callback) end
+                end)
+                return button
+            end
+            return tab
+        end
+        return window
+    end
+    return fallback
+end
+
+local function executeWindUISource(source)
+    if type(source) ~= "string" or #source < WINDUI_MIN_SOURCE_SIZE then
+        return nil, "source is empty or truncated", "source"
+    end
+    if type(loadstring) ~= "function" then return nil, "loadstring is unavailable", "compile" end
+
+    local chunk, compileError = loadstring(source)
+    if type(chunk) ~= "function" then return nil, tostring(compileError or "compile failed"), "compile" end
+    local ok, lib = pcall(chunk)
+    if not ok then return nil, tostring(lib), "runtime" end
+    if not validWindUI(lib) then return nil, "WindUI returned an invalid library", "api" end
+    return lib, nil, nil
+end
+
+local function loadWindUI()
+    if validWindUI(_G.WindUICache) then
+        return _G.WindUICache
+    end
+    if validWindUI(_G.WindUI) then
+        _G.WindUICache = _G.WindUI
+        return _G.WindUI
+    end
+
+    if isfile and readfile then
+        local cacheOk, cachedSource = pcall(function()
+            if isfile(WINDUI_CACHE) then return readfile(WINDUI_CACHE) end
+        end)
+        if cacheOk and cachedSource then
+            local cachedLib, cacheError, cacheErrorType = executeWindUISource(cachedSource)
+            if cachedLib then
+                _G.WindUICache = cachedLib
+                return cachedLib
+            end
+            if cacheErrorType == "runtime" or cacheErrorType == "api" then
+                warn("123" .. tostring(cacheError))
+                return createFallbackUI()
+            end
+            pcall(function()
+                if delfile and isfile(WINDUI_CACHE) then delfile(WINDUI_CACHE) end
+            end)
+        end
+    end
+
+    local downloadOk, source = pcall(game.HttpGet, game, WINDUI_URL)
+    if not downloadOk then
+        warn("123" .. tostring(source))
+        return createFallbackUI()
+    end
+    local lib, loadError = executeWindUISource(source)
+    if not lib then
+        warn("123" .. tostring(loadError))
+        return createFallbackUI()
+    end
+
+    pcall(function()
+        if writefile then writefile(WINDUI_CACHE, source) end
+    end)
+    _G.WindUICache = lib
+    return lib
+end
+
+local WindUI = loadWindUI()
+WindUI.TransparencyValue = 0.2
+if type(WindUI.SetTheme) == "function" then pcall(WindUI.SetTheme, WindUI, "Dark") end
+
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local webhookUrl = ""
+local privateServerUrl = ""
+local webhookEnabled = false
+local webhookWaterEnabled = false
+local webhookMerchantEnabled = false
+
+local webhookQueue = {}
+local webhookWorkerRunning = false
+local webhookWorkerLastProgress = tick()
+local webhookWorkerThread = nil
+local webhookWorkerRunId = 0
+local webhookLastBiome = ""
+local webhookBiomeSentAt = 0
+local webhookWaterThread = nil
+local biomeConn = nil
+local biomeAncestryConn = nil
+local biomeDiscoveryConn = nil
+local webhookWaterRunning = false
+local webhookMerchantRunning = false
+local webhookMerchantRemoteConn = nil
+local webhookMerchantAddedConn = nil
+local webhookMerchantRemovingConn = nil
+local webhookMerchantThread = nil
+local webhookLastMerchantAt = {}
+local webhookMerchantSendSerial = 0
+local webhookActiveMerchantModels = setmetatable({}, { __mode = "k" })
+local weatherScanLabelCache = nil
+local WEATHER_KNOWN = {
+    NORMAL = true, WINDY = true, RAINY = true, SNOWY = true, SANDSTORM = true,
+    HELL = true, STARFALL = true, CORRUPTION = true, NULL = true, GLITCHED = true,
+    DREAMSPACE = true, GRAVEYARD = true, ["PUMPKIN MOON"] = true, HEAVEN = true,
+    HOLLOWED = true, CYBERSPACE = true
+}
+
+local WEATHER_RARE = {
+    GLITCHED = true, DREAMSPACE = true, CYBERSPACE = true
+}
+local WEATHER_NAMES = {
+    "PUMPKIN MOON", "SAND STORM", "DREAMSPACE", "CYBERSPACE", "CORRUPTION", "SANDSTORM",
+    "GRAVEYARD", "GLITCHED", "HOLLOWED", "STARFALL", "HEAVEN", "NORMAL",
+    "WINDY", "RAINY", "SNOWY", "HELL", "NULL"
+}
+
+local function normalizeWeatherText(raw)
+    raw = tostring(raw or "")
+    raw = raw:gsub("<[^>]+>", ""):gsub("[%[%]]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+    return raw
+end
+
+local function extractWeather(rawText)
+    local norm = normalizeWeatherText(rawText)
+    if norm == "" then return nil end
+    local up = norm:upper()
+    local aliases = {
+        ["SAND STORM"] = "SANDSTORM", ["SAND-STORM"] = "SANDSTORM", ["SAND_STORM"] = "SANDSTORM",
+        ["PUMPKINMOON"] = "PUMPKIN MOON"
+    }
+    if aliases[up] then return aliases[up] end
+    if WEATHER_KNOWN[up] then return up end
+
+    local bracketed = up:match("^%[([^%]]+)%]$")
+    if bracketed then
+        bracketed = bracketed:gsub("^%s+", ""):gsub("%s+$", "")
+        if aliases[bracketed] then return aliases[bracketed] end
+        if WEATHER_KNOWN[bracketed] then return bracketed end
+    end
+
+    local labeled = up:match("BIOME%s*[:%-]%s*(.+)$") or up:match("WEATHER%s*[:%-]%s*(.+)$")
+    if labeled then
+        labeled = labeled:gsub("[%[%]]", ""):gsub("%s+$", "")
+        if aliases[labeled] then return aliases[labeled] end
+        if WEATHER_KNOWN[labeled] then return labeled end
+    end
+    return nil
+end
+
+local function webhookRequest()
+    return request or http_request or (syn and syn.request) or (_G.http and _G.http.request)
+end
+
+local function validWebhook(url)
+    return type(url) == "string" and url:match("^https://[^/]+/api/webhooks/%d+/[%w%-%._]+") ~= nil
+end
+
+local function webhookResponseStatus(response)
+    if type(response) == "number" then return response end
+    if type(response) == "string" then
+        return tonumber(response) or tonumber(response:match("^(%d%d%d)")) or 0
+    end
+    if type(response) ~= "table" then return 0 end
+    local raw = response.StatusCode or response.Status or response.status_code or response.status
+    local status = tonumber(raw)
+    if not status and raw ~= nil then status = tonumber(tostring(raw):match("(%d%d%d)")) end
+    if not status and response.Success == true then return 204 end
+    return status or 0
+end
+
+local function takeReadyWebhookJob()
+    local now = tick()
+    local readyIndex = nil
+    local earliestReadyAt = math.huge
+    for index = #webhookQueue, 1, -1 do
+        local job = webhookQueue[index]
+        if now - (tonumber(job.createdAt) or now) > 90 then
+            table.remove(webhookQueue, index)
+        else
+            local readyAt = tonumber(job.readyAt) or 0
+            if readyAt <= now and (not readyIndex or index > readyIndex) then
+                readyIndex = index
+            elseif readyAt < earliestReadyAt then
+                earliestReadyAt = readyAt
+            end
+        end
+    end
+    if readyIndex then return table.remove(webhookQueue, readyIndex), 0 end
+    if earliestReadyAt < math.huge then return nil, math.max(earliestReadyAt - now, 0.1) end
+    return nil, 0.25
+end
+
+local runWebhookQueue
+runWebhookQueue = function()
+    if webhookWorkerRunning then return end
+    webhookWorkerRunning = true
+    webhookWorkerLastProgress = tick()
+    webhookWorkerRunId = webhookWorkerRunId + 1
+    local runId = webhookWorkerRunId
+    webhookWorkerThread = task.spawn(function()
+        local workerOk, workerError = xpcall(function()
+            while _G.BonesHubWebhookRunToken == WEBHOOK_RUN_TOKEN
+                and runId == webhookWorkerRunId and #webhookQueue > 0 do
+                webhookWorkerLastProgress = tick()
+                local job, waitTime = takeReadyWebhookJob()
+                if not job then
+                    task.wait(math.min(waitTime, 1))
+                    continue
+                end
+
+                local sent = false
+                local status = 0
+                local retryAfter = nil
+                local fn = webhookRequest()
+                if fn and validWebhook(job.url) then
+                    local ok, response = pcall(fn, {
+                        Url = job.url,
+                        Method = "POST",
+                        Headers = {
+                            ["Content-Type"] = "application/json",
+                            ["User-Agent"] = "bones-hub-webhook/1.0"
+                        },
+                        Body = job.data,
+                        Timeout = 12
+                    })
+                    if ok then status = webhookResponseStatus(response) end
+                    sent = status >= 200 and status < 300
+
+                    if status == 429 and type(response) == "table" then
+                        pcall(function()
+                            local decoded = HttpService:JSONDecode(tostring(response.Body or ""))
+                            retryAfter = tonumber(decoded.retry_after)
+                        end)
+                        if not retryAfter and type(response.Headers) == "table" then
+                            retryAfter = tonumber(response.Headers["Retry-After"] or response.Headers["retry-after"])
+                        end
+                    end
+                end
+
+                if not sent then
+                    job.attempt = (tonumber(job.attempt) or 0) + 1
+                    local retryable = status == 0 or status == 408 or status == 429 or status >= 500
+                    if retryable and job.attempt <= 3 and validWebhook(job.url) then
+                        if retryAfter and retryAfter > 300 then retryAfter = retryAfter / 1000 end
+                        local backoff = retryAfter or math.min(2 ^ job.attempt, 30)
+                        job.readyAt = tick() + math.max(backoff, 1)
+                        webhookQueue[#webhookQueue + 1] = job
+                    else
+                        warn("[Webhook]" .. tostring(status) .. " attempt=" .. tostring(job.attempt))
+                    end
+                else
+                    task.wait(0.5)
+                end
+                webhookWorkerLastProgress = tick()
+            end
+        end, function(err)
+            return tostring(err)
+        end)
+
+        if not workerOk then
+            warn("[Webhook]" .. tostring(workerError))
+        end
+        if runId == webhookWorkerRunId then
+            webhookWorkerRunning = false
+            webhookWorkerThread = nil
+            if #webhookQueue > 0 then task.defer(runWebhookQueue) end
+        end
+    end)
+end
+
+local function httpPost(url, data)
+    if _G.BonesHubWebhookRunToken ~= WEBHOOK_RUN_TOKEN then return false end
+    if not validWebhook(url) or not webhookRequest() then return false end
+    if #webhookQueue >= 25 then
+        warn("123")
+        table.remove(webhookQueue, 1)
+    end
+    webhookQueue[#webhookQueue + 1] = {
+        url = url,
+        data = data,
+        attempt = 0,
+        readyAt = 0,
+        createdAt = tick()
+    }
+    runWebhookQueue()
+    return true
+end
+
+task.spawn(function()
+    while true do
+        if #webhookQueue > 0 and not webhookWorkerRunning then runWebhookQueue() end
+        if #webhookQueue > 0 and webhookWorkerRunning and tick() - webhookWorkerLastProgress > 45 then
+            warn("123")
+            webhookWorkerRunId = webhookWorkerRunId + 1
+            if webhookWorkerThread then pcall(task.cancel, webhookWorkerThread) end
+            webhookWorkerThread = nil
+            webhookWorkerRunning = false
+            runWebhookQueue()
+        end
+        task.wait(15)
+    end
+end)
+
+local function isReadableTextObject(obj)
+    return (obj:IsA("TextLabel") or obj:IsA("TextButton"))
+        and obj.Visible
+        and obj.TextTransparency < 1
+        and obj.AbsoluteSize.X > 0
+        and obj.AbsoluteSize.Y > 0
+end
+
+local function resolveBiomeLabel()
+    if weatherScanLabelCache and weatherScanLabelCache.Parent then
+        local ok, w = pcall(function()
+            return isReadableTextObject(weatherScanLabelCache) and extractWeather(weatherScanLabelCache.Text)
+        end)
+        if ok and w then return weatherScanLabelCache end
+    end
+
+    local mi = playerGui:FindFirstChild("MainInterface")
+    if not mi then return nil end
+
+    for _, child in ipairs(mi:GetChildren()) do
+        local label = child:FindFirstChildWhichIsA("TextLabel")
+            or child:FindFirstChildWhichIsA("TextButton")
+        if label then
+            local text = tostring(label.Text or "")
+            local ok, w = pcall(extractWeather, text)
+            if ok and w then
+                weatherScanLabelCache = label
+                return label
+            end
+        end
+    end
+
+    local descendants = mi:GetDescendants()
+    for i = 1, math.min(#descendants, 120) do
+        local obj = descendants[i]
+        if isReadableTextObject(obj) then
+            local text = tostring(obj.Text or "")
+            if text:find("^%[?Weather?%]?[%s:]+", 1, true)
+                or text:find("^%[?Biome?%]?[%s:]+", 1, true)
+                or text:find("^[Ww][Ee][Aa][Tt][Hh][Ee][Rr]", 1, true)
+                or text:find("^[Bb][Ii][Oo][Mm][Ee]", 1, true)
+                or extractWeather(text) then
+                weatherScanLabelCache = obj
+                return obj
+            end
+        end
+    end
+
+    return nil
+end
+
+local function discordTimestamp()
+    return os.time()
+end
+
+local function validPrivateServerLink(url)
+    return type(url) == "string" and url:match("^https?://%S+$") ~= nil
+end
+
+local function makeBonesEmbed(title, privateLink, timestamp, color)
+    local embed = {
+        title = title,
+        description = privateLink and ("**Private Server Link:** " .. privateLink) or nil,
+        color = color or 3447003,
+        footer = { text = "bones hub" },
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ", timestamp)
+    }
+    return {
+        username = "bones hub",
+        allowed_mentions = { parse = {} },
+        embeds = { embed }
+    }
+end
+
+local function sendBiomeWebhook(biome)
+    if _G.BonesHubWebhookRunToken ~= WEBHOOK_RUN_TOKEN then return end
+    local ok, err = pcall(function()
+        if webhookUrl == "" or not webhookEnabled or not webhookWaterEnabled then return end
+        if not validPrivateServerLink(privateServerUrl) then return end
+        local biomeName = normalizeWeatherText(biome)
+        if biomeName == "" then return end
+        local last = webhookLastBiome or ""
+        if biomeName == last then return end
+        if tick() - webhookBiomeSentAt < 15 then return end
+        local previousBiome = last
+        webhookLastBiome = biomeName
+        webhookBiomeSentAt = tick()
+
+        local isRare = WEATHER_RARE[biomeName] == true
+        local detectedAt = discordTimestamp()
+        if previousBiome ~= "" then
+            httpPost(webhookUrl, HttpService:JSONEncode(makeBonesEmbed("Biome Ended - " .. previousBiome, nil, detectedAt)))
+        end
+        local payload = makeBonesEmbed("Biome Started - " .. biomeName, privateServerUrl, detectedAt)
+        if isRare then
+            payload.content = "@everyone"
+            payload.allowed_mentions = { parse = { "everyone" } }
+        end
+        httpPost(webhookUrl, HttpService:JSONEncode(payload))
+    end)
+    if not ok then warn("失败" .. tostring(err)) end
+end
+
+local function scanWeatherText()
+    local label = resolveBiomeLabel()
+    if label then
+        local ok, w = pcall(extractWeather, label.Text)
+        if ok then return w end
+    end
+    return nil
+end
+
+local function startWater()
+    if webhookWaterRunning then return end
+    webhookWaterRunning = true
+    for index = #webhookQueue, 1, -1 do
+        local body = tostring(webhookQueue[index].data or "")
+        if body:find("Biome Started", 1, true) or body:find("Biome Ended", 1, true) then
+            table.remove(webhookQueue, index)
+        end
+    end
+    webhookLastBiome = ""
+    webhookBiomeSentAt = 0
+    local label = nil
+    local validationCycles = 0
+
+    local function bindLabel(newLabel)
+        if newLabel == label and biomeConn then return end
+        if biomeConn then biomeConn:Disconnect(); biomeConn = nil end
+        if biomeAncestryConn then biomeAncestryConn:Disconnect(); biomeAncestryConn = nil end
+        label = newLabel
+        if not label then return end
+
+        biomeConn = label:GetPropertyChangedSignal("Text"):Connect(function()
+            local ok, weather = pcall(extractWeather, label.Text)
+            if ok and weather and weather ~= webhookLastBiome then
+                sendBiomeWebhook(weather)
+            end
+        end)
+        biomeAncestryConn = label.AncestryChanged:Connect(function(_, parent)
+            if not parent then
+                weatherScanLabelCache = nil
+                bindLabel(nil)
+            end
+        end)
+    end
+
+    bindLabel(resolveBiomeLabel())
+    biomeDiscoveryConn = playerGui.DescendantAdded:Connect(function(obj)
+        if not (obj:IsA("TextLabel") or obj:IsA("TextButton")) then return end
+        local mainInterface = playerGui:FindFirstChild("MainInterface")
+        if not mainInterface or not obj:IsDescendantOf(mainInterface) then return end
+        task.defer(function()
+            if not webhookWaterRunning then return end
+            local currentLabel = resolveBiomeLabel()
+            if currentLabel ~= label then bindLabel(currentLabel) end
+            local ok, weather = pcall(scanWeatherText)
+            if ok and weather and weather ~= webhookLastBiome then sendBiomeWebhook(weather) end
+        end)
+    end)
+    webhookWaterThread = task.spawn(function()
+        while _G.BonesHubWebhookRunToken == WEBHOOK_RUN_TOKEN
+            and webhookWaterRunning and webhookWaterEnabled do
+            local iterationOk, iterationError = pcall(function()
+                validationCycles = validationCycles + 1
+                if validationCycles >= 40 then
+                    validationCycles = 0
+                    weatherScanLabelCache = nil
+                end
+                local currentLabel = resolveBiomeLabel()
+                if currentLabel ~= label then bindLabel(currentLabel) end
+                local weather = scanWeatherText()
+                if weather and weather ~= webhookLastBiome then sendBiomeWebhook(weather) end
+            end)
+            if not iterationOk then
+                warn("[天气webhook 失败" .. tostring(iterationError))
+                weatherScanLabelCache = nil
+                bindLabel(nil)
+            end
+            task.wait(1.5)
+        end
+    end)
+    task.spawn(function()
+        task.wait(3)
+        if not webhookWaterRunning then return end
+        local ok, weather = pcall(scanWeatherText)
+        if ok and weather and weather ~= webhookLastBiome then sendBiomeWebhook(weather) end
+    end)
+end
+
+local function stopWater()
+    webhookWaterRunning = false
+    if biomeConn then biomeConn:Disconnect(); biomeConn = nil end
+    if biomeAncestryConn then biomeAncestryConn:Disconnect(); biomeAncestryConn = nil end
+    if biomeDiscoveryConn then biomeDiscoveryConn:Disconnect(); biomeDiscoveryConn = nil end
+    if webhookWaterThread then pcall(task.cancel, webhookWaterThread); webhookWaterThread = nil end
+end
+
+local function trimText(value)
+    return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function looksLikeGuid(value)
+    value = trimText(value)
+    return #value > 20 and value:match("^[%x%-]+$") ~= nil
+end
+
+local function merchantNameFromValue(value, depth, seen)
+    depth = depth or 0
+    seen = seen or {}
+    if depth > 3 then return nil end
+    if type(value) == "string" then
+        local name = trimText(value)
+        if looksLikeGuid(name) then return nil end
+        return name ~= "" and name or nil
+    end
+    if type(value) ~= "table" or seen[value] then return nil end
+    seen[value] = true
+
+    for _, key in ipairs({ "merchant_name", "merchantName", "MerchantName", "display_name", "DisplayName", "name", "Name", "merchant_id", "merchantId" }) do
+        local name = merchantNameFromValue(value[key], depth + 1, seen)
+        if name then return name end
+    end
+    return nil
+end
+
+local function resolveMerchantModel(candidate)
+    if not candidate then return nil end
+    if candidate:IsA("Model") then return candidate end
+    return candidate:FindFirstAncestorOfClass("Model")
+end
+
+local function inspectMerchantModel(candidate)
+    local model = resolveMerchantModel(candidate)
+    if not model or webhookActiveMerchantModels[model] then return nil, nil end
+    if not model:FindFirstChildOfClass("Humanoid") then return nil, nil end
+
+    local merchantName = nil
+
+    for _, attr in ipairs({ "MerchantName", "merchant_name", "MerchantID", "merchantId" }) do
+        local v = model:GetAttribute(attr)
+        if v and type(v) == "string" and v ~= "" then
+            local n = trimText(v)
+            if n ~= "" and not looksLikeGuid(n) then
+                merchantName = n
+                break
+            end
+        end
+    end
+
+    if not merchantName then
+        local prompt = model:FindFirstChildWhichIsA("ProximityPrompt", true)
+        if prompt then
+            merchantName = trimText(prompt.ObjectText)
+        end
+    end
+
+    if not merchantName or merchantName == "" then return nil, nil end
+    return model, merchantName
+end
+
+local function sendMerchantWebhook(merchantName, merchantModel)
+    if _G.BonesHubWebhookRunToken ~= WEBHOOK_RUN_TOKEN then return end
+    if webhookUrl == "" or not webhookEnabled or not webhookMerchantEnabled then return end
+    if not validPrivateServerLink(privateServerUrl) then return end
+
+    merchantName = trimText(merchantName)
+    if merchantName == "" then merchantName = "Merchant" end
+    if merchantModel then
+        if webhookActiveMerchantModels[merchantModel] then return end
+        webhookActiveMerchantModels[merchantModel] = merchantName
+    end
+
+    local now = tick()
+    local key = merchantName:upper()
+    if webhookLastMerchantAt[key] and now - webhookLastMerchantAt[key] < 10 then return end
+    webhookLastMerchantAt[key] = now
+    webhookMerchantSendSerial = webhookMerchantSendSerial + 1
+
+    local detectedAt = discordTimestamp()
+    local payload = makeBonesEmbed(merchantName .. " has arrived on the island.", privateServerUrl, detectedAt, 16763904)
+    httpPost(webhookUrl, HttpService:JSONEncode(payload))
+end
+
+local function inspectAndSendMerchant(candidate)
+    local ok, model, merchantName = pcall(function()
+        local foundModel, foundName = inspectMerchantModel(candidate)
+        return foundModel, foundName
+    end)
+    if ok and model and merchantName then sendMerchantWebhook(merchantName, model) end
+end
+
+local function scanExistingMerchants()
+    for index, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("ProximityPrompt") then inspectAndSendMerchant(obj) end
+        if index % 500 == 0 then task.wait() end
+    end
+end
+
+local function bindMerchantRemote()
+    if webhookMerchantRemoteConn then return true end
+    local remoteRoot = ReplicatedStorage:FindFirstChild("Remote")
+    local merchantFolder = remoteRoot and remoteRoot:FindFirstChild("Merchant")
+    local spawned = merchantFolder and merchantFolder:FindFirstChild("MerchantSpawned")
+    if not (spawned and spawned:IsA("RemoteEvent")) then return false end
+
+    webhookMerchantRemoteConn = spawned.OnClientEvent:Connect(function(...)
+        local args = { ... }
+        local merchantName
+        for _, value in ipairs(args) do
+            merchantName = merchantNameFromValue(value)
+            if merchantName then break end
+        end
+        local serialBeforeScan = webhookMerchantSendSerial
+        task.delay(0.5, scanExistingMerchants)
+        if merchantName then
+            task.delay(1.2, function()
+                if webhookMerchantRunning and webhookMerchantSendSerial == serialBeforeScan then
+                    sendMerchantWebhook(merchantName)
+                end
+            end)
+        end
+    end)
+    return true
+end
+
+local function startMerchantScan()
+    if webhookMerchantRunning then return end
+    webhookMerchantRunning = true
+    bindMerchantRemote()
+
+    webhookMerchantAddedConn = workspace.DescendantAdded:Connect(function(obj)
+        if obj:IsA("Model") or obj:IsA("Humanoid") or obj:IsA("ProximityPrompt") then
+            task.delay(0.25, inspectAndSendMerchant, obj)
+            task.delay(1, inspectAndSendMerchant, obj)
+            task.delay(2.5, inspectAndSendMerchant, obj)
+        end
+    end)
+    webhookMerchantRemovingConn = workspace.DescendantRemoving:Connect(function(obj)
+        if obj:IsA("Model") and webhookActiveMerchantModels[obj] then
+            webhookActiveMerchantModels[obj] = nil
+        end
+    end)
+
+    task.spawn(scanExistingMerchants)
+    webhookMerchantThread = task.spawn(function()
+        while _G.BonesHubWebhookRunToken == WEBHOOK_RUN_TOKEN
+            and webhookMerchantRunning and webhookMerchantEnabled do
+            if not webhookMerchantRemoteConn then bindMerchantRemote() end
+            local now = tick()
+            for name, sentAt in pairs(webhookLastMerchantAt) do
+                if now - sentAt > 300 then webhookLastMerchantAt[name] = nil end
+            end
+            task.wait(4)
+            if webhookMerchantRunning then scanExistingMerchants() end
+        end
+    end)
+end
+
+local function stopMerchantScan()
+    webhookMerchantRunning = false
+    if webhookMerchantRemoteConn then webhookMerchantRemoteConn:Disconnect(); webhookMerchantRemoteConn = nil end
+    if webhookMerchantAddedConn then webhookMerchantAddedConn:Disconnect(); webhookMerchantAddedConn = nil end
+    if webhookMerchantRemovingConn then webhookMerchantRemovingConn:Disconnect(); webhookMerchantRemovingConn = nil end
+    if webhookMerchantThread then pcall(task.cancel, webhookMerchantThread); webhookMerchantThread = nil end
+    table.clear(webhookActiveMerchantModels)
+end
+
+local Window = WindUI:CreateWindow({
+    Title = "Sol RNG自用webhook",
+    Icon = "crown",
+    Author = "made by bones hub",
+    Folder = "SolRNGWeather",
+    Size = UDim2.fromOffset(500, 360),
+    Theme = "Dark",
+    User = { Enabled = false },
+    SideBarWidth = 180,
+    ScrollBarEnabled = true
+})
+
+Window:Tag({
+    Title = "Webhook",
+    Color = Color3.fromHex("#f30000")
+})
+
+local Tab = Window:Tab({
+    Title = "Webhook",
+    Icon = "cloud-rain",
+    Locked = false,
+})
+
+Tab:Toggle({
+    Title = "Webhook开关",
+    Desc = "开启后天气和商人才会发",
+    Type = "Checkbox",
+    Default = false,
+    Callback = function(state)
+        webhookEnabled = state
+        WindUI:Notify({
+            Title = "Webhook开关",
+            Content = state and "已启用" or "已禁用",
+            Icon = state and "check" or "x",
+            Duration = 1.5
+        })
+    end
+})
+
+Tab:Input({
+    Title = "Webhook链接",
+    Desc = "Discord 频道 Webhook URL",
+    Value = "",
+    Type = "Input",
+    Placeholder = "https://discord.com/api/webhooks/...",
+    Callback = function(input)
+        webhookUrl = tostring(input or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    end
+})
+
+Tab:Input({
+    Title = "私服链接",
+    Desc = "填入你的私服链接",
+    Value = "",
+    Type = "Input",
+    Placeholder = "https://www.roblox.com/share?...",
+    Callback = function(input)
+        privateServerUrl = tostring(input or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    end
+})
+
+Tab:Button({
+    Title = "测试发送",
+    Locked = false,
+    Callback = function()
+        if not validWebhook(webhookUrl) then
+            WindUI:Notify({
+                Title = "Webhook 错误",
+                Content = "请先填写有效的 Webhook 地址",
+                Icon = "x",
+                Duration = 2
+            })
+            return
+        end
+        if not validPrivateServerLink(privateServerUrl) then
+            WindUI:Notify({
+                Title = "私服链接错误",
+                Content = "请先填写有效的私服链接",
+                Icon = "x",
+                Duration = 2
+            })
+            return
+        end
+        local biomeName = scanWeatherText() or "UNKNOWN"
+        local detectedAt = discordTimestamp()
+        local ok = httpPost(webhookUrl, HttpService:JSONEncode(
+            makeBonesEmbed("Biome Started - " .. biomeName, privateServerUrl, detectedAt)
+        ))
+        WindUI:Notify({
+            Title = "测试发送",
+            Content = ok and "已发送测试消息" or "发送失败（地址无效或请求函数不可用）",
+            Icon = ok and "check" or "x",
+            Duration = 2
+        })
+    end
+})
+
+Tab:Toggle({
+    Title = "天气变化",
+    Desc = "检测天气变化",
+    Type = "Checkbox",
+    Default = false,
+    Callback = function(state)
+        if state and not validPrivateServerLink(privateServerUrl) then
+            webhookWaterEnabled = false
+            WindUI:Notify({
+                Title = "私服链接错误",
+                Content = "请先填写有效的私服链接",
+                Icon = "x",
+                Duration = 2
+            })
+            return
+        end
+        webhookWaterEnabled = state
+        if state then startWater() else stopWater() end
+        WindUI:Notify({
+            Title = "天气变化",
+            Content = state and "已开始" or "已停止",
+            Icon = state and "check" or "x",
+            Duration = 1.5
+        })
+    end
+})
+
+Tab:Toggle({
+    Title = "商人刷新",
+    Desc = "监听商人到达并推送",
+    Type = "Checkbox",
+    Default = false,
+    Callback = function(state)
+        if state and not validPrivateServerLink(privateServerUrl) then
+            webhookMerchantEnabled = false
+            WindUI:Notify({
+                Title = "私服链接错误",
+                Content = "请先填写有效的私服链接",
+                Icon = "x",
+                Duration = 2
+            })
+            return
+        end
+        webhookMerchantEnabled = state
+        if state then startMerchantScan() else stopMerchantScan() end
+        WindUI:Notify({
+            Title = "商人刷新推送",
+            Content = state and "已开始监听" or "已停止监听",
+            Icon = state and "check" or "x",
+            Duration = 1.5
+        })
+    end
+})
