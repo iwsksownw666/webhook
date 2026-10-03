@@ -92,6 +92,7 @@ local requestFunction
 local antiAfkConnection
 local imageCache = {}
 local lastSendAt = {}
+local ServerReplica
 local State = {
     Running = false, CurrentBiome = "NORMAL", LastBiome = "None", LastMerchant = "None",
     StartedAt = 0, SessionBiomes = 0, SessionMerchants = 0, AlertsSent = 0,
@@ -288,28 +289,44 @@ local function normalizeBiome(value)
     end
 end
 
+local function connectWeatherReplica()
+    local ok, result = pcall(function()
+        local utility = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Utility"))
+        return utility.Replica.GetServerReplica()
+    end)
+    if ok and result then
+        ServerReplica = result
+        log("Weather source connected: Replica", "INFO")
+    else
+        log("Replica weather source unavailable; using HUD fallback: " .. tostring(result), "WARN")
+    end
+end
+
 local function currentBiome()
+    if ServerReplica and type(ServerReplica.Data) == "table" then
+        local replicaBiome = normalizeBiome(ServerReplica.Data.BiomeName) or normalizeBiome(ServerReplica.Data.Biome)
+        if replicaBiome then return replicaBiome end
+    end
     local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
     local main = playerGui and playerGui:FindFirstChild("MainInterface")
     if not main then return nil end
-    local container
-    for _, child in ipairs(main:GetChildren()) do
-        if child:IsA("TextLabel") and math.abs(child.Position.Y.Scale - 0.855) < 0.01 and child.Position.X.Offset == 10 then
-            container = child
-            break
+    for _, container in ipairs(main:GetChildren()) do
+        if container:IsA("TextLabel") and container.Visible then
+            local visibleBiomeLabels = 0
+            local detected
+            for _, child in ipairs(container:GetChildren()) do
+                if child:IsA("TextLabel") and child.Visible then
+                    local normalized = normalizeBiome(child.Text)
+                    if normalized then
+                        visibleBiomeLabels += 1
+                        detected = detected or normalized
+                    end
+                end
+            end
+            if visibleBiomeLabels >= 3 then return "GLITCHED" end
+            if detected then return detected end
         end
     end
-    if not container then return nil end
-    local visibleBiomeLabels = 0
-    local detected
-    for _, child in ipairs(container:GetChildren()) do
-        if child:IsA("TextLabel") and child.Visible and math.abs(child.Position.Y.Scale) < 0.01 then
-            visibleBiomeLabels += 1
-            detected = detected or normalizeBiome(child.Text)
-        end
-    end
-    if visibleBiomeLabels >= 3 then return "GLITCHED" end
-    return detected
 end
 
 local function updateStatus()
@@ -593,6 +610,7 @@ function API.GetState()
         Running = State.Running, CurrentBiome = State.CurrentBiome, LastBiome = State.LastBiome,
         LastMerchant = State.LastMerchant, AlertsSent = State.AlertsSent,
         WebhookValid = isWebhook(Config.Webhook), UIVisible = UI:IsVisible(),
+        WeatherSource = ServerReplica and "Replica" or "HUD",
     }
 end
 function API.Destroy()
@@ -612,6 +630,7 @@ table.insert(Connections, Players.PlayerRemoving:Connect(function(player)
     if player == LocalPlayer then saveConfig() end
 end))
 applyAntiAfk()
+task.spawn(connectWeatherReplica)
 task.spawn(function()
     while Alive do updateStatus() task.wait(0.5) end
 end)
