@@ -1,4 +1,4 @@
-About This Project Being Open Source
+#About This Project Being Open Source
 Someone asked me if this script could be open-sourced.
 
 My answer: since someone wants it, I'll just open-source it.
