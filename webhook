@@ -1,3 +1,6 @@
+--Forever
+--Made by bones hub
+--Game SOL RNG
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
