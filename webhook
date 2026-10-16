@@ -1,6 +1,3 @@
---Forever
---Made by bones hub
---Game SOL RNG
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
@@ -96,6 +93,16 @@ local antiAfkConnection
 local imageCache = {}
 local lastSendAt = {}
 local ServerReplica
+local WeatherBridge
+local WeatherSource = "Waiting for main-world data"
+local MerchantCache = {}
+local MerchantNotified = {}
+local MerchantPending = {}
+local MerchantRetries = {}
+local MerchantRevision
+local buildMerchantCard
+local refreshMerchants
+local announceMerchant
 local State = {
     Running = false, CurrentBiome = "NORMAL", LastBiome = "None", LastMerchant = "None",
     StartedAt = 0, SessionBiomes = 0, SessionMerchants = 0, AlertsSent = 0,
@@ -268,8 +275,16 @@ end
 local function sendBiome(biome)
     return sendCard("biome-" .. biome, "# Biome Started - " .. biome .. "\n" .. privateServerText(), BIOME_COLORS[biome] or 0x00FFFF, RARE_BIOMES[biome] == true, BIOME_ICON_IDS[biome])
 end
-local function sendMerchant(merchant)
-    return sendCard("merchant-" .. merchant, "# Merchant Arrived - " .. merchant .. "\n" .. privateServerText(), 0xFEE75C, false)
+local function sendMerchant(merchant, details)
+    local name = type(merchant) == "table" and tostring(merchant.merchant_name or "Merchant") or tostring(merchant)
+    if type(merchant) == "table" then details = merchant end
+    if not details then
+        for _, cached in pairs(MerchantCache) do
+            if cached.merchant_name == name then details = cached break end
+        end
+    end
+    local body = "# Merchant Arrived - " .. name .. "\n" .. privateServerText() .. "\n\n" .. buildMerchantCard(details)
+    return sendCard("merchant-" .. tostring(details and details.merchant_id or name), body, 0xFEE75C, false)
 end
 local function sendStopped(elapsed)
     local body = "# -- Macro Stopped --\n**Session Time:** " .. formatElapsed(elapsed)
@@ -293,23 +308,171 @@ local function normalizeBiome(value)
 end
 
 local function connectWeatherReplica()
-    local ok, result = pcall(function()
-        local utility = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Utility"))
-        return utility.Replica.GetServerReplica()
-    end)
-    if ok and result then
-        ServerReplica = result
-        log("Weather source connected: Replica", "INFO")
-    else
-        log("Replica weather source unavailable; using HUD fallback: " .. tostring(result), "WARN")
+    local handlers = game:GetService("ReplicatedFirst"):FindFirstChild("ClientHandlers")
+    local runner = ENV.run_on_actor or run_on_actor
+    if handlers and handlers:IsA("Actor") and type(runner) == "function" then
+        local coreGui = game:GetService("CoreGui")
+        local old = coreGui:FindFirstChild("BonesHubWeatherBridge")
+        if old then old:Destroy() end
+        WeatherBridge = Instance.new("Folder")
+        WeatherBridge.Name = "BonesHubWeatherBridge"
+        WeatherBridge:SetAttribute("Active", true)
+        WeatherBridge.Parent = coreGui
+        local ok, err = pcall(runner, handlers, [[
+            local bridge = game:GetService("CoreGui"):FindFirstChild("BonesHubWeatherBridge")
+            if not bridge then return end
+            local connections = {}
+            local jobs = {}
+            local function alive()
+                return bridge.Parent ~= nil and bridge:GetAttribute("Active") == true
+            end
+            local ok, err = pcall(function()
+                local replica = require(game:GetService("ReplicatedStorage").Modules.Utility.Replica).GetServerReplica()
+                if not alive() then return end
+                local function publish()
+                    if not alive() then return end
+                    local data = replica.Data
+                    bridge:SetAttribute("BiomeName", data.BiomeName)
+                    bridge:SetAttribute("Biome", data.Biome)
+                    bridge:SetAttribute("UpdatedAt", workspace:GetServerTimeNow())
+                    bridge:SetAttribute("Ready", true)
+                end
+                for _, field in ipairs({ "BiomeName", "Biome" }) do
+                    local bound, connection = pcall(function()
+                        return replica:ListenToChange(field, function() task.defer(publish) end)
+                    end)
+                    if bound and connection then table.insert(connections, connection) end
+                end
+                table.insert(jobs, task.spawn(function()
+                    local merchantOk, merchantError = pcall(function()
+                        local rs = game:GetService("ReplicatedStorage")
+                        local http = game:GetService("HttpService")
+                        local store = require(rs.Modules.UI.Merchant.MerchantUIBeta).store
+                        local remote = rs.Remote.Merchant
+                        local stocks, snapshots, retired = {}, {}, {}
+                        local queue = {}
+                        local function activeMerchant(data)
+                            if type(data) ~= "table" then return false end
+                            if typeof(data.model) == "Instance" and not data.model:IsDescendantOf(game) then return false end
+                            local life, start = tonumber(data.life_time), tonumber(data.spawned_at)
+                            return not (life and start and life < math.huge and start + life <= workspace:GetServerTimeNow())
+                        end
+                        local function queryStock(id, productId)
+                            local done, success, result = false, false, nil
+                            local job = task.spawn(function()
+                                success, result = pcall(function()
+                                    return remote.GetData:InvokeServer("GetShopProductQuantityInfo", id, productId)
+                                end)
+                                done = true
+                            end)
+                            local deadline = os.clock() + 3
+                            while alive() and not done and os.clock() < deadline do task.wait(0.05) end
+                            if not done then pcall(task.cancel, job) return nil end
+                            if success and type(result) == "number" and result == result and result >= 0 then
+                                return result == math.huge and "Unlimited" or math.floor(result)
+                            end
+                        end
+                        for _ = 1, 3 do
+                            table.insert(jobs, task.spawn(function()
+                                while alive() do
+                                    local request = table.remove(queue, 1)
+                                    if request then
+                                        local value = queryStock(request.Id, request.ProductId)
+                                        if alive() then
+                                            if request.Product.StockLeft == nil then request.Product.StockLeft = value end
+                                            request.Snapshot.Pending -= 1
+                                            request.Snapshot.stock_complete = request.Snapshot.Pending == 0
+                                        end
+                                    else task.wait(0.1) end
+                                end
+                            end))
+                        end
+                        table.insert(connections, remote.ProductQuantityUpdated.OnClientEvent:Connect(function(id, productId, amount)
+                            local products = stocks[tostring(id)]
+                            local product = products and products[tostring(productId)]
+                            if product and type(amount) == "number" and amount >= 0 then
+                                product.StockLeft = amount == math.huge and "Unlimited" or math.floor(amount)
+                            end
+                        end))
+                        table.insert(connections, remote.MerchantDespawned.OnClientEvent:Connect(function(id)
+                            retired[tostring(id)] = true
+                        end))
+                        while alive() do
+                            local output = {}
+                            for key, data in pairs(store.merchant_infos) do
+                                local id = tostring(data.merchant_id or key)
+                                if not retired[id] and activeMerchant(data) then
+                                    local snapshot = snapshots[id]
+                                    if not snapshot then
+                                        local life = tonumber(data.life_time)
+                                        snapshot = {
+                                            merchant_id = id, merchant_name = tostring(data.merchant_name or "Merchant"),
+                                            spawned_at = tonumber(data.spawned_at) or workspace:GetServerTimeNow(),
+                                            life_time = life and life < math.huge and life or nil,
+                                            permanent = life == math.huge, product_list = {}, Pending = 0,
+                                        }
+                                        snapshots[id] = snapshot
+                                        stocks[id] = {}
+                                        for productId, source in pairs(data.product_list or {}) do
+                                            if type(source) == "table" then
+                                                local product = {}
+                                                for _, field in ipairs({ "ProductName", "ProductDisplayName", "Price", "CurrencyType", "CurrencyName", "CurrencyDisplayName", "Index" }) do
+                                                    local value = source[field]
+                                                    if type(value) == "string" or (type(value) == "number" and value == value and math.abs(value) < math.huge) then product[field] = value end
+                                                end
+                                                snapshot.product_list[tostring(productId)] = product
+                                                stocks[id][tostring(productId)] = product
+                                                snapshot.Pending += 1
+                                                table.insert(queue, { Id = data.merchant_id or key, ProductId = productId, Product = product, Snapshot = snapshot })
+                                            end
+                                        end
+                                        snapshot.stock_complete = snapshot.Pending == 0
+                                    end
+                                    output[id] = snapshot
+                                end
+                            end
+                            local encoded = http:JSONEncode(output)
+                            if bridge:GetAttribute("Merchants") ~= encoded then bridge:SetAttribute("Merchants", encoded) end
+                            bridge:SetAttribute("MerchantsReady", true)
+                            task.wait(0.5)
+                        end
+                    end)
+                    if not merchantOk and alive() then bridge:SetAttribute("MerchantError", tostring(merchantError)) end
+                end))
+                while alive() do publish() task.wait(0.25) end
+            end)
+            for _, connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
+            for _, job in ipairs(jobs) do pcall(task.cancel, job) end
+            if not ok and alive() then
+                bridge:SetAttribute("Ready", false)
+                bridge:SetAttribute("Error", tostring(err))
+            end
+        ]])
+        if not ok then log("Actor weather bridge failed: " .. tostring(err), "WARN") end
+        return
     end
+    local ok, controller = pcall(require, ReplicatedStorage:FindFirstChild("ReplicaController"))
+    if ok and type(controller) == "table" then
+        for _, replica in pairs(controller._replicas or {}) do
+            if replica.Class == "ServerInfo" then ServerReplica = replica break end
+        end
+    end
+    if not ServerReplica then log("Main-world Replica unavailable in this executor; HUD fallback only", "WARN") end
 end
 
 local function currentBiome()
+    if WeatherBridge and WeatherBridge.Parent and WeatherBridge:GetAttribute("Ready") then
+        local updated = WeatherBridge:GetAttribute("UpdatedAt")
+        if type(updated) == "number" and workspace:GetServerTimeNow() - updated < 3 then
+            local biome = normalizeBiome(WeatherBridge:GetAttribute("BiomeName")) or normalizeBiome(WeatherBridge:GetAttribute("Biome"))
+            if biome then WeatherSource = "Actor Replica" return biome end
+        end
+    end
     if ServerReplica and type(ServerReplica.Data) == "table" then
         local replicaBiome = normalizeBiome(ServerReplica.Data.BiomeName) or normalizeBiome(ServerReplica.Data.Biome)
-        if replicaBiome then return replicaBiome end
+        if replicaBiome then WeatherSource = "Replica" return replicaBiome end
     end
+    WeatherSource = "HUD fallback"
     local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
     local main = playerGui and playerGui:FindFirstChild("MainInterface")
     if not main then return nil end
@@ -332,8 +495,69 @@ local function currentBiome()
     end
 end
 
+local function merchantRemaining(data)
+    if not data then return "Unknown" end
+    if data.permanent or data.life_time == math.huge then return "Permanent" end
+    local lifetime, spawned = tonumber(data.life_time), tonumber(data.spawned_at)
+    if not lifetime or not spawned then return "Unknown" end
+    local seconds = math.max(0, math.ceil(spawned + lifetime - workspace:GetServerTimeNow()))
+    if seconds == 0 then return "Expired" end
+    if seconds < 60 then return tostring(seconds) .. " sec" end
+    return "~" .. tostring(math.ceil(seconds / 60)) .. " min"
+end
+
+local function merchantProducts(data)
+    local products = {}
+    for id, product in pairs(data and data.product_list or {}) do
+        if type(product) == "table" then table.insert(products, { Id = tostring(id), Data = product }) end
+    end
+    table.sort(products, function(a, b)
+        local ai, bi = tonumber(a.Data.Index) or math.huge, tonumber(b.Data.Index) or math.huge
+        if ai ~= bi then return ai < bi end
+        return a.Id < b.Id
+    end)
+    return products
+end
+
+buildMerchantCard = function(data)
+    local products = merchantProducts(data)
+    local lines = {
+        "⌛ **Remaining:** " .. merchantRemaining(data),
+        "📦 **Products:** " .. (data and type(data.product_list) == "table" and tostring(#products) or "Unknown"),
+        "", "**Available stock**",
+    }
+    if not data or type(data.product_list) ~= "table" then
+        table.insert(lines, "Stock data unavailable")
+    elseif #products == 0 then
+        table.insert(lines, "No products listed")
+    else
+        local length = #table.concat(lines, "\n")
+        for index, entry in ipairs(products) do
+            local product = entry.Data
+            local name = trim(product.ProductDisplayName)
+            if name == "" then name = tostring(product.ProductName or entry.Id) end
+            name = name:gsub("<.->", ""):gsub("[\r\n]", " "):gsub("%*", "")
+            local currency = trim(product.CurrencyDisplayName)
+            if currency == "" then currency = trim(product.CurrencyName) end
+            if currency == "" then currency = trim(product.CurrencyType) end
+            if currency == "" then currency = "Unknown currency" end
+            local price = product.Price ~= nil and tostring(product.Price) or "?"
+            local stock = product.StockLeft ~= nil and (tostring(product.StockLeft) .. " left") or "stock unavailable"
+            local line = "• **" .. name .. "** — " .. price .. " " .. currency .. " • " .. stock
+            if length + #line > 2800 then
+                table.insert(lines, "… " .. tostring(#products - index + 1) .. " more products")
+                break
+            end
+            table.insert(lines, line)
+            length += #line + 1
+        end
+    end
+    return table.concat(lines, "\n")
+end
+
 local function updateStatus()
     pcall(function()
+        local observed = currentBiome()
         local online = State.Running and "online" or "offline"
         if Controls.MainBadge then Controls.MainBadge:SetState(online) end
         if Controls.StatusBadge then Controls.StatusBadge:SetState(online) end
@@ -344,12 +568,71 @@ local function updateStatus()
         if Controls.SessionBiomes and Controls.SessionBiomes.ValueLabel then Controls.SessionBiomes.ValueLabel.Text = tostring(State.SessionBiomes) end
         if Controls.SessionMerchants and Controls.SessionMerchants.ValueLabel then Controls.SessionMerchants.ValueLabel.Text = tostring(State.SessionMerchants) end
         if Controls.Alerts and Controls.Alerts.ValueLabel then Controls.Alerts.ValueLabel.Text = tostring(State.AlertsSent) end
+        if Controls.MainWorldWeather and Controls.MainWorldWeather.ValueLabel then Controls.MainWorldWeather.ValueLabel.Text = observed or "Unavailable" end
+        if Controls.WeatherSource and Controls.WeatherSource.ValueLabel then Controls.WeatherSource.ValueLabel.Text = WeatherSource end
         if Controls.Counts then
             for biome, metric in pairs(Controls.Counts) do
                 if metric.ValueLabel then metric.ValueLabel.Text = tostring(State.Counts[biome] or 0) end
             end
         end
     end)
+end
+
+announceMerchant = function(id)
+    id = tostring(id)
+    if not State.Running or MerchantNotified[id] or MerchantPending[id] then return end
+    local retry = MerchantRetries[id]
+    if retry and (retry.Attempts >= 3 or os.clock() < retry.After) then return end
+    MerchantPending[id] = true
+    local generation = State.Generation
+    task.spawn(function()
+        local deadline = os.clock() + 6
+        while Alive and State.Running and State.Generation == generation and os.clock() < deadline do
+            refreshMerchants(false)
+            local data = MerchantCache[id]
+            if not data or data.stock_complete then break end
+            task.wait(0.15)
+        end
+        local data = MerchantCache[id]
+        if Alive and State.Running and State.Generation == generation and data and merchantRemaining(data) ~= "Expired" then
+            State.LastMerchant = tostring(data.merchant_name or "Merchant")
+            if not data.Counted then
+                State.SessionMerchants += 1
+                data.Counted = true
+            end
+            log("Merchant detected: " .. State.LastMerchant .. " (" .. tostring(#merchantProducts(data)) .. " products)", "INFO")
+            local ok = sendMerchant(data)
+            if ok then
+                MerchantNotified[id] = true
+                MerchantRetries[id] = nil
+            else
+                local attempts = (MerchantRetries[id] and MerchantRetries[id].Attempts or 0) + 1
+                MerchantRetries[id] = { Attempts = attempts, After = os.clock() + math.min(60, 15 * attempts) }
+            end
+            updateStatus()
+        end
+        MerchantPending[id] = nil
+    end)
+end
+
+refreshMerchants = function(announce)
+    if WeatherBridge and WeatherBridge.Parent then
+        local encoded = WeatherBridge:GetAttribute("Merchants")
+        if type(encoded) == "string" and encoded ~= MerchantRevision then
+            local ok, data = pcall(HttpService.JSONDecode, HttpService, encoded)
+            if ok and type(data) == "table" then
+                for id, merchant in pairs(data) do
+                    local old = MerchantCache[id]
+                    if old and old.Counted then merchant.Counted = true end
+                end
+                MerchantCache = data
+                MerchantRevision = encoded
+            end
+        end
+    end
+    if announce and State.Running then
+        for id in pairs(MerchantCache) do announceMerchant(id) end
+    end
 end
 
 local function applyAntiAfk()
@@ -406,12 +689,13 @@ local function startMacro()
     State.SessionMerchants = 0
     State.Generation += 1
     local generation = State.Generation
-    local initial = currentBiome() or "NORMAL"
+    local initial = currentBiome()
     State.CurrentBiome = "NORMAL"
     log("Macro started", "INFO")
     updateStatus()
     if isWebhook(Config.Webhook) then task.spawn(sendStarted) else log("No valid webhook configured", "WARN") end
     processBiome(initial, true)
+    if refreshMerchants then task.spawn(refreshMerchants, true) end
     task.spawn(function()
         while Alive and State.Running and State.Generation == generation do
             local ok, err = pcall(function() processBiome(currentBiome(), false) end)
@@ -439,18 +723,24 @@ local function connectMerchantEvents()
         local despawned = merchantFolder and merchantFolder:WaitForChild("MerchantDespawned", 10)
         if not spawned or not despawned then error("Merchant remotes missing") end
         table.insert(Connections, spawned.OnClientEvent:Connect(function(data)
-            if not State.Running then return end
-            local merchant = type(data) == "table" and tostring(data.merchant_name or data.Name or "Merchant") or tostring(data or "Merchant")
-            State.LastMerchant = merchant
-            State.SessionMerchants += 1
-            log("Merchant detected: " .. merchant, "INFO")
-            updateStatus()
-            task.spawn(sendMerchant, merchant)
+            if type(data) ~= "table" or data.merchant_id == nil then return end
+            local id = tostring(data.merchant_id)
+            MerchantCache[id] = {
+                merchant_id = id, merchant_name = data.merchant_name,
+                life_time = data.life_time, spawned_at = data.spawned_at or workspace:GetServerTimeNow(),
+                product_list = copy(data.product_list or {}), stock_complete = false,
+            }
+            announceMerchant(id)
         end))
-        table.insert(Connections, despawned.OnClientEvent:Connect(function()
-            State.LastMerchant = "None"
-            log("Merchant left", "INFO")
+        table.insert(Connections, despawned.OnClientEvent:Connect(function(id)
+            local old = MerchantCache[tostring(id)]
+            MerchantCache[tostring(id)] = nil
+            if old and State.LastMerchant == old.merchant_name then State.LastMerchant = "None" end
+            if old then log("Merchant left: " .. tostring(old.merchant_name), "INFO") end
         end))
+        task.spawn(function()
+            while Alive do refreshMerchants(State.Running) task.wait(1) end
+        end)
     end)
     if not ok then log("Merchant events unavailable: " .. tostring(err), "WARN") end
 end
@@ -542,6 +832,12 @@ local timerMetrics = UI:AddMetricRow(2, {
     { Label = "Last Biome", Value = "None", Unit = "" },
 })
 Controls.Elapsed, Controls.LastBiome = timerMetrics[1], timerMetrics[2]
+UI:AddDivider(2, "Main-world Weather")
+local weatherMetrics = UI:AddMetricRow(2, {
+    { Label = "Current Biome", Value = "Waiting", Unit = "main world" },
+    { Label = "Weather Source", Value = "Connecting", Unit = "independent of Limbo HUD" },
+})
+Controls.MainWorldWeather, Controls.WeatherSource = weatherMetrics[1], weatherMetrics[2]
 UI:AddDivider(2, "Session Counts")
 local sessionMetrics = UI:AddMetricRow(2, {
     { Label = "Biomes Detected", Value = "0", Unit = "this session" },
@@ -592,7 +888,7 @@ Controls.ScanInterval = UI:AddInputNumber(5, "Biome Scanner Interval (Seconds)",
     local number = tonumber(value)
     if number then Config.BiomeScanInterval = math.clamp(number, 0.15, 5) saveConfig() end
 end)
-UI:AddAlert(5, "Detection source", "Weather is read from the game's exact MainInterface biome label. Merchant alerts use the game's MerchantSpawned event.", "info")
+UI:AddAlert(5, "Detection source", "Main-world weather is read from ServerInfo inside the game's Actor, including while in Limbo. Merchant stock is read from the game shop data and quantity query. HUD weather is a fallback only.", "info")
 UI:AddDivider(5, "Webhook Tests")
 UI:AddButtonRow(5, {
     { Text = "Test Normal", Style = "ghost", Width = 130, Callback = debounced(function() sendBiome("WINDY") end, 2) },
@@ -607,13 +903,31 @@ function API.Stop() stopMacro() end
 function API.TestBiome(biome) return sendBiome(normalizeBiome(biome) or "WINDY") end
 function API.TestMerchant(merchant) return sendMerchant(tostring(merchant or "Mari")) end
 function API.ProbeBiome() return currentBiome() end
+function API.GetMerchants()
+    refreshMerchants(false)
+    return copy(MerchantCache)
+end
+function API.PreviewMerchant(merchant)
+    refreshMerchants(false)
+    if type(merchant) == "table" then return buildMerchantCard(merchant) end
+    for id, data in pairs(MerchantCache) do
+        if id == merchant or data.merchant_name == merchant then return buildMerchantCard(data) end
+    end
+    return buildMerchantCard(nil)
+end
 function API.SetPage(page) return UI:SetPage(page) end
 function API.GetState()
+    local observed = currentBiome()
     return {
         Running = State.Running, CurrentBiome = State.CurrentBiome, LastBiome = State.LastBiome,
         LastMerchant = State.LastMerchant, AlertsSent = State.AlertsSent,
         WebhookValid = isWebhook(Config.Webhook), UIVisible = UI:IsVisible(),
-        WeatherSource = ServerReplica and "Replica" or "HUD",
+        WeatherSource = WeatherSource,
+        ObservedBiome = observed,
+        MerchantDataReady = WeatherBridge ~= nil and WeatherBridge.Parent ~= nil and WeatherBridge:GetAttribute("MerchantsReady") == true,
+        WeatherBridgeError = WeatherBridge and WeatherBridge:GetAttribute("Error") or nil,
+        MerchantDataError = WeatherBridge and WeatherBridge:GetAttribute("MerchantError") or nil,
+        WeatherBridgeReady = WeatherBridge ~= nil and WeatherBridge.Parent ~= nil and WeatherBridge:GetAttribute("Ready") == true,
     }
 end
 function API.Destroy()
@@ -623,6 +937,7 @@ function API.Destroy()
     saveConfig()
     for _, connection in ipairs(Connections) do pcall(function() connection:Disconnect() end) end
     table.clear(Connections)
+    if WeatherBridge then WeatherBridge:SetAttribute("Active", false) WeatherBridge:Destroy() WeatherBridge = nil end
     if UI then pcall(function() UI:Destroy() end) end
     if ENV[API_KEY] == API then ENV[API_KEY] = nil end
     if ENV[LEGACY_API_KEY] == API then ENV[LEGACY_API_KEY] = nil end
