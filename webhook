@@ -1,4 +1,3 @@
---help
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
@@ -746,6 +745,1796 @@ local function connectMerchantEvents()
     if not ok then log("Merchant events unavailable: " .. tostring(err), "WARN") end
 end
 
+local MovementCoordinator = (function()
+    local controller = {}
+    local owner, ticket, serial = nil, nil, 0
+    local queue = {}
+    function controller.Acquire(name)
+        if owner == name then return ticket end
+        if not table.find(queue, name) then queue[#queue + 1] = name end
+        if owner or queue[1] ~= name then return nil end
+        table.remove(queue, 1)
+        serial += 1
+        owner, ticket = name, serial
+        return ticket
+    end
+    function controller.Release(name, lease)
+        if owner ~= name or ticket ~= lease then return false end
+        owner, ticket = nil, nil
+        return true
+    end
+    function controller.Cancel(name)
+        local index = table.find(queue, name)
+        if index then table.remove(queue, index) end
+    end
+    function controller.IsOwner(name, lease)
+        return owner == name and (lease == nil or lease == ticket)
+    end
+    function controller.Wants(name)
+        return table.find(queue, name) ~= nil
+    end
+    function controller.GetState()
+        return { Owner = owner, Ticket = ticket, Waiting = table.clone(queue) }
+    end
+    return controller
+end)()
+
+local Potion = (function()
+    local controller = {}
+    local enabled, busy, alive = false, false, true
+    local epoch, completed, nextAttempt, sequence = 0, 0, 0, 0
+    local bridge, inFlight, mounted, movingHumanoid, navigationOwner
+    local status, lastError = "Loading recipes", nil
+    local rows = {}
+    local namespace, recipeName = "StellaCauldron", "Heavenly Potion"
+    local pendingOutcomes = {}
+    local selectedRecipes = {}
+    local selector, selectorSignature
+    local syncingRecipes = false
+    local movementTicket
+
+    local function setStatus(value, err)
+        status, lastError = value, err
+    end
+
+    local function plan(data)
+        if type(data) ~= "table" or type(data.Ingredients) ~= "table" or #data.Ingredients == 0 then
+            return false, false
+        end
+        local ready, filled = true, true
+        for _, ingredient in ipairs(data.Ingredients) do
+            local required = tonumber(ingredient.Required)
+            local added, owned = tonumber(ingredient.Added), tonumber(ingredient.Owned)
+            if not required or required <= 0 or not added or added < 0 or not owned or owned < 0 then
+                return false, false
+            end
+            local missing = math.max(0, required - added)
+            if owned < missing then ready = false end
+            if missing > 0 then filled = false end
+        end
+        return ready, filled
+    end
+
+    local function readSnapshot(name)
+        if not bridge or not bridge.Parent then return nil end
+        local updated, encoded = bridge:GetAttribute("UpdatedAt"), bridge:GetAttribute("Snapshot")
+        if type(updated) ~= "number" or workspace:GetServerTimeNow() - updated > 3 or type(encoded) ~= "string" then return nil end
+        local ok, data = pcall(HttpService.JSONDecode, HttpService, encoded)
+        name = name or recipeName
+        if ok and type(data) == "table" then
+            if data.ByRecipe then
+                local value = data.ByRecipe[name]
+                if value then value.Recipes = data.Recipes end
+                return value
+            end
+            if data.Recipe == nil or data.Recipe == name then return data end
+        end
+    end
+
+    local function currentCharacter()
+        local character = LocalPlayer.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        if humanoid and humanoid.Health > 0 and root then return character, humanoid, root end
+    end
+
+    local function active(token)
+        return alive and Alive and epoch == token
+    end
+
+    local function callRemote(remote, token, ...)
+        if not active(token) then return false, "Stopped" end
+        local requestedRecipe = select(2, ...)
+        if not table.find(selectedRecipes, requestedRecipe) then return false, "Recipe not selected", "rejected" end
+        if inFlight then return false, "Request pending" end
+        sequence += 1
+        local ticket, arguments = sequence, table.pack(...)
+        inFlight = ticket
+        local done, result = false, nil
+        task.spawn(function()
+            result = table.pack(pcall(function()
+                if not active(token) or not table.find(selectedRecipes, requestedRecipe) then return false, "Stopped" end
+                return remote:InvokeServer(table.unpack(arguments, 1, arguments.n))
+            end))
+            done = true
+            if inFlight == ticket then inFlight = nil end
+        end)
+        local deadline = os.clock() + 10
+        while active(token) and not done and os.clock() < deadline do task.wait(0.1) end
+        if not done then return false, "Request unconfirmed; waiting without resending", "uncertain" end
+        if not result[1] then return false, tostring(result[2]), "uncertain" end
+        if result[2] ~= true then return false, tostring(result[3] or result[2] or "Server rejected request"), "rejected" end
+        return true
+    end
+
+    local function walk(target, token, reach)
+        local character, humanoid, root = currentCharacter()
+        if not character then return false, "Character unavailable" end
+        reach = reach or 4
+        local function valid()
+            return active(token) and LocalPlayer.Character == character and humanoid.Health > 0
+        end
+        local function distance(position)
+            local delta = root.Position - position
+            return math.sqrt(delta.X * delta.X + delta.Z * delta.Z), math.abs(delta.Y)
+        end
+        local function reached(position, radius)
+            local horizontal, vertical = distance(position)
+            return horizontal <= radius and vertical <= 10
+        end
+        if reached(target, reach) then return true end
+        movingHumanoid = humanoid
+        local totalDeadline = os.clock() + 150
+        for _ = 1, 8 do
+            if not valid() or os.clock() >= totalDeadline then break end
+            local path = game:GetService("PathfindingService"):CreatePath({ AgentRadius = 1.25, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 3 })
+            local done, computed = false, false
+            task.spawn(function()
+                computed = pcall(function() path:ComputeAsync(root.Position, target) end)
+                done = true
+            end)
+            local deadline = math.min(totalDeadline, os.clock() + 8)
+            while valid() and not done and os.clock() < deadline do task.wait(0.1) end
+            if not valid() or not done then break end
+            if not computed or path.Status ~= Enum.PathStatus.Success then task.wait(0.3) continue end
+            local blockedIndex, index = math.huge, 1
+            local connection = path.Blocked and path.Blocked:Connect(function(value) if value >= index then blockedIndex = value end end)
+            for waypointIndex, waypoint in ipairs(path:GetWaypoints()) do
+                index = waypointIndex
+                if not valid() or os.clock() >= totalDeadline then break end
+                if reached(target, reach) then break end
+                if reached(waypoint.Position, 1.5) then continue end
+                local movePosition = waypoint.Position
+                if waypoint.Action == Enum.PathWaypointAction.Jump then movePosition += Vector3.new(0, 3, 0) end
+                humanoid:MoveTo(movePosition)
+                if waypoint.Action == Enum.PathWaypointAction.Jump then
+                    humanoid.Jump = true
+                    if humanoid.ChangeState then humanoid:ChangeState(Enum.HumanoidStateType.Jumping) end
+                end
+                local best = distance(waypoint.Position)
+                local lastProgress, lastJump = os.clock(), 0
+                local waypointDeadline = math.min(totalDeadline, os.clock() + 7)
+                while valid() and not reached(waypoint.Position, 1.5) and os.clock() < waypointDeadline and blockedIndex > index do
+                    local current = distance(waypoint.Position)
+                    if current < best - 0.3 then best, lastProgress = current, os.clock() end
+                    if os.clock() - lastProgress > 0.8 and os.clock() - lastJump > 1 and (not humanoid.FloorMaterial or humanoid.FloorMaterial ~= Enum.Material.Air) then
+                        humanoid.Jump = true
+                        if humanoid.ChangeState then humanoid:ChangeState(Enum.HumanoidStateType.Jumping) end
+                        humanoid:MoveTo(movePosition)
+                        lastJump = os.clock()
+                    end
+                    if os.clock() - lastProgress > 2.5 then break end
+                    task.wait(0.1)
+                end
+                if not reached(waypoint.Position, 1.5) then break end
+            end
+            if connection then connection:Disconnect() end
+            if valid() and reached(target, reach) then movingHumanoid = nil return true end
+            if valid() then task.wait(0.25) end
+        end
+        if valid() then humanoid:MoveTo(root.Position) end
+        movingHumanoid = nil
+        return false, "Route blocked"
+    end
+
+    local function walkPortal(portal, token, reach)
+        local _, humanoid, root = currentCharacter()
+        if not root then return false, "Character unavailable" end
+        local map = workspace:FindFirstChild("Map")
+        local bridgeModel = map and map:FindFirstChild("Bridge")
+        local planks = bridgeModel and bridgeModel:FindFirstChild("Planks")
+        local east = portal.X > 420 and portal.X < 650 and root.Position.X > 0 and root.Position.X < 420
+        local west = portal.X > 0 and portal.X < 360 and root.Position.X > 360 and root.Position.X < 650
+        if east or west then
+            local direction = east and 1 or -1
+            local points = {}
+            local function collect()
+                table.clear(points)
+                map = workspace:FindFirstChild("Map")
+                bridgeModel = map and map:FindFirstChild("Bridge")
+                planks = bridgeModel and bridgeModel:FindFirstChild("Planks")
+                if planks then
+                    for _, part in ipairs(planks:GetDescendants()) do
+                        if part:IsA("BasePart") and part.CanCollide then points[#points + 1] = part.Position end
+                    end
+                end
+            end
+            collect()
+            if #points < 2 then
+                local anchor = bridgeModel and bridgeModel:GetPivot().Position or Vector3.new(390, 96, -316.5)
+                task.spawn(function() pcall(function() LocalPlayer:RequestStreamAroundAsync(anchor, 5) end) end)
+                local streamDeadline = os.clock() + 6
+                repeat task.wait(0.15) collect() until #points >= 2 or not active(token) or os.clock() >= streamDeadline
+            end
+            table.sort(points, function(a, b) return direction * a.X < direction * b.X end)
+            if #points < 2 then return false, "Bridge not streamed" end
+            local first = points[1]
+            if direction * (root.Position.X - first.X) < -2 or math.abs(root.Position.Z - first.Z) > 6 then
+                local ok, err = walk(first, token, 2)
+                if not ok then return false, err end
+            end
+            movingHumanoid = humanoid
+            for _, point in ipairs(points) do
+                if direction * (point.X - root.Position.X) < -1.8 then continue end
+                if not active(token) or LocalPlayer.Character == nil or LocalPlayer.Character:FindFirstChild("HumanoidRootPart") ~= root or humanoid.Health <= 0 then movingHumanoid = nil return false, "Stopped" end
+                local destination = point + Vector3.new(0, humanoid.HipHeight + 2, 0)
+                humanoid:MoveTo(destination)
+                local deadline = os.clock() + 4
+                local previous, progressAt, jumped = root.Position, os.clock(), false
+                while active(token) and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") == root and humanoid.Health > 0 and os.clock() < deadline do
+                    local delta = root.Position - destination
+                    if math.sqrt(delta.X * delta.X + delta.Z * delta.Z) < 1.8 then break end
+                    if root.Position.Y < point.Y - 4 then movingHumanoid = nil return false, "Fell off bridge" end
+                    if (root.Position - previous).Magnitude > 0.3 then previous, progressAt = root.Position, os.clock() end
+                    if not jumped and os.clock() - progressAt > 0.6 then
+                        humanoid.Jump = true
+                        humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+                        humanoid:MoveTo(destination)
+                        jumped = true
+                    end
+                    task.wait(0.05)
+                end
+                if not active(token) or LocalPlayer.Character == nil or LocalPlayer.Character:FindFirstChild("HumanoidRootPart") ~= root or humanoid.Health <= 0 then movingHumanoid = nil return false, "Stopped" end
+                if os.clock() >= deadline then movingHumanoid = nil return false, "Bridge blocked" end
+            end
+            movingHumanoid = nil
+        end
+        return walk(portal, token, reach or 2)
+    end
+
+
+    local function cauldronPosition()
+        local cauldron = workspace:FindFirstChild("Cauldron")
+        if cauldron and cauldron:IsA("Model") then return cauldron:GetPivot().Position end
+    end
+
+    local function portalPosition(destination)
+        local _, _, root = currentCharacter()
+        if not root then return nil end
+        local selected, best
+        for _, portal in ipairs(game:GetService("CollectionService"):GetTagged("StellaPortal")) do
+            local position = portal:IsA("Model") and portal:GetPivot().Position or portal:IsA("BasePart") and portal.Position
+            if position and (position - destination).Magnitude > 500 then
+                local distance = (position - root.Position).Magnitude
+                if not best or distance < best then selected, best = position, distance end
+            end
+        end
+        return selected
+    end
+
+    local function travel(destination, token, reach)
+        local character, humanoid, root = currentCharacter()
+        if not root then return false, "Character unavailable" end
+        if (root.Position - destination).Magnitude > 1000 then
+            local data = readSnapshot()
+            if not data or not data.PortalUnlocked then return false, "Stella shortcut is locked" end
+            local portal = portalPosition(destination)
+            if not portal then return false, "Portal unavailable" end
+            setStatus("Walking to portal")
+            local ok, err = walkPortal(portal, token)
+            if not ok then return false, err end
+            local deadline = os.clock() + 10
+            movingHumanoid = humanoid
+            while active(token) and LocalPlayer.Character == character and humanoid.Health > 0 and (root.Position - destination).Magnitude > 1000 and os.clock() < deadline do
+                humanoid:MoveTo(portal)
+                task.wait(0.25)
+            end
+            movingHumanoid = nil
+            if not active(token) then return false, "Stopped" end
+            if LocalPlayer.Character ~= character or humanoid.Health <= 0 then return false, "Character changed" end
+            if (root.Position - destination).Magnitude > 1000 then return false, "Portal did not respond" end
+        end
+        return walkPortal(destination, token, reach)
+    end
+
+    local function awaitData(predicate, token, seconds)
+        local deadline = os.clock() + seconds
+        while active(token) and os.clock() < deadline do
+            local data = readSnapshot()
+            if data and predicate(data) then return data end
+            task.wait(0.15)
+        end
+    end
+
+    local function cycleRecipe(token)
+        local data = readSnapshot()
+        local ready = plan(data)
+        if not data then setStatus("Waiting for inventory") return end
+        if inFlight then setStatus("Request pending") return end
+        if pendingOutcomes[recipeName] then
+            if data.Count > pendingOutcomes[recipeName] then
+                completed += 1
+                pendingOutcomes[recipeName] = nil
+                setStatus("Craft confirmed")
+            else
+                setStatus("Craft unconfirmed; resending paused")
+                return
+            end
+        end
+        local available = false
+        for _, ingredient in ipairs(data.Ingredients or {}) do
+            if ingredient.Required > ingredient.Added and ingredient.Owned > 0 then available = true break end
+        end
+        if not ready and not available then setStatus("Waiting for ingredients") return end
+        local _, _, root = currentCharacter()
+        local target = cauldronPosition()
+        if not root or not target then setStatus("Waiting for cauldron") return end
+        setStatus("Walking to cauldron")
+        local arrived, movementError = travel(target, token, 9)
+        if not arrived then setStatus("Movement paused", movementError) nextAttempt = os.clock() + 30 return end
+        local function make()
+            if not active(token) then return end
+            local latest = readSnapshot()
+            local _, filled = plan(latest)
+            if not latest then return end
+            local _, _, currentRoot = currentCharacter()
+            if not currentRoot or (currentRoot.Position - target).Magnitude > 12 then setStatus("Outside crafting range") return end
+            local remote = ReplicatedStorage:FindFirstChild("Remote")
+            remote = remote and remote:FindFirstChild("Crafting")
+            if not remote then error("Crafting remotes unavailable") end
+            if not filled then
+                setStatus("Adding ingredients")
+                local expected = {}
+                for _, ingredient in ipairs(latest.Ingredients) do
+                    expected[ingredient.Name] = math.min(ingredient.Required, ingredient.Added + ingredient.Owned)
+                end
+                local ok, err = callRemote(remote.AddAllIngredients, token, namespace, recipeName, false)
+                if not ok then setStatus("Add failed", err) nextAttempt = os.clock() + 30 return end
+                latest = awaitData(function(value)
+                    for _, ingredient in ipairs(value.Ingredients) do
+                        if ingredient.Added < (expected[ingredient.Name] or ingredient.Required) then return false end
+                    end
+                    return true
+                end, token, 8)
+                if not latest then setStatus("Ingredients unconfirmed; crafting paused") nextAttempt = os.clock() + 30 return end
+                local _, complete = plan(latest)
+                if not complete then setStatus("Materials added; waiting for remaining ingredients") return end
+            end
+            if not active(token) then return end
+            latest = readSnapshot()
+            local _, complete = plan(latest)
+            local _, _, craftRoot = currentCharacter()
+            if not complete or not craftRoot or (craftRoot.Position - target).Magnitude > 12 then setStatus("Craft check failed") return end
+            local previousCount = latest.Count
+            setStatus("Crafting " .. recipeName)
+            pendingOutcomes[recipeName] = previousCount
+            local ok, err, outcome = callRemote(remote.CraftRecipe, token, namespace, recipeName)
+            if not ok then
+                if outcome == "rejected" then pendingOutcomes[recipeName] = nil end
+                setStatus("Craft failed", err)
+                nextAttempt = os.clock() + 30
+                return
+            end
+            local confirmed = awaitData(function(value) return value.Count > previousCount end, token, 8)
+            if confirmed then
+                completed += 1
+                pendingOutcomes[recipeName] = nil
+                log(recipeName .. " crafted; inventory " .. tostring(previousCount) .. " -> " .. tostring(confirmed.Count), "INFO")
+                setStatus("Craft confirmed")
+            else
+                setStatus("Inventory unconfirmed; crafting paused")
+                nextAttempt = os.clock() + 30
+            end
+        end
+        local ok, err = pcall(make)
+        if not ok then setStatus("Crafting paused", tostring(err)) nextAttempt = os.clock() + 30 end
+    end
+
+    local function cycle(token)
+        local _, _, root = currentCharacter()
+        if not root then return end
+        local idlePosition = root.Position
+        for _, name in ipairs(copy(selectedRecipes)) do
+            if not active(token) or inFlight then break end
+            recipeName = name
+            if bridge then bridge:SetAttribute("Recipe", name) end
+            local data = readSnapshot()
+            if not data then
+                data = awaitData(function() return true end, token, 2)
+            end
+            if data then cycleRecipe(token) end
+        end
+        local target = cauldronPosition()
+        local _, _, finalRoot = currentCharacter()
+        if not target or not finalRoot or (finalRoot.Position - idlePosition).Magnitude <= 5 then return end
+        if active(token) and (idlePosition - target).Magnitude > 15 then
+            local previousStatus, previousError = status, lastError
+            setStatus("Returning to idle position", previousError)
+            local returned, returnError = travel(idlePosition, token, 5)
+            if returned then setStatus(previousStatus, previousError) else setStatus("Return route blocked", returnError) nextAttempt = os.clock() + 30 end
+        end
+    end
+
+    local function launch()
+        if busy or not alive then return false end
+        local available = false
+        for _, name in ipairs(selectedRecipes) do
+            local data = readSnapshot(name)
+            if data then
+                local ready, filled = plan(data)
+                if ready or filled or (pendingOutcomes[name] and data.Count > pendingOutcomes[name]) then available = true end
+                for _, ingredient in ipairs(data.Ingredients or {}) do
+                    if ingredient.Required > ingredient.Added and ingredient.Owned > 0 then available = true break end
+                end
+            end
+        end
+        if not available then MovementCoordinator.Cancel("Potion") return false end
+        movementTicket = MovementCoordinator.Acquire("Potion")
+        if not movementTicket then return false end
+        busy, navigationOwner = true, "Potion"
+        local token = epoch
+        task.spawn(function()
+            local ok, err = pcall(cycle, token)
+            if not ok then setStatus("Crafting error", tostring(err)) nextAttempt = os.clock() + 30 end
+            MovementCoordinator.Release("Potion", movementTicket)
+            movementTicket, movingHumanoid, navigationOwner, busy = nil, nil, nil, false
+            nextAttempt = math.max(nextAttempt, os.clock() + 2)
+        end)
+        return true
+    end
+
+    function controller.SetEnabled(value)
+        enabled = value == true
+        epoch += 1
+        if not enabled then MovementCoordinator.Cancel("Potion") end
+        if not enabled and movingHumanoid and MovementCoordinator.IsOwner("Potion", movementTicket) then
+            local _, _, root = currentCharacter()
+            if root then pcall(function() movingHumanoid:MoveTo(root.Position) end) end
+            movingHumanoid = nil
+        end
+        nextAttempt = 0
+        setStatus(enabled and "Auto craft enabled" or "Auto craft disabled")
+        return enabled
+    end
+
+    function controller.RunOnce()
+        if busy or enabled then return false, "Already running" end
+        if os.clock() < nextAttempt then return false, "Retry cooldown" end
+        return launch()
+    end
+
+    function controller.SelectRecipe(value)
+        return controller.SelectRecipes({ value })
+    end
+
+    function controller.SelectRecipes(values)
+        if type(values) ~= "table" then return false end
+        local list, seen = {}, {}
+        for _, value in ipairs(values) do
+            if type(value) ~= "string" then return false end
+            value = trim(value)
+            if value ~= "" and not seen[value] then list[#list + 1], seen[value] = value, true end
+        end
+        epoch += 1
+        nextAttempt = 0
+        if #list == 0 then MovementCoordinator.Cancel("Potion") end
+        if movingHumanoid and MovementCoordinator.IsOwner("Potion", movementTicket) then
+            local _, _, root = currentCharacter()
+            if root then pcall(function() movingHumanoid:MoveTo(root.Position) end) end
+            movingHumanoid = nil
+        end
+        selectedRecipes = list
+        recipeName = list[1] or recipeName
+        if bridge then
+            bridge:SetAttribute("Recipe", recipeName)
+        end
+        syncingRecipes = true
+        if selector then pcall(function() selector:SetSelected(copy(selectedRecipes)) end) end
+        syncingRecipes = false
+        return true
+    end
+
+    function controller.GetState()
+        local data = readSnapshot()
+        local ready, filled = plan(data)
+        return {
+            Enabled = enabled, Busy = busy, Status = status, Error = lastError, NavigationOwner = navigationOwner,
+            MovementOwner = MovementCoordinator.GetState().Owner, WaitingForMovement = MovementCoordinator.Wants("Potion"),
+            Recipe = recipeName, Completed = completed, Count = data and data.Count,
+            SelectedRecipes = copy(selectedRecipes),
+            DataReady = data ~= nil, MaterialsReady = ready, IngredientsFilled = filled,
+            Ingredients = data and copy(data.Ingredients) or {},
+            PendingRequest = inFlight ~= nil, PendingOutcome = next(pendingOutcomes) ~= nil,
+            PendingRecipes = copy(pendingOutcomes),
+            BridgeError = bridge and bridge:GetAttribute("Error"),
+            Recipes = data and copy(data.Recipes) or {},
+        }
+    end
+
+    local function mountSelector(names)
+        local signature = table.concat(names, "\n")
+        if selector and selectorSignature == signature then return end
+        if selector and selector.Frame then selector.Frame:Destroy() end
+        selectorSignature = signature
+        selector = UI:AddMultiSelect(mounted, "Potions", names, function(values)
+            if syncingRecipes or type(values) ~= "table" then return end
+            local choices = {}
+            for _, name in ipairs(names) do if values[name] == true then choices[#choices + 1] = name end end
+            controller.SelectRecipes(choices)
+        end)
+        selector:SetSelected(copy(selectedRecipes))
+        if selector.Frame then selector.Frame.LayoutOrder = 0 end
+    end
+
+    function controller.Mount(page)
+        mounted = page
+        mountSelector({})
+        UI:AddToggle(page, "Auto Craft", false, controller.SetEnabled)
+    end
+
+    function controller.Destroy()
+        controller.SetEnabled(false)
+        alive = false
+        if bridge then bridge:SetAttribute("Active", false) bridge:Destroy() bridge = nil end
+    end
+
+    task.spawn(function()
+        local runner = ENV.run_on_actor or run_on_actor
+        local actor = game:GetService("ReplicatedFirst"):FindFirstChild("ClientHandlers")
+        if type(runner) ~= "function" or not actor then setStatus("Actor support unavailable") return end
+        local core = game:GetService("CoreGui")
+        local old = core:FindFirstChild("BonesHubPotionBridge")
+        if old then old:Destroy() end
+        bridge = Instance.new("Folder")
+        bridge.Name = "BonesHubPotionBridge"
+        bridge:SetAttribute("Active", true)
+        bridge:SetAttribute("Recipe", recipeName)
+        bridge.Parent = core
+        local ok, err = pcall(runner, actor, [=[
+            if setthreadidentity then setthreadidentity(8) end
+            local rs = game:GetService("ReplicatedStorage")
+            local player = game:GetService("Players").LocalPlayer
+            local bridge = game:GetService("CoreGui"):FindFirstChild("BonesHubPotionBridge")
+            if not bridge then return end
+            local function alive() return bridge.Parent ~= nil and bridge:GetAttribute("Active") == true end
+            local ok, err = pcall(function()
+                local replicaController = require(rs.ReplicaController)
+                local namespace = "StellaCauldron"
+                local db = require(rs.Storage.RecipeDB)
+                local recipes, requests = {}, {}
+                local function accept(name, recipe)
+                    if type(recipe) == "table" and recipe.CraftingTable == namespace and type(recipe.Ingredients) == "table" and #recipe.Ingredients > 0 and recipe.Type == "Item" then
+                        recipes[name] = recipe
+                    end
+                end
+                local function request(name)
+                    if requests[name] or recipes[name] then return end
+                    requests[name] = true
+                    task.spawn(function()
+                        local ok, recipe = pcall(function() return db:GetValue(name) end)
+                        if ok and alive() then accept(name, recipe) end
+                    end)
+                end
+                request("Heavenly Potion")
+                while alive() do
+                    if setthreadidentity then setthreadidentity(8) end
+                    local recipeName = bridge:GetAttribute("Recipe") or "Heavenly Potion"
+                    local data
+                    local uid = player:GetAttribute("UID")
+                    for _, replica in pairs(replicaController._replicas or {}) do
+                        if replica.Class == "PlayerData" and tostring(replica.Id) == tostring(uid) then data = replica.Data break end
+                    end
+                    if data then
+                        local itemList = rs:FindFirstChild("ItemList")
+                        local progressList = data.CraftingProgresses and data.CraftingProgresses[namespace] or {}
+                        for name in pairs(progressList) do
+                            local item = itemList and itemList:FindFirstChild(name)
+                            local displayName = item and item:GetAttribute("DisplayName") or name
+                            if item and (name:find("Potion", 1, true) or tostring(displayName):find("Potion", 1, true)) and not requests[name] and not recipes[name] then
+                                request(name)
+                                task.wait(0.35)
+                            end
+                        end
+                        if debug and debug.getupvalues then
+                            for _, cache in pairs(debug.getupvalues(db.GetValue)) do
+                                if type(cache) == "table" then
+                                    for name, value in pairs(cache) do if type(name) == "string" then accept(name, value) end end
+                                end
+                            end
+                        end
+                        local counts = {}
+                        for index, aura in pairs(data.InventoryAuras or {}) do
+                            if type(aura) == "table" and type(aura.Name) == "string" and not aura.Locked and tostring(index) ~= tostring(data.EquippedAuraIndex) then
+                                counts[aura.Name] = (counts[aura.Name] or 0) + 1
+                            end
+                        end
+                        local byRecipe, names = {}, {}
+                        for name, recipe in pairs(recipes) do
+                          local progress = progressList[name] or {}
+                          local ingredients = {}
+                          for _, ingredient in ipairs(recipe.Ingredients) do
+                            local name = ingredient.name or ingredient[1]
+                            local required = tonumber(ingredient.amount or ingredient[2])
+                            if type(name) ~= "string" or not required or required <= 0 then error("Invalid recipe ingredient") end
+                            local item = data.Inventory and data.Inventory[name]
+                            local owned = type(item) == "table" and tonumber(item.Amount) or counts[name] or 0
+                            local added = progress[name] or 0
+                            if type(added) ~= "number" then error("Invalid crafting progress") end
+                            ingredients[#ingredients + 1] = {
+                                Name = name, DisplayName = ingredient.displayName or name,
+                                Required = required, Owned = owned, Added = added,
+                            }
+                          end
+                          local potion = data.Inventory and data.Inventory[name]
+                          local item = itemList and itemList:FindFirstChild(name)
+                          byRecipe[name] = { Recipe = name, DisplayName = recipe.DisplayName or item and item:GetAttribute("DisplayName") or name, Ingredients = ingredients, Count = type(potion) == "table" and tonumber(potion.Amount) or 0, PortalUnlocked = data.CaveShortcutUnlocked == true }
+                          names[#names + 1] = name
+                        end
+                        table.sort(names)
+                        local out = { Recipe = recipeName, Recipes = names, ByRecipe = byRecipe }
+                        bridge:SetAttribute("Error", nil)
+                        bridge:SetAttribute("Snapshot", game:GetService("HttpService"):JSONEncode(out))
+                        bridge:SetAttribute("UpdatedAt", workspace:GetServerTimeNow())
+                    end
+                    task.wait(0.5)
+                end
+            end)
+            if not ok and alive() then bridge:SetAttribute("Error", tostring(err)) end
+        ]=])
+        if not ok and bridge then bridge:SetAttribute("Error", tostring(err)) end
+    end)
+
+    task.spawn(function()
+        while alive and Alive do
+            local ok, err = pcall(function()
+                if mounted then
+                    local visible = {}
+                    local encoded = bridge and bridge:GetAttribute("Snapshot")
+                    local decoded, catalog = pcall(HttpService.JSONDecode, HttpService, encoded or "")
+                    if decoded and type(catalog) == "table" then mountSelector(catalog.Recipes or {}) end
+                    for _, name in ipairs(selectedRecipes) do
+                      local selectedData = readSnapshot(name)
+                      for _, ingredient in ipairs(selectedData and selectedData.Ingredients or {}) do
+                        local key = name .. ":" .. ingredient.Name
+                        visible[key] = true
+                        if not rows[key] then
+                            rows[key] = UI:AddMetricRow(mounted, { { Label = name .. " / " .. ingredient.DisplayName, Value = "", Unit = "Owned / Required | Added" } })[1]
+                        end
+                        if rows[key].ValueLabel then rows[key].ValueLabel.Text = tostring(ingredient.Owned) .. " / " .. tostring(ingredient.Required) .. " | " .. tostring(ingredient.Added) end
+                      end
+                    end
+                    for key, row in pairs(rows) do if row.ValueLabel and row.ValueLabel.Parent then row.ValueLabel.Parent.Visible = visible[key] == true end end
+                end
+                if enabled and not busy and os.clock() >= nextAttempt then launch() end
+            end)
+            if not ok then setStatus("Crafting error", tostring(err)) nextAttempt = os.clock() + 30 end
+            task.wait(0.5)
+        end
+    end)
+    return controller
+end)()
+
+local FishingAutomation = (function()
+    local controller = {}
+    local bridge, metrics, selector
+    local enabled, autoSell, early, living = false, false, false, true
+    local areas, blocked = {}, {}
+    local epoch, nextAttempt, sellSequence = 0, 0, 0
+    local sellRequested, selling, saleFault = false, false, false
+    local target, lastError, navigation = nil, nil, false
+    local targetUsedAt = -math.huge
+    local areaNames = { "Sol's World - Main Island", "Sol's World - Island 1", "Sol's World - Island 2" }
+    local owner = "Fishing"
+    local movementTicket, movingHumanoid
+    local snapshotText, cachedSnapshot
+    local hideResults = true
+
+    local function rootPart()
+        local character = LocalPlayer.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        if root and humanoid and humanoid.Health > 0 then return root end
+    end
+
+    local function snapshot()
+        if not bridge or not bridge.Parent then return nil end
+        local updated = bridge:GetAttribute("UpdatedAt")
+        if type(updated) ~= "number" or workspace:GetServerTimeNow() - updated > 3 then return nil end
+        local encoded = bridge:GetAttribute("Snapshot") or ""
+        if encoded == snapshotText then return cachedSnapshot end
+        local ok, result = pcall(HttpService.JSONDecode, HttpService, encoded)
+        if ok and type(result) == "table" then snapshotText, cachedSnapshot = encoded, result return result end
+    end
+
+    local function attribute(name, value)
+        if bridge and bridge.Parent and bridge:GetAttribute(name) ~= value then bridge:SetAttribute(name, value) end
+    end
+
+    local function pause(value)
+        attribute("Paused", value)
+    end
+
+    local function cancel()
+        epoch += 1
+        target = nil
+        targetUsedAt = -math.huge
+        MovementCoordinator.Cancel(owner)
+        if movingHumanoid and MovementCoordinator.IsOwner(owner, movementTicket) then
+            local root = rootPart()
+            if root then pcall(function() movingHumanoid:MoveTo(root.Position) movingHumanoid.Jump = false end) end
+        end
+        if bridge and bridge.Parent then
+            bridge:SetAttribute("Spot", nil)
+            bridge:SetAttribute("SellAuthorized", false)
+            pause(true)
+        end
+    end
+
+    function controller.SetEnabled(value)
+        enabled = value == true
+        cancel()
+        if bridge then bridge:SetAttribute("Enabled", enabled) end
+        return enabled
+    end
+
+    function controller.SelectAreas(values)
+        if type(values) ~= "table" then return false end
+        local selected = {}
+        for _, name in ipairs(values) do
+            if table.find(areaNames, name) and not table.find(selected, name) then selected[#selected + 1] = name end
+        end
+        areas = selected
+        if selector then pcall(function() selector:SetSelected(copy(areas)) end) end
+        table.clear(blocked)
+        nextAttempt = 0
+        cancel()
+        return true
+    end
+
+    function controller.SetEarly(value)
+        early = value == true
+        if bridge then bridge:SetAttribute("Early", early) end
+        return early
+    end
+
+    function controller.SetHideResults(value)
+        hideResults = value == true
+        attribute("HideResults", hideResults)
+        return hideResults
+    end
+
+    function controller.SetAutoSell(value)
+        autoSell = value == true
+        saleFault = false
+        if not autoSell and selling then cancel() end
+        return autoSell
+    end
+
+    function controller.SellAll()
+        if not bridge or bridge:GetAttribute("SaleReady") ~= true then return false, "Shop listener unavailable" end
+        if selling or sellRequested then return false, "Sale already queued" end
+        local current = snapshot()
+        if not current or current.SalePending then return false, "Sale confirmation pending" end
+        saleFault, sellRequested = false, true
+        cancel()
+        return true
+    end
+
+    function controller.CancelSale()
+        sellRequested = false
+        saleFault = true
+        cancel()
+    end
+
+    local function valid(token)
+        return living and Alive and epoch == token
+    end
+
+local FishSpots = (function()
+    local catalog, byId, byLabel, selected = {}, {}, {}, {}
+    local selector, mountedPage, onChanged
+    local signature, syncing = "", false
+    local spots = {}
+    local boundFolder, dirty, refreshAt = nil, true, 0
+    local connections = {}
+
+    local function bindFolder(folder)
+        if boundFolder == folder then return end
+        for _, connection in ipairs(connections) do connection:Disconnect() end
+        table.clear(connections)
+        boundFolder, dirty = folder, true
+        for _, signal in ipairs({ folder.ChildAdded, folder.ChildRemoved }) do
+            connections[#connections + 1] = signal:Connect(function() dirty = true end)
+        end
+    end
+
+    local function selectedLabels()
+        local labels = {}
+        for _, id in ipairs(selected) do
+            if byId[id] then labels[#labels + 1] = byId[id].Label end
+        end
+        return labels
+    end
+
+    local function syncSelected()
+        if not selector then return end
+        syncing = true
+        pcall(function() selector:SetSelected(selectedLabels()) end)
+        syncing = false
+    end
+
+    local function same(a, b)
+        if #a ~= #b then return false end
+        for index, value in ipairs(a) do if b[index] ~= value then return false end end
+        return true
+    end
+
+    local function publish(previous)
+        if not same(previous, selected) and type(onChanged) == "function" then
+            onChanged(copy(selected))
+        end
+    end
+
+    local function rebuild()
+        if mountedPage == nil or not UI then return end
+        local order
+        if selector and selector.Frame then
+            pcall(function() order = selector.Frame.LayoutOrder end)
+            pcall(function() selector.Frame:Destroy() end)
+        end
+        local labels = {}
+        for _, entry in ipairs(catalog) do labels[#labels + 1] = entry.Label end
+        syncing = true
+        selector = UI:AddMultiSelect(mountedPage, "Fishing Spots", labels, function(values)
+            if syncing then return end
+            local choices = {}
+            if type(values) == "table" then
+                for _, entry in ipairs(catalog) do
+                    if values[entry.Label] == true then choices[#choices + 1] = entry.Id end
+                end
+            end
+            spots.Select(choices)
+        end)
+        if order ~= nil and selector and selector.Frame then
+            pcall(function() selector.Frame.LayoutOrder = order end)
+        end
+        syncing = false
+        syncSelected()
+    end
+
+    local function defaultFolder()
+        local map = workspace:FindFirstChild("Map")
+        local miscs = map and map:FindFirstChild("Miscs")
+        return miscs and miscs:FindFirstChild("FishingPoints")
+    end
+
+    local function readPoint(point)
+        local ok, id, area, position = pcall(function()
+            local pointId = point:GetAttribute("spotId")
+            local location = point:GetAttribute("locationName")
+            local standing = point:GetAttribute("plrLoc")
+            local at = typeof(standing) == "CFrame" and standing.Position or point:GetPivot().Position
+            return pointId, location, at
+        end)
+        if not ok or type(id) ~= "string" or id == "" or type(area) ~= "string" or area == "" then return end
+        if not position or type(position.X) ~= "number" or type(position.Z) ~= "number" then return end
+        if position.X ~= position.X or position.Z ~= position.Z or math.abs(position.X) == math.huge or math.abs(position.Z) == math.huge then return end
+        local label = string.format("%s | %.0f, %.0f [%s]", area, position.X, position.Z, id:sub(1, 8))
+        return { Id = id, Label = label, Area = area, Model = point, X = position.X, Z = position.Z }
+    end
+
+    function spots.Refresh(pointsFolder)
+        local folder = pointsFolder or defaultFolder()
+        if not folder then return false end
+        local ok, children = pcall(function() return folder:GetChildren() end)
+        if not ok or type(children) ~= "table" then return false end
+        bindFolder(folder)
+        dirty, refreshAt = false, os.clock() + 30
+        local entries, ids, labels = {}, {}, {}
+        for _, point in ipairs(children) do
+            local entry = readPoint(point)
+            if entry and not ids[entry.Id] then
+                entries[#entries + 1] = entry
+                ids[entry.Id] = entry
+                labels[entry.Label] = (labels[entry.Label] or 0) + 1
+            end
+        end
+        for _, entry in ipairs(entries) do
+            if labels[entry.Label] > 1 then
+                entry.Label = string.format("%s | %.0f, %.0f [%s]", entry.Area, entry.X, entry.Z, entry.Id)
+            end
+        end
+        table.sort(entries, function(a, b)
+            if a.Area ~= b.Area then return a.Area < b.Area end
+            if a.X ~= b.X then return a.X < b.X end
+            if a.Z ~= b.Z then return a.Z < b.Z end
+            return a.Id < b.Id
+        end)
+        if #entries > 4 then
+            local limited, seen = {}, {}
+            local anchors = {
+                { "Sol's World - Main Island", 213.52, -177.34 },
+                { "Sol's World - Main Island", 217.65, -172.54 },
+                { "Sol's World - Island 1", 19.21, -150.54 },
+                { "Sol's World - Island 2", 353.21, -70.54 },
+            }
+            for _, anchor in ipairs(anchors) do
+                local chosen, best
+                for _, entry in ipairs(entries) do
+                    if entry.Area == anchor[1] and not seen[entry.Id] then
+                        local distance = (entry.X - anchor[2]) ^ 2 + (entry.Z - anchor[3]) ^ 2
+                        if not best or distance < best then chosen, best = entry, distance end
+                    end
+                end
+                if chosen then limited[#limited + 1], seen[chosen.Id] = chosen, true end
+            end
+            for _, entry in ipairs(entries) do
+                if #limited >= 4 then break end
+                if not seen[entry.Id] then limited[#limited + 1], seen[entry.Id] = entry, true end
+            end
+            local allowed = {}
+            for _, entry in ipairs(limited) do allowed[entry.Id] = true end
+            local filtered = {}
+            for _, entry in ipairs(entries) do if allowed[entry.Id] then filtered[#filtered + 1] = entry end end
+            entries, ids = filtered, {}
+            for _, entry in ipairs(entries) do ids[entry.Id] = entry end
+        end
+        local nextCatalog, nextByLabel, parts = {}, {}, {}
+        for _, entry in ipairs(entries) do
+            local public = { Id = entry.Id, Label = entry.Label, Area = entry.Area }
+            nextCatalog[#nextCatalog + 1] = public
+            nextByLabel[entry.Label] = entry.Id
+            parts[#parts + 1] = entry.Id .. "\0" .. entry.Label .. "\0" .. entry.Area
+        end
+        local nextSignature = table.concat(parts, "\1")
+        local previous = copy(selected)
+        catalog, byId, byLabel = nextCatalog, ids, nextByLabel
+        selected = {}
+        for _, id in ipairs(previous) do if byId[id] then selected[#selected + 1] = id end end
+        local changed = signature ~= nextSignature
+        signature = nextSignature
+        if changed then rebuild() end
+        publish(previous)
+        return changed
+    end
+
+    function spots.GetCatalog()
+        return copy(catalog)
+    end
+
+    function spots.GetPoints()
+        local points = {}
+        for _, entry in ipairs(catalog) do points[#points + 1] = byId[entry.Id].Model end
+        return points
+    end
+
+    function spots.HasSelection()
+        return #selected > 0
+    end
+
+    function spots.NeedsRefresh(folder)
+        return boundFolder ~= folder or dirty or os.clock() >= refreshAt
+    end
+
+    function spots.Destroy()
+        for _, connection in ipairs(connections) do connection:Disconnect() end
+        table.clear(connections)
+        boundFolder = nil
+    end
+
+    function spots.Select(values)
+        if type(values) ~= "table" then return false end
+        local previous, nextSelected, seen = copy(selected), {}, {}
+        for _, value in ipairs(values) do
+            local id = type(value) == "string" and (byId[value] and value or byLabel[value]) or nil
+            if id and not seen[id] then
+                nextSelected[#nextSelected + 1] = id
+                seen[id] = true
+            end
+        end
+        selected = nextSelected
+        syncSelected()
+        publish(previous)
+        return true
+    end
+
+    function spots.GetSelected()
+        return copy(selected)
+    end
+
+    function spots.Contains(point)
+        if #selected == 0 then return true end
+        local ok, id = pcall(function() return point:GetAttribute("spotId") end)
+        return ok and type(id) == "string" and table.find(selected, id) ~= nil
+    end
+
+    function spots.Mount(page, callback)
+        mountedPage, onChanged = page, callback
+        rebuild()
+    end
+
+    return spots
+end)()
+
+    local function walkTo(targetPosition, isActive, reach)
+        local player = game:GetService("Players").LocalPlayer
+        local character = player.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        if not humanoid or not root or humanoid.Health <= 0 then return false, "Character unavailable" end
+        local deadline = os.clock() + 75
+        local clearance = humanoid.HipHeight + root.Size.Y / 2
+        if humanoid.HipHeight == 0 then
+            local leg = character:FindFirstChild("Left Leg")
+            clearance += leg and leg.Size.Y or 2
+        end
+        reach = math.clamp(tonumber(reach) or 3, 0.5, 3.5)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { character }
+        params.RespectCanCollide = true
+        params.IgnoreWater = true
+        local edgeJumps, edgeRecoveries = {}, {}
+        local jumps, recoveries, lastJump = 0, 0, -math.huge
+        local function valid()
+            return (not isActive or isActive()) and player.Character == character and humanoid.Health > 0
+        end
+        local function stop()
+            if player.Character == character then
+                humanoid:MoveTo(root.Position)
+                humanoid.Jump = false
+            end
+        end
+        local function waitFor(duration)
+            local untilAt = math.min(deadline, os.clock() + duration)
+            while valid() and os.clock() < untilAt do task.wait(math.min(0.05, untilAt - os.clock())) end
+            return valid() and os.clock() < deadline
+        end
+        local function offset(point)
+            local delta = root.Position - point
+            return Vector3.new(delta.X, 0, delta.Z), delta.Y
+        end
+        local function arrived()
+            local flat, height = offset(targetPosition)
+            return flat.Magnitude <= reach and math.abs(height) <= 4
+        end
+        local function grounded()
+            return humanoid.FloorMaterial ~= Enum.Material.Air or humanoid:GetState() == Enum.HumanoidStateType.Climbing
+        end
+        local gravity = math.max(tonumber(workspace.Gravity) or 196.2, 1)
+        local jumpRise = humanoid.UseJumpPower == false and tonumber(humanoid.JumpHeight) or (tonumber(humanoid.JumpPower) or 50) ^ 2 / (2 * gravity)
+        jumpRise = math.clamp((jumpRise or 7) - 0.5, 1, 7)
+        local function jump(edge)
+            if not valid() or not grounded() or jumps >= 12 or (edgeJumps[edge] or 0) >= 4 or os.clock() - lastJump < 0.8 then return false end
+            humanoid.Jump = true
+            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+            jumps += 1
+            edgeJumps[edge] = (edgeJumps[edge] or 0) + 1
+            lastJump = os.clock()
+            return true
+        end
+        local function lowObstacle(point)
+            local delta = point - root.Position
+            local flat = Vector3.new(delta.X, 0, delta.Z)
+            if flat.Magnitude < 0.1 then return false end
+            local feet = root.Position - Vector3.new(0, clearance, 0)
+            local obstacle = workspace:Raycast(feet + Vector3.new(0, 0.8, 0), flat.Unit * math.min(flat.Magnitude, 3.5), params)
+            if not obstacle or not obstacle.Instance.CanCollide then return false end
+            local above = obstacle.Position + flat.Unit * 0.8 + Vector3.new(0, jumpRise + 1.5, 0)
+            local top = workspace:Raycast(above, Vector3.new(0, -jumpRise - 2.5, 0), params)
+            if not top or top.Normal.Y < 0.6 then return false end
+            local rise = top.Position.Y - feet.Y
+            if rise < 0.5 or rise > jumpRise then return false end
+            if workspace:Raycast(root.Position, Vector3.new(0, jumpRise + root.Size.Y / 2, 0), params) then return false end
+            return workspace:Raycast(top.Position + Vector3.new(0, 0.2, 0), Vector3.new(0, clearance + root.Size.Y / 2 + 1, 0), params) == nil
+        end
+        local function runUp(point, previousPoint, edge, waypointDeadline)
+            local flat = offset(point)
+            if flat.Magnitude < 0.5 and previousPoint then
+                local previous = previousPoint - point
+                flat = Vector3.new(previous.X, 0, previous.Z)
+            end
+            if flat.Magnitude < 0.5 then return false end
+            local back = root.Position + flat.Unit * 4.5
+            local floor = workspace:Raycast(back + Vector3.new(0, 3, 0), Vector3.new(0, -clearance - 10, 0), params)
+            if not floor or floor.Normal.Y < 0.6 or math.abs(floor.Position.Y - root.Position.Y + clearance) > 4.5 then return false end
+            back = floor.Position + Vector3.new(0, clearance, 0)
+            humanoid:MoveTo(back)
+            if not waitFor(math.min(0.45, math.max(0, waypointDeadline - os.clock()))) then return false end
+            if os.clock() >= waypointDeadline then return false end
+            humanoid:MoveTo(point)
+            local approachDeadline = math.min(deadline, waypointDeadline, os.clock() + 0.7)
+            while valid() and os.clock() < approachDeadline do
+                local approach = offset(point)
+                if approach.Magnitude < 2.8 then return jump(edge) end
+                task.wait(math.min(0.05, approachDeadline - os.clock()))
+            end
+            return false
+        end
+        local pathService = game:GetService("PathfindingService")
+        for attempt = 1, 5 do
+            if not valid() or os.clock() >= deadline then break end
+            if arrived() then stop() return true end
+            local path = pathService:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 3 })
+            local computed, done = false, false
+            local startPosition = root.Position
+            task.spawn(function()
+                computed = pcall(function() path:ComputeAsync(startPosition, targetPosition) end)
+                done = true
+            end)
+            local computeDeadline = math.min(deadline, os.clock() + 6)
+            while valid() and not done and os.clock() < computeDeadline do task.wait(0.05) end
+            if not valid() then break end
+            if not done then stop() return false, "Path computation timed out" end
+            if computed and path.Status == Enum.PathStatus.Success then
+                local waypoints = path:GetWaypoints()
+                local currentIndex, blockedIndex = 1, math.huge
+                local connection = path.Blocked:Connect(function(index)
+                    if index >= currentIndex then blockedIndex = math.min(blockedIndex, index) end
+                end)
+                for index, waypoint in ipairs(waypoints) do
+                    currentIndex = index
+                    if not valid() or os.clock() >= deadline or blockedIndex <= index or arrived() then break end
+                    local point = waypoint.Position
+                    local edge = string.format("%d:%d:%d", math.floor(point.X / 2), math.floor(point.Y / 2), math.floor(point.Z / 2))
+                    local isJump = waypoint.Action == Enum.PathWaypointAction.Jump
+                    local radius = isJump and 2 or index == #waypoints and math.min(reach, 2.5) or 2.5
+                    local waypointDeadline = math.min(deadline, os.clock() + 6)
+                    local best, progressAt, jumpPressed, climbRetries = math.huge, os.clock(), false, 0
+                    local waypointReached = false
+                    while valid() and os.clock() < waypointDeadline and blockedIndex > index do
+                        local flat, height = offset(point)
+                        local distance, rise = flat.Magnitude, clearance - height
+                        local metric = distance + math.abs(height - clearance)
+                        if metric < best - 0.2 then best, progressAt = metric, os.clock() end
+                        if isJump and not jumpPressed and distance < 3 and (distance > 0.3 or rise > 0.4) then
+                            jumpPressed = jump(edge)
+                        end
+                        local nearbyBelow = not isJump and distance < 2 and height > -1.5
+                        if (distance <= radius and math.abs(height - clearance) <= 2.3) or nearbyBelow then waypointReached = true break end
+                        if arrived() then waypointReached = true break end
+                        humanoid:MoveTo(point)
+                        local stalled = os.clock() - progressAt
+                        if stalled >= 1.2 then
+                            local raisedStep = isJump and rise > 1.2 and rise <= jumpRise + 0.75
+                            local canRecover = grounded() and (raisedStep or lowObstacle(point))
+                            if canRecover and climbRetries < 4 and recoveries < 8 and (edgeRecoveries[edge] or 0) < 3 then
+                                climbRetries += 1
+                                recoveries += 1
+                                edgeRecoveries[edge] = (edgeRecoveries[edge] or 0) + 1
+                                local previous = waypoints[index - 1]
+                                if not runUp(point, previous and previous.Position, edge, waypointDeadline) then break end
+                                progressAt = os.clock()
+                                jumpPressed = true
+                            else
+                                break
+                            end
+                        end
+                        task.wait(math.min(0.15, math.max(0, waypointDeadline - os.clock())))
+                    end
+                    humanoid.Jump = false
+                    if not waypointReached and not arrived() then break end
+                end
+                connection:Disconnect()
+                if valid() and arrived() then stop() return true end
+            end
+            stop()
+            if attempt < 5 and not waitFor(0.5) then break end
+        end
+        stop()
+        return false, not valid() and "Stopped" or os.clock() >= deadline and "Route timed out" or "Route unavailable"
+    end
+
+    local function navigate(position, token, reach)
+        if not valid(token) or not MovementCoordinator.IsOwner(owner, movementTicket) then return false, "Stopped" end
+        navigation = true
+        local character = LocalPlayer.Character
+        movingHumanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local ran, ok, err = pcall(walkTo, position, function()
+            return valid(token) and MovementCoordinator.IsOwner(owner, movementTicket)
+        end, reach or 3)
+        navigation, movingHumanoid = false, nil
+        if not ran then return false, tostring(ok) end
+        if not valid(token) then return false, "Stopped" end
+        return ok, err
+    end
+
+    local function releaseMovement()
+        pause(true)
+        attribute("MovementGranted", false)
+        if movementTicket then MovementCoordinator.Release(owner, movementTicket) end
+        MovementCoordinator.Cancel(owner)
+        movementTicket = nil
+    end
+
+    local function acquireMovement()
+        movementTicket = MovementCoordinator.Acquire(owner)
+        local granted = movementTicket ~= nil
+        attribute("MovementGranted", granted)
+        return granted
+    end
+
+    local function spots()
+        local map = workspace:FindFirstChild("Map")
+        local miscs = map and map:FindFirstChild("Miscs")
+        return miscs and miscs:FindFirstChild("FishingPoints"), miscs
+    end
+
+    local function position(spot)
+        local standing = spot:GetAttribute("plrLoc")
+        if typeof(standing) == "CFrame" then return standing.Position end
+        return spot:GetPivot().Position
+    end
+
+    local function selectedPoint(point)
+        if FishSpots.HasSelection() then return FishSpots.Contains(point) end
+        return table.find(areas, point:GetAttribute("locationName")) ~= nil
+    end
+
+    function controller.SelectSpots(values)
+        if not FishSpots.Select(values) then return false end
+        table.clear(blocked)
+        nextAttempt = 0
+        cancel()
+        return true
+    end
+
+    function controller.GetSpots()
+        return FishSpots.GetCatalog()
+    end
+
+    local function choose()
+        local root = rootPart()
+        local points = spots()
+        if not root or not points then return nil end
+        local selected, best
+        for _, point in ipairs(FishSpots.GetPoints()) do
+            local id = point:GetAttribute("spotId")
+            if type(id) == "string" and selectedPoint(point) and not point:GetAttribute("occupied") and (blocked[id] or 0) <= os.clock() then
+                local distance = (root.Position - position(point)).Magnitude
+                if not best or distance < best then selected, best = point, distance end
+            end
+        end
+        return selected
+    end
+
+    local function sale(token)
+        selling, sellRequested = true, false
+        pause(true)
+        bridge:SetAttribute("Spot", nil)
+        target = nil
+        local function perform()
+            if bridge:GetAttribute("SaleReady") ~= true then return false, "Shop listener unavailable" end
+            local deadline = os.clock() + 5
+            local current = snapshot()
+            while valid(token) and (not current or current.Fishing) and os.clock() < deadline do task.wait(0.08) current = snapshot() end
+            if not valid(token) then return false, "Stopped" end
+            if not current or current.Fishing then return false, "Fishing session still active" end
+            if current.Count == 0 then return true end
+            local _, miscs = spots()
+            local shop = miscs and miscs:FindFirstChild("FishShop")
+            if not shop then return false, "Fish shop unavailable" end
+            local npc = shop:FindFirstChild("NPC")
+            local merchant = (npc or shop):GetPivot().Position
+            local ok, err = navigate(merchant, token, 3.5)
+            if not ok then return false, err end
+            local root = rootPart()
+            if not valid(token) or not root or (root.Position - merchant).Magnitude > 4.5 then return false, "Outside merchant range" end
+            local settleUntil = os.clock() + 0.25
+            while valid(token) and os.clock() < settleUntil do task.wait(0.04) end
+            sellSequence += 1
+            bridge:SetAttribute("SaleError", nil)
+            bridge:SetAttribute("SaleDone", false)
+            bridge:SetAttribute("SellSequence", sellSequence)
+            bridge:SetAttribute("SellAuthorized", true)
+            deadline = os.clock() + 180
+            while valid(token) and os.clock() < deadline do
+                if bridge:GetAttribute("SaleDone") == true then return true end
+                if bridge:GetAttribute("SaleError") then return false, bridge:GetAttribute("SaleError") end
+                if bridge:GetAttribute("Error") then return false, bridge:GetAttribute("Error") end
+                task.wait(0.15)
+            end
+            return false, valid(token) and "Sale timed out" or "Stopped"
+        end
+        local ran, ok, err = pcall(perform)
+        if bridge and bridge.Parent then bridge:SetAttribute("SellAuthorized", false) end
+        selling = false
+        if not ran or not ok then
+            lastError = ran and err or tostring(ok)
+            saleFault = true
+            nextAttempt = os.clock() + 10
+        else lastError = nil end
+    end
+
+    local function step()
+        local current = snapshot()
+        if not current then releaseMovement() return end
+        if MovementCoordinator.Wants("Potion") and movementTicket then
+            attribute("YieldAfterCatch", true)
+            if not current.Fishing and not current.SalePending and not selling then releaseMovement() return end
+        else attribute("YieldAfterCatch", false) end
+        if os.clock() < nextAttempt then
+            pause(true)
+            if not current.Fishing and not current.SalePending then releaseMovement() end
+            return
+        end
+        local full = current.Capacity > 0 and current.Count >= current.Capacity
+        local needsSale = sellRequested or (enabled and autoSell and full and not saleFault)
+        if not needsSale and (not enabled or (#areas == 0 and not FishSpots.HasSelection()) or full or current.Capacity <= 0) then
+            pause(true)
+            if not current.Fishing and not current.SalePending then releaseMovement() end
+            return
+        end
+        if not acquireMovement() then pause(true) return end
+        if needsSale then sale(epoch) return end
+        if current.Fishing then targetUsedAt = os.clock() pause(false) return end
+        if target and (not target.Parent or not selectedPoint(target)) then target = nil end
+        if target and target:GetAttribute("occupied") then
+            if os.clock() - targetUsedAt < 1.5 then pause(true) return end
+            target = nil
+        end
+        target = target or choose()
+        if not target then releaseMovement() nextAttempt = os.clock() + 3 return end
+        local selected, token = target, epoch
+        local root = rootPart()
+        if not root then releaseMovement() return end
+        attribute("Spot", selected:GetAttribute("spotId"))
+        if (root.Position - position(selected)).Magnitude > 4 then
+            pause(true)
+            local ok, err = navigate(position(selected), token, 3)
+            if not valid(token) then return end
+            if not ok then
+                blocked[selected:GetAttribute("spotId")] = os.clock() + 45
+                target, lastError = nil, err
+                bridge:SetAttribute("Spot", nil)
+                nextAttempt = os.clock() + 1.5
+                return
+            end
+        end
+        if not valid(token) or selected:GetAttribute("occupied") then target = nil return end
+        lastError = nil
+        pause(false)
+    end
+
+    function controller.GetState()
+        local current = snapshot() or {}
+        return {
+            Enabled = enabled, AutoSell = autoSell, Early = early, HideResults = hideResults, Areas = copy(areas),
+            SelectedSpots = FishSpots.GetSelected(), MovementOwner = MovementCoordinator.GetState().Owner,
+            WaitingForMovement = MovementCoordinator.Wants(owner),
+            Navigating = navigation, Selling = selling, SaleQueued = sellRequested, SalePaused = saleFault,
+            Spot = target and target:GetAttribute("spotId"), Error = lastError or (bridge and (bridge:GetAttribute("Error") or bridge:GetAttribute("FishingError"))),
+            Count = current.Count, Capacity = current.Capacity, Coins = current.Coins,
+            Caught = current.Caught, Sold = current.Sold, EarlyConfirmed = current.EarlyConfirmed,
+            SuppressedResults = current.SuppressedResults,
+            DataReady = next(current) ~= nil, SaleReady = bridge and bridge:GetAttribute("SaleReady") == true,
+        }
+    end
+
+    function controller.Mount(page)
+        UI:AddDivider(page, "Fishing")
+        selector = UI:AddMultiSelect(page, "Fishing Areas", areaNames, function(values)
+            local selected = {}
+            for _, name in ipairs(areaNames) do if values[name] == true then selected[#selected + 1] = name end end
+            controller.SelectAreas(selected)
+        end)
+        selector:SetSelected({})
+        local points = spots()
+        FishSpots.Refresh(points)
+        FishSpots.Mount(page, function()
+            table.clear(blocked)
+            nextAttempt = 0
+            cancel()
+        end)
+        UI:AddToggle(page, "Auto Fish", false, controller.SetEnabled)
+        UI:AddToggle(page, "Early Finish", false, controller.SetEarly)
+        UI:AddToggle(page, "Hide Catch Result", true, controller.SetHideResults)
+        UI:AddToggle(page, "Auto Sell When Full", false, controller.SetAutoSell)
+        UI:AddButtonRow(page, {
+            { Text = "Instant Sell Fish (All)", Style = "primary", Width = 200, Callback = controller.SellAll },
+            { Text = "Stop Selling", Style = "danger", Width = 130, Callback = controller.CancelSale },
+        })
+        metrics = UI:AddMetricRow(page, {
+            { Label = "Fish", Value = "--", Unit = "Inventory / Capacity" },
+            { Label = "Fish Coins", Value = "--", Unit = "Balance" },
+        })
+    end
+
+    function controller.Destroy()
+        enabled, living, sellRequested = false, false, false
+        cancel()
+        releaseMovement()
+        FishSpots.Destroy()
+        if bridge then bridge:SetAttribute("Active", false) end
+    end
+
+    task.spawn(function()
+        local runner = ENV.run_on_actor or run_on_actor
+        local actor = game:GetService("ReplicatedFirst"):FindFirstChild("ClientHandlers")
+        if type(runner) ~= "function" or not actor then lastError = "Actor support unavailable" return end
+        local core = game:GetService("CoreGui")
+        local old = core:FindFirstChild("BonesHubFishingBridge")
+        if old then
+            old:SetAttribute("Active", false)
+            local stopAt = os.clock() + 1
+            while old.Parent and old:GetAttribute("Stopped") ~= true and os.clock() < stopAt do task.wait(0.05) end
+            old:Destroy()
+        end
+        if not living or not Alive then return end
+        bridge = Instance.new("Folder")
+        bridge.Name = "BonesHubFishingBridge"
+        bridge:SetAttribute("Active", true)
+        bridge:SetAttribute("Enabled", enabled)
+        bridge:SetAttribute("Early", early)
+        bridge:SetAttribute("HideResults", hideResults)
+        bridge:SetAttribute("Paused", true)
+        bridge:SetAttribute("SellAuthorized", false)
+        bridge:SetAttribute("SellSequence", 0)
+        bridge:SetAttribute("MovementGranted", false)
+        bridge.Parent = core
+        local ok, err = pcall(runner, actor, [=[
+if setthreadidentity then setthreadidentity(8) end
+local core = game:GetService("CoreGui")
+local bridge = core:FindFirstChild("BonesHubFishingBridge")
+if not bridge then return end
+local rs = game:GetService("ReplicatedStorage")
+local player = game:GetService("Players").LocalPlayer
+local http = game:GetService("HttpService")
+local packets = require(rs.Packets.Fishing)
+local replicaController = require(rs.ReplicaController)
+local ui = require(game.ReplicatedFirst.ClientHandlers.FishingClient.FishUI)
+local events, listeners, replacements = {}, {}, {}
+local failedSpecies, species = {}, {}
+local inventoryDirty, inventorySource, count = true, nil, 0
+local nextInventory = 0
+local cachedReplica, cachedReplicaKey
+local cachedSpot, cachedSpotId, cachedPoints
+local lastSnapshot, suppressResults, suppressedResults = nil, true, 0
+local sale, session, retired
+local saleSequence, caught, sold, earlyConfirmed = 0, 0, 0, 0
+local nextCast, nextSale, nextSnapshot = 0, 0, 0
+local saleReady, ownedFishing, resetSale = false, false, false
+local function alive()
+    return bridge.Parent ~= nil and bridge:GetAttribute("Active") == true
+end
+local function allowed()
+    return alive() and bridge:GetAttribute("Enabled") == true and bridge:GetAttribute("Paused") ~= true and bridge:GetAttribute("MovementGranted") == true
+end
+local function data()
+    local uid = player:GetAttribute("UID")
+    local replicas = replicaController._replicas or {}
+    if cachedReplica and replicas[cachedReplicaKey] == cachedReplica and tostring(cachedReplica.Id) == tostring(uid) then return cachedReplica.Data end
+    for key, replica in pairs(replicas) do
+        if replica.Class == "PlayerData" and tostring(replica.Id) == tostring(uid) then
+            cachedReplica, cachedReplicaKey = replica, key
+            return replica.Data
+        end
+    end
+end
+for _, name in ipairs({ "reward", "playGame", "beginFishing", "quit", "addFish", "removeFish", "sellAllFishConfirm", "sellAllFish" }) do
+    local collection = packets[name].getListeners()
+    for index = #collection, 1, -1 do
+        local callback, stale, original = collection[index], false, nil
+        for _, value in pairs(debug.getupvalues(callback)) do
+            if typeof(value) == "Instance" and value:IsA("Folder") and value.Name == "BonesHubFishingBridge" and value ~= bridge then stale = true end
+            if type(value) == "function" then
+                local source = debug.info(value, "s")
+                if name == "reward" and source:find("ClientHandlers.FishingClient", 1, true) or name == "sellAllFish" and source:find("ClientHandlers.UIs.FishingShopUI", 1, true) then original = value end
+            end
+        end
+        if stale then
+            if original then collection[index] = original else table.remove(collection, index) end
+        end
+    end
+end
+local function listen(packet, callback)
+    local wrapped = function(...)
+        if bridge then events[#events + 1] = { callback = callback, arguments = table.pack(...) } end
+    end
+    packet.listen(wrapped)
+    listeners[#listeners + 1] = { packet = packet, callback = wrapped }
+end
+local function quitOwned(reason)
+    if ownedFishing then packets.quit.send() end
+    ownedFishing, session = false, nil
+    nextCast = os.clock() + 0.5
+    if reason then bridge:SetAttribute("FishingError", reason) end
+end
+listen(packets.addFish, function()
+    inventoryDirty = true
+end)
+listen(packets.removeFish, function()
+    inventoryDirty = true
+end)
+listen(packets.beginFishing, function()
+    if ownedFishing and session then
+        session.began = true
+        session.waitUntil = os.clock() + 60
+    end
+end)
+listen(packets.playGame, function(params)
+    if not ownedFishing or not session or not allowed() then return end
+    session.began = true
+    session.deadline = tonumber(params.endTimestamp)
+    session.waitUntil = os.clock() + 90
+end)
+listen(packets.reward, function(value)
+    if not ownedFishing or not session then return end
+    if value.rewardInfo then
+        caught += 1
+        inventoryDirty = true
+        bridge:SetAttribute("LastFishUID", value.rewardInfo.uid)
+        if session.deadline and workspace:GetServerTimeNow() < session.deadline then earlyConfirmed += 1 end
+    end
+    ownedFishing, session = false, nil
+    nextCast = os.clock() + 1
+end)
+listen(packets.quit, function()
+    if ownedFishing then
+        ownedFishing, session = false, nil
+        nextCast = os.clock() + 0.5
+    end
+end)
+listen(packets.sellAllFishConfirm, function()
+    if sale then sale.acknowledged = true end
+end)
+local rewardCallbacks = packets.reward.getListeners()
+local suppressionReady = false
+for index, original in pairs(rewardCallbacks) do
+    if debug.info(original, "s"):find("ClientHandlers.FishingClient", 1, true) then
+        local wrapped = function(...)
+            if bridge and ownedFishing and suppressResults then
+                suppressedResults += 1
+                if ui.isResultMode then ui.isResultMode = false end
+                if ui.rewardModel ~= nil then ui.rewardModel = nil end
+                ui.isFishing = false
+                return
+            end
+            return original(...)
+        end
+        rewardCallbacks[index] = wrapped
+        replacements[#replacements + 1] = { list = rewardCallbacks, original = original, wrapped = wrapped }
+        suppressionReady = true
+    end
+end
+bridge:SetAttribute("ResultSuppressionReady", suppressionReady)
+local collection = packets.sellAllFish.getListeners()
+for index, original in pairs(collection) do
+    if debug.info(original, "s"):find("ClientHandlers.UIs.FishingShopUI", 1, true) then
+        local wrapped = function(id, ...)
+            if sale and id == sale.id then
+                local pending = sale
+                events[#events + 1] = { callback = function()
+                    bridge:SetAttribute("SaleHandshake", id)
+                    local accept = alive() and sale == pending and not pending.confirmed and bridge:GetAttribute("SellAuthorized") == true and bridge:GetAttribute("SellSequence") == pending.sequence and os.clock() <= pending.deadline
+                    if not pending.confirmed then
+                        pending.confirmed = true
+                        packets.sellAllFishConfirm.send(accept)
+                    end
+                end, arguments = table.pack() }
+                return
+            end
+            if retired and id == retired.id and os.clock() < retired.untilTime then
+                packets.sellAllFishConfirm.send(false)
+                return
+            end
+            return original(id, ...)
+        end
+        collection[index] = wrapped
+        replacements[#replacements + 1] = { list = collection, original = original, wrapped = wrapped }
+        saleReady = true
+    end
+end
+bridge:SetAttribute("SaleReady", saleReady)
+local ok, failure = pcall(function()
+    while alive() do
+        if setthreadidentity then setthreadidentity(8) end
+        suppressResults = bridge:GetAttribute("HideResults") ~= false
+        for _ = 1, math.min(#events, 64) do
+            local event = table.remove(events, 1)
+            event.callback(table.unpack(event.arguments, 1, event.arguments.n))
+        end
+        local current = data()
+        if current then
+            local saleAuthorized = bridge:GetAttribute("SellAuthorized") == true
+            if inventoryDirty or inventorySource ~= current.FishInventory or os.clock() >= nextInventory or saleAuthorized and next(species) == nil then
+                count = 0
+                table.clear(species)
+                inventorySource, inventoryDirty = current.FishInventory, false
+                nextInventory = os.clock() + (saleAuthorized and 0.15 or 1)
+                for uid, fish in pairs(current.FishInventory or {}) do
+                    if type(fish) == "table" and type(fish.id) == "string" then
+                        count += 1
+                        if saleAuthorized then
+                            species[fish.id] = species[fish.id] or {}
+                            table.insert(species[fish.id], uid)
+                        end
+                    end
+                end
+            end
+            local capacity = tonumber(current.FishInventorySize) or 0
+            local coins = tonumber(current.FishCoins) or 0
+            local requested = bridge:GetAttribute("SellSequence") or 0
+            if requested ~= saleSequence then
+                saleSequence = requested
+                table.clear(failedSpecies)
+                bridge:SetAttribute("SaleError", nil)
+                bridge:SetAttribute("SaleDone", false)
+                resetSale = true
+            end
+            if sale then
+                local remaining = false
+                for _, uid in ipairs(sale.uids) do
+                    if current.FishInventory[uid] then remaining = true break end
+                end
+                if not remaining and coins > sale.coins then
+                    sold += #sale.uids
+                    inventoryDirty = true
+                    bridge:SetAttribute("LastSaleSeconds", os.clock() - sale.started)
+                    bridge:SetAttribute("LastSaleCount", #sale.uids)
+                    sale = nil
+                    nextSale = os.clock() + 0.08
+                elseif bridge:GetAttribute("SellAuthorized") ~= true or requested ~= sale.sequence or os.clock() > sale.deadline then
+                    packets.sellAllFishConfirm.send(false)
+                    retired = { id = sale.id, untilTime = os.clock() + 12 }
+                    failedSpecies[sale.id] = true
+                    sale = nil
+                    nextSale = os.clock() + 0.2
+                end
+            end
+            if saleReady and bridge:GetAttribute("SellAuthorized") == true and not sale and os.clock() >= nextSale then
+                local shop = workspace.Map.Miscs:FindFirstChild("FishShop")
+                local npc = shop and shop:FindFirstChild("NPC")
+                local merchant = npc or shop
+                local character = player.Character
+                local root = character and character:FindFirstChild("HumanoidRootPart")
+                if merchant and root and (root.Position - merchant:GetPivot().Position).Magnitude <= 4.5 then
+                    local names = {}
+                    for id, uids in pairs(species) do
+                        if not failedSpecies[id] then
+                            for _, uid in ipairs(uids) do
+                                if current.FishInventory[uid] then names[#names + 1] = id break end
+                            end
+                        end
+                    end
+                    table.sort(names)
+                    local id = names[1]
+                    if id and resetSale then
+                        packets.sellAllFishConfirm.send(false)
+                        resetSale = false
+                        nextSale = os.clock() + 0.15
+                    elseif id then
+                        sale = { id = id, uids = species[id], coins = coins, started = os.clock(), deadline = os.clock() + 2.5, sequence = saleSequence }
+                        bridge:SetAttribute("LastSaleRequested", id)
+                        bridge:SetAttribute("SaleHandshake", nil)
+                        packets.sellAllFish.send(id)
+                    elseif count == 0 and next(failedSpecies) == nil then
+                        bridge:SetAttribute("SaleDone", true)
+                        bridge:SetAttribute("SellAuthorized", false)
+                    else
+                        bridge:SetAttribute("SaleError", "Some fish sales were not confirmed")
+                        bridge:SetAttribute("SellAuthorized", false)
+                    end
+                else
+                    bridge:SetAttribute("SaleError", "Outside merchant range")
+                    bridge:SetAttribute("SellAuthorized", false)
+                end
+            end
+            if ownedFishing then
+                if not allowed() or bridge:GetAttribute("SellAuthorized") == true then
+                    quitOwned()
+                elseif session and session.deadline then
+                    if not session.submitted and workspace:GetServerTimeNow() >= session.deadline - (bridge:GetAttribute("Early") == true and 0.35 or 0.1) then
+                        session.submitted = true
+                        session.waitUntil = os.clock() + 5
+                        packets.gameResult.send(true)
+                    elseif os.clock() > session.waitUntil then
+                        quitOwned("Fishing result timed out")
+                    end
+                elseif session and os.clock() > session.waitUntil then
+                    quitOwned(session.began and "Fishing parameters timed out" or "Fishing start timed out")
+                end
+            elseif allowed() and not ui.isFishing and count < capacity and os.clock() >= nextCast and bridge:GetAttribute("SellAuthorized") ~= true and bridge:GetAttribute("YieldAfterCatch") ~= true then
+                local character = player.Character
+                local root = character and character:FindFirstChild("HumanoidRootPart")
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                local selected = bridge:GetAttribute("Spot")
+                local points = workspace.Map.Miscs:FindFirstChild("FishingPoints")
+                if selected ~= cachedSpotId or points ~= cachedPoints or not cachedSpot or not cachedSpot.Parent then
+                    cachedSpot, cachedSpotId, cachedPoints = nil, selected, points
+                    if points and selected then
+                        for _, point in ipairs(points:GetChildren()) do if point:GetAttribute("spotId") == selected then cachedSpot = point break end end
+                    end
+                end
+                local spot = cachedSpot
+                local standing = spot and spot:GetAttribute("plrLoc")
+                local destination = typeof(standing) == "CFrame" and standing.Position or spot and spot:GetPivot().Position
+                if root and humanoid and humanoid.Health > 0 and destination and count < capacity and not spot:GetAttribute("occupied") and not ui.isFishing and os.clock() >= nextCast and (root.Position - destination).Magnitude <= 6 then
+                    bridge:SetAttribute("FishingError", nil)
+                    session = { waitUntil = os.clock() + 8, began = false, submitted = false }
+                    ownedFishing = true
+                    packets.start.send(selected)
+                end
+            end
+            if os.clock() >= nextSnapshot then
+                nextSnapshot = os.clock() + 0.25
+                local currentSnapshot = { Count = count, Capacity = capacity, Coins = coins, Caught = caught, Sold = sold, EarlyConfirmed = earlyConfirmed, SuppressedResults = suppressedResults, Fishing = ownedFishing or ui.isFishing == true, Minigame = session and session.deadline ~= nil or false, SalePending = sale ~= nil }
+                local changed = lastSnapshot == nil
+                if not changed then
+                    for key, value in pairs(currentSnapshot) do if lastSnapshot[key] ~= value then changed = true break end end
+                end
+                if changed then bridge:SetAttribute("Snapshot", http:JSONEncode(currentSnapshot)) lastSnapshot = currentSnapshot end
+                bridge:SetAttribute("UpdatedAt", workspace:GetServerTimeNow())
+            end
+        end
+        local delay = 0.25
+        if sale or bridge:GetAttribute("SellAuthorized") == true then delay = 0.04
+        elseif ownedFishing then
+            delay = session and session.deadline and session.deadline - workspace:GetServerTimeNow() < 0.6 and 0.025 or 0.1
+        elseif allowed() then delay = 0.1 end
+        task.wait(delay)
+    end
+end)
+if not ok and alive() then bridge:SetAttribute("Error", tostring(failure)) end
+if ownedFishing then pcall(packets.quit.send) end
+if sale then pcall(packets.sellAllFishConfirm.send, false) end
+for _, entry in ipairs(listeners) do
+    local list = entry.packet.getListeners()
+    local index = table.find(list, entry.callback)
+    if index then table.remove(list, index) end
+end
+for _, entry in ipairs(replacements) do
+    for index, callback in pairs(entry.list) do if callback == entry.wrapped then entry.list[index] = entry.original end end
+end
+if bridge.Parent ~= nil then bridge:SetAttribute("Stopped", true) end
+]=])
+        if not ok then bridge:SetAttribute("Error", tostring(err)) end
+    end)
+
+    task.spawn(function()
+        while living and Alive do
+            local ok, err = pcall(step)
+            if not ok then lastError = tostring(err) cancel() releaseMovement() nextAttempt = os.clock() + 5 end
+            task.wait((enabled or sellRequested or selling or movementTicket ~= nil) and 0.25 or 0.5)
+        end
+    end)
+
+    task.spawn(function()
+        local refreshAt, lastCount, lastCapacity, lastCoins = 0, nil, nil, nil
+        while living and Alive do
+            if navigation and target and target:GetAttribute("occupied") then cancel() end
+            if os.clock() >= refreshAt then
+                refreshAt = os.clock() + 2
+                local points = spots()
+                if points and FishSpots.NeedsRefresh(points) then FishSpots.Refresh(points) end
+            end
+            local current = snapshot()
+            if current and metrics then
+                if current.Count ~= lastCount or current.Capacity ~= lastCapacity then
+                    if metrics[1] and metrics[1].ValueLabel then metrics[1].ValueLabel.Text = tostring(current.Count) .. " / " .. tostring(current.Capacity) end
+                    lastCount, lastCapacity = current.Count, current.Capacity
+                end
+                if current.Coins ~= lastCoins then
+                    if metrics[2] and metrics[2].ValueLabel then metrics[2].ValueLabel.Text = tostring(current.Coins) end
+                    lastCoins = current.Coins
+                end
+            end
+            task.wait((enabled or selling or sellRequested) and 0.5 or 1)
+        end
+    end)
+    return controller
+end)()
+
 local source = game:HttpGet(UI_URL, true)
 source = source:gsub("Sla" .. "oqUILib", "bones hub")
 source = source:gsub(LEGACY_UI_ROOT_NAME, UI_ROOT_NAME)
@@ -755,7 +2544,7 @@ UI = library.new({
     AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.8", LogoImage = "",
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 200,
     WindowWidth = 900, WindowHeight = 560, SplashMode = "boot", BootSteps = 7,
-    Pages = { { Name = "Main" }, { Name = "Status" }, { Name = "Biome Counts" }, { Name = "Pings" }, { Name = "Settings" } },
+    Pages = { { Name = "main" }, { Name = "Webhook" }, { Name = "Status" }, { Name = "Biome Counts" }, { Name = "Pings" }, { Name = "Settings" } },
     SplashTasks = {
         "Creating interface shell", "Building macro controls", "Registering status panels",
         "Loading biome counters", "Loading notification controls", "Mounting settings", "Ready.",
@@ -786,35 +2575,35 @@ end)
 
 UI:SetSidebarUserStatus(false)
 UI:SetBootStep("Building macro controls", 0.18, "main page")
-UI:AddSectionHeader(1, "Biome Macro", "Automatic biome and merchant detection for Sol's RNG")
-UI:AddDivider(1, "Control")
-Controls.MainBadge = UI:AddStatusBadge2(1, "Macro State", "offline")
-Controls.StartStop = UI:AddButtonRow(1, {
+UI:AddSectionHeader(2, "Biome Macro", "Automatic biome and merchant detection for Sol's RNG")
+UI:AddDivider(2, "Control")
+Controls.MainBadge = UI:AddStatusBadge2(2, "Macro State", "offline")
+Controls.StartStop = UI:AddButtonRow(2, {
     { Text = "Start", Style = "primary", Width = 130, Callback = debounced(startMacro) },
     { Text = "Stop", Style = "danger", Width = 130, Callback = debounced(stopMacro) },
 })
-UI:AddDivider(1, "Private Server")
-Controls.PSLink = UI:AddInput(1, "Private Server Link", "Permanent PS link (roblox.com/share?...)", function(value)
+UI:AddDivider(2, "Private Server")
+Controls.PSLink = UI:AddInput(2, "Private Server Link", "Permanent PS link (roblox.com/share?...)", function(value)
     local entered = trim(value)
     if isWebhook(entered) then entered = "" end
     Config.PSLink = entered
     saveConfig()
 end)
 Controls.PSLink:Set(Config.PSLink)
-UI:AddDivider(1, "Webhooks")
-Controls.Webhook = UI:AddInput(1, "Discord Webhook URL", "https://discord.com/api/webhooks/...", function(value)
+UI:AddDivider(2, "Webhooks")
+Controls.Webhook = UI:AddInput(2, "Discord Webhook URL", "https://discord.com/api/webhooks/...", function(value)
     Config.Webhook = trim(value) saveConfig()
 end)
 Controls.Webhook:Set(Config.Webhook)
-UI:AddButtonRow(1, {
+UI:AddButtonRow(2, {
     { Text = "Test Webhook", Style = "primary", Width = 150, Callback = debounced(sendWebhookTest, 2) },
 })
-UI:AddDivider(1, "Session")
-Controls.AntiAfk = UI:AddToggle(1, "Anti-AFK", Config.AntiAfk, function(value)
+UI:AddDivider(2, "Session")
+Controls.AntiAfk = UI:AddToggle(2, "Anti-AFK", Config.AntiAfk, function(value)
     Config.AntiAfk = value == true saveConfig() applyAntiAfk()
 end, "Keeps player active to prevent disconnection")
-UI:AddDivider(1, "Actions")
-UI:AddButtonRow(1, {
+UI:AddDivider(2, "Actions")
+UI:AddButtonRow(2, {
     { Text = "Stop and Rejoin", Style = "danger", Width = 170, Callback = debounced(function()
         stopMacro() saveConfig() TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
     end) },
@@ -824,42 +2613,42 @@ UI:AddButtonRow(1, {
 })
 
 UI:SetBootStep("Registering status panels", 0.34, "status page")
-UI:AddSectionHeader(2, "Status", "Live state of your current macro session")
-UI:AddDivider(2, "State")
-Controls.StatusBadge = UI:AddStatusBadge2(2, "Macro State", "offline")
-UI:AddDivider(2, "Session Timer")
-local timerMetrics = UI:AddMetricRow(2, {
+UI:AddSectionHeader(3, "Status", "Live state of your current macro session")
+UI:AddDivider(3, "State")
+Controls.StatusBadge = UI:AddStatusBadge2(3, "Macro State", "offline")
+UI:AddDivider(3, "Session Timer")
+local timerMetrics = UI:AddMetricRow(3, {
     { Label = "Elapsed Time", Value = "00:00:00", Unit = "hh:mm:ss" },
     { Label = "Last Biome", Value = "None", Unit = "" },
 })
 Controls.Elapsed, Controls.LastBiome = timerMetrics[1], timerMetrics[2]
-UI:AddDivider(2, "Main-world Weather")
-local weatherMetrics = UI:AddMetricRow(2, {
+UI:AddDivider(3, "Main-world Weather")
+local weatherMetrics = UI:AddMetricRow(3, {
     { Label = "Current Biome", Value = "Waiting", Unit = "main world" },
     { Label = "Weather Source", Value = "Connecting", Unit = "independent of Limbo HUD" },
 })
 Controls.MainWorldWeather, Controls.WeatherSource = weatherMetrics[1], weatherMetrics[2]
-UI:AddDivider(2, "Session Counts")
-local sessionMetrics = UI:AddMetricRow(2, {
+UI:AddDivider(3, "Session Counts")
+local sessionMetrics = UI:AddMetricRow(3, {
     { Label = "Biomes Detected", Value = "0", Unit = "this session" },
     { Label = "Merchants Found", Value = "0", Unit = "this session" },
     { Label = "Alerts Sent", Value = "0", Unit = "this session" },
 })
 Controls.SessionBiomes, Controls.SessionMerchants, Controls.Alerts = sessionMetrics[1], sessionMetrics[2], sessionMetrics[3]
-UI:AddDivider(2, "Event Log")
-Controls.LogConsole = UI:AddLogConsole(2, 200)
+UI:AddDivider(3, "Event Log")
+Controls.LogConsole = UI:AddLogConsole(3, 200)
 
 UI:SetBootStep("Loading biome counters", 0.5, "biome counts")
-UI:AddSectionHeader(3, "Statistics", "Biome detection totals for this execution")
-UI:AddDivider(3, "Rare Biomes")
+UI:AddSectionHeader(4, "Statistics", "Biome detection totals for this execution")
+UI:AddDivider(4, "Rare Biomes")
 Controls.Counts = {}
-local rareMetrics = UI:AddMetricRow(3, {
+local rareMetrics = UI:AddMetricRow(4, {
     { Label = "Glitched", Value = "0", Unit = "found" },
     { Label = "Dreamspace", Value = "0", Unit = "found" },
     { Label = "Cyberspace", Value = "0", Unit = "found" },
 })
 Controls.Counts.GLITCHED, Controls.Counts.DREAMSPACE, Controls.Counts.CYBERSPACE = rareMetrics[1], rareMetrics[2], rareMetrics[3]
-UI:AddDivider(3, "Other Biomes")
+UI:AddDivider(4, "Other Biomes")
 for index = 4, #BIOMES, 3 do
     local definitions, names = {}, {}
     for offset = 0, 2 do
@@ -869,34 +2658,37 @@ for index = 4, #BIOMES, 3 do
             table.insert(names, biome)
         end
     end
-    local row = UI:AddMetricRow(3, definitions)
+    local row = UI:AddMetricRow(4, definitions)
     for rowIndex, biome in ipairs(names) do Controls.Counts[biome] = row[rowIndex] end
 end
 
 UI:SetBootStep("Loading notification controls", 0.67, "pings page")
-UI:AddSectionHeader(4, "Pings", "Discord notification and mention policy")
-UI:AddAlert(4, "Rare weather", "DREAMSPACE, GLITCHED and CYBERSPACE send @everyone and allow only the everyone mention.", "warning")
-UI:AddAlert(4, "Normal events", "Every normal weather and merchant event is sent, but allowed_mentions.parse is empty so nobody is pinged.", "info")
-UI:AddDivider(4, "Delivery")
-UI:AddAlert(4, "Private delivery", "All cards are posted only to the Discord webhook entered on the Main page. The private-server link must be a Roblox URL.", "info")
+UI:AddSectionHeader(5, "Pings", "Discord notification and mention policy")
+UI:AddAlert(5, "Rare weather", "DREAMSPACE, GLITCHED and CYBERSPACE send @everyone and allow only the everyone mention.", "warning")
+UI:AddAlert(5, "Normal events", "Every normal weather and merchant event is sent, but allowed_mentions.parse is empty so nobody is pinged.", "info")
+UI:AddDivider(5, "Delivery")
+UI:AddAlert(5, "Private delivery", "All cards are posted only to the Discord webhook entered on the Main page. The private-server link must be a Roblox URL.", "info")
 
 UI:SetBootStep("Mounting settings", 0.84, "settings page")
-UI:AddSectionHeader(5, "Settings", "Detection timing and notification tests")
-UI:AddDivider(5, "Performance")
-Controls.ScanInterval = UI:AddInputNumber(5, "Biome Scanner Interval (Seconds)", {
+UI:AddSectionHeader(6, "Settings", "Detection timing and notification tests")
+UI:AddDivider(6, "Performance")
+Controls.ScanInterval = UI:AddInputNumber(6, "Biome Scanner Interval (Seconds)", {
     Min = 0.15, Max = 5, Default = Config.BiomeScanInterval, Placeholder = "0.5",
 }, function(value)
     local number = tonumber(value)
     if number then Config.BiomeScanInterval = math.clamp(number, 0.15, 5) saveConfig() end
 end)
-UI:AddAlert(5, "Detection source", "Main-world weather is read from ServerInfo inside the game's Actor, including while in Limbo. Merchant stock is read from the game shop data and quantity query. HUD weather is a fallback only.", "info")
-UI:AddDivider(5, "Webhook Tests")
-UI:AddButtonRow(5, {
+UI:AddAlert(6, "Detection source", "Main-world weather is read from ServerInfo inside the game's Actor, including while in Limbo. Merchant stock is read from the game shop data and quantity query. HUD weather is a fallback only.", "info")
+UI:AddDivider(6, "Webhook Tests")
+UI:AddButtonRow(6, {
     { Text = "Test Normal", Style = "ghost", Width = 130, Callback = debounced(function() sendBiome("WINDY") end, 2) },
     { Text = "Test Rare", Style = "primary", Width = 130, Callback = debounced(function() sendBiome("GLITCHED") end, 2) },
     { Text = "Test Merchant", Style = "ghost", Width = 140, Callback = debounced(function() sendMerchant("Mari") end, 2) },
 })
-UI:AddAlert(5, "Outbound safety", "Webhook POST requests only use the exact Discord URL entered on the Main page. No private-server or weather data is sent anywhere else.", "warning")
+UI:AddAlert(6, "Outbound safety", "Webhook POST requests only use the exact Discord URL entered on the Main page. No private-server or weather data is sent anywhere else.", "warning")
+
+Potion.Mount(1)
+FishingAutomation.Mount(1)
 
 local API = {}
 function API.Start() startMacro() end
@@ -904,6 +2696,20 @@ function API.Stop() stopMacro() end
 function API.TestBiome(biome) return sendBiome(normalizeBiome(biome) or "WINDY") end
 function API.TestMerchant(merchant) return sendMerchant(tostring(merchant or "Mari")) end
 function API.ProbeBiome() return currentBiome() end
+function API.SetPotionEnabled(value) return Potion.SetEnabled(value) end
+function API.GetPotionState() return Potion.GetState() end
+function API.SelectPotion(value) return Potion.SelectRecipe(value) end
+function API.SelectPotions(values) return Potion.SelectRecipes(values) end
+function API.SetFishingEnabled(value) return FishingAutomation.SetEnabled(value) end
+function API.SelectFishingAreas(values) return FishingAutomation.SelectAreas(values) end
+function API.SelectFishingSpots(values) return FishingAutomation.SelectSpots(values) end
+function API.GetFishingSpots() return FishingAutomation.GetSpots() end
+function API.SetFishingEarly(value) return FishingAutomation.SetEarly(value) end
+function API.SetFishingHideResults(value) return FishingAutomation.SetHideResults(value) end
+function API.SetFishingAutoSell(value) return FishingAutomation.SetAutoSell(value) end
+function API.SellAllFish() return FishingAutomation.SellAll() end
+function API.CancelFishingSale() return FishingAutomation.CancelSale() end
+function API.GetFishingState() return FishingAutomation.GetState() end
 function API.GetMerchants()
     refreshMerchants(false)
     return copy(MerchantCache)
@@ -933,6 +2739,8 @@ function API.GetState()
 end
 function API.Destroy()
     if not Alive then return end
+    FishingAutomation.Destroy()
+    Potion.Destroy()
     Alive = false
     stopMacro(true)
     saveConfig()
