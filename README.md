@@ -1,6 +1,6 @@
 <b>About This Project Being Open Source</b>
 <p align="center"> <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=24&pause=1000&color=58A6FF&center=true&vCenter=true&width=600&lines=Someone+asked+if+this+could+be+open-sourced.;So+I+just+open-sourced+it.;That's+it." alt="Typing SVG" /> </p>
-<font size="5"><b>Someone asked me if this script could be open-sourced.</b></font>
+<font size="5"><b> Someone asked me if this script could be open-sourced.</b></font>
 
 <font size="5"><b>My answer: since someone wants it, I'll just open-source it.</b></font>
 
