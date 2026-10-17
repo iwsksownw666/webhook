@@ -60,7 +60,7 @@ local BIOME_COLORS = {
 }
 
 local DEFAULT_CONFIG = {
-    Webhook = "", PSLink = "", AntiAfk = true, BiomeScanInterval = 0.5, UIMode = "Original",
+    Webhook = "", PSLink = "", AntiAfk = true, BiomeScanInterval = 0.5, UIMode = "Glass", InterfaceMotion = true, InterfaceStyleVersion = 0,
     AuraEnabled = false, AuraMinimum = 1000000, AuraWebhook = "", AuraPing = false,
     PingBiomes = {
         HEAVEN = false, NULL = false, HELL = false, STARFALL = false, WINDY = false,
@@ -194,6 +194,10 @@ local function loadConfig()
     end
 end
 loadConfig()
+if Config.InterfaceStyleVersion ~= 1 then
+    Config.UIMode, Config.InterfaceStyleVersion = "Glass", 1
+    saveConfig()
+end
 
 local function isWebhook(url)
     local value = trim(url)
@@ -1024,6 +1028,11 @@ local Appearance = (function()
     end
 
     function appearance.Style(object)
+        local owner = object
+        while owner do
+            if type(owner.GetAttribute) == "function" and owner:GetAttribute("BonesGlassUI") == true then return end
+            owner = owner.Parent
+        end
         if object:IsA("GuiObject") then
             local color = object.BackgroundColor3
             if object.BackgroundTransparency < 1 and gray(color) then
@@ -2937,6 +2946,7 @@ local MobileUI = (function()
             CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.X,
             ScrollingDirection = Enum.ScrollingDirection.X, ScrollBarThickness = 0,
         }, window)
+        ui.Root, ui.Window, ui.Header, ui.TabStrip, ui.Tabs = gui, window, header, strip, tabs
         make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, strip)
         for index, definition in ipairs(options.Pages or {}) do
             local tab = button(strip, definition.Name)
@@ -2957,6 +2967,7 @@ local MobileUI = (function()
         local function resize()
             local camera = workspace.CurrentCamera
             local size = camera and camera.ViewportSize or Vector2.new(640, 480)
+            if type(ui.Layout) == "function" then ui:Layout(size) return end
             window.Size = UDim2.fromOffset(math.max(240, math.min(620, size.X - 24)), math.max(180, math.min(580, size.Y - 64)))
         end
         local function bindCamera()
@@ -2996,6 +3007,7 @@ local MobileUI = (function()
             corner(frame)
             return frame
         end
+        function ui:CreateRow(page, height) return row(page, height) end
         function ui:AddSectionHeader(page, text, description)
             local frame = row(page, description and 66 or 38)
             frame.AutomaticSize = Enum.AutomaticSize.Y
@@ -3191,8 +3203,446 @@ local MobileUI = (function()
     return library
 end)()
 
+local GlassUI = (function()
+    local library = {}
+    function library.new(options)
+        local ui = MobileUI.new(options)
+        local tweenService = game:GetService("TweenService")
+        local input = game:GetService("UserInputService")
+        local root, window, header, strip = ui.Root, ui.Window, ui.Header, ui.TabStrip
+        root:SetAttribute("BonesGlassUI", true)
+        ui.Mode = "glass"
+        local colors = {
+            Surface = Color3.fromRGB(31, 51, 73), Frost = Color3.fromRGB(213, 232, 248),
+            Text = Color3.fromRGB(244, 249, 255), Muted = Color3.fromRGB(179, 201, 221),
+            Accent = Color3.fromRGB(164, 230, 245), White = Color3.fromRGB(255, 255, 255),
+        }
+        local alive, motion, compact = true, options.InterfaceMotion ~= false, false
+        local connections, tweens, metricRows, dropdowns, selected, visibilityToken = {}, {}, {}, {}, 1, 0
+        local function make(class, properties, parent)
+            local object = Instance.new(class)
+            for key, value in pairs(properties) do object[key] = value end
+            object.Parent = parent
+            return object
+        end
+        local function connect(signal, callback)
+            local connection = signal:Connect(callback)
+            connections[#connections + 1] = connection
+            return connection
+        end
+        local function animate(object, properties, duration)
+            if not alive or not object.Parent then return end
+            if tweens[object] then tweens[object]:Cancel() tweens[object] = nil end
+            if not motion then
+                for key, value in pairs(properties) do object[key] = value end
+                return
+            end
+            local tween = tweenService:Create(object, TweenInfo.new(duration or 0.16, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), properties)
+            tweens[object] = tween
+            tween:Play()
+        end
+        local function round(object, radius)
+            local shape = object:FindFirstChildOfClass("UICorner") or make("UICorner", {}, object)
+            shape.CornerRadius = UDim.new(0, radius)
+        end
+        local function stroke(object, transparency)
+            local edge = object:FindFirstChild("GlassEdge")
+            if edge then return edge end
+            edge = make("UIStroke", { Name = "GlassEdge", Color = colors.White, Thickness = 1,
+                Transparency = transparency or 0.78, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, object)
+            make("UIGradient", { Rotation = 42, Color = ColorSequence.new(colors.White, colors.Accent),
+                Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(0.48, 0.65), NumberSequenceKeypoint.new(1, 0.12) }) }, edge)
+            return edge
+        end
+        local function surface(object, opacity, radius)
+            object.BackgroundColor3, object.BackgroundTransparency = colors.Frost, opacity or 0.92
+            object.BorderSizePixel = 0
+            round(object, radius or 18)
+            stroke(object)
+            if not object:FindFirstChild("GlassWash") then
+                make("UIGradient", { Name = "GlassWash", Rotation = 105,
+                    Color = ColorSequence.new(colors.White, Color3.fromRGB(139, 190, 235)),
+                    Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(0.5, 0.48), NumberSequenceKeypoint.new(1, 0.18) }) }, object)
+            end
+        end
+        local function text(parent, value, size, color, properties)
+            local data = { BackgroundTransparency = 1, BorderSizePixel = 0, Text = tostring(value),
+                Font = Enum.Font.BuilderSans, TextSize = size, TextColor3 = color or colors.Text,
+                TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true }
+            for key, item in pairs(properties or {}) do data[key] = item end
+            return make("TextLabel", data, parent)
+        end
+        local function decorate(object)
+            if object:GetAttribute("GlassStyled") then return end
+            object:SetAttribute("GlassStyled", true)
+            if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+                local color = object.TextColor3
+                if color.G > color.R + 0.1 then object.TextColor3 = colors.Accent
+                elseif color.R < 0.75 then object.TextColor3 = colors.Muted
+                else object.TextColor3 = colors.Text end
+                object.Font = Enum.Font.BuilderSans
+                object.TextSize = math.clamp(object.TextSize - 1, 11, 15)
+            end
+            if object:IsA("TextBox") then
+                surface(object, 0.91, 13)
+                object.PlaceholderColor3 = colors.Muted
+                local edge = stroke(object)
+                connect(object.Focused, function() animate(edge, { Transparency = 0.2 }) end)
+                connect(object.FocusLost, function() animate(edge, { Transparency = 0.78 }) end)
+            elseif object:IsA("TextButton") and object.BackgroundTransparency < 1 then
+                local primary = object.BackgroundColor3.G > object.BackgroundColor3.R + 0.1
+                surface(object, primary and 0.68 or 0.92, 15)
+                object.TextColor3, object.AutoButtonColor = colors.Text, false
+                local resting = object.BackgroundTransparency
+                connect(object.MouseEnter, function() animate(object, { BackgroundTransparency = math.max(0.5, resting - 0.1) }) end)
+                connect(object.MouseLeave, function() animate(object, { BackgroundTransparency = resting }) end)
+            end
+        end
+        window.BackgroundColor3, window.BackgroundTransparency = colors.Surface, 0.28
+        round(window, 32)
+        stroke(window, 0.48)
+        local blur = make("BlurEffect", { Name = "BonesHubGlassBackdrop", Size = 0 }, game:GetService("Lighting"))
+        make("UIGradient", { Name = "GlassWindowTint", Rotation = 115,
+            Color = ColorSequence.new(colors.White, Color3.fromRGB(109, 151, 205)),
+            Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.05), NumberSequenceKeypoint.new(0.48, 0.3), NumberSequenceKeypoint.new(1, 0.08) }) }, window)
+        local scale = make("UIScale", { Scale = 1 }, window)
+        local rail = make("Frame", { Name = "GlassRail", ZIndex = 1 }, window)
+        surface(rail, 0.94, 23)
+        local lens = make("Frame", { Name = "GlassSelection", Position = UDim2.fromOffset(8, 8), Size = UDim2.new(1, -16, 0, 46), ZIndex = 1 }, rail)
+        surface(lens, 0.71, 16)
+        local mark = make("Frame", { Name = "GlassMark", Position = UDim2.fromOffset(22, 20), Size = UDim2.fromOffset(42, 42) }, header)
+        surface(mark, 0.73, 15)
+        text(mark, "b", 22, colors.Text, { Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center, Font = Enum.Font.BuilderSansMedium })
+        for _, child in ipairs(header:GetChildren()) do
+            if child:IsA("TextLabel") then
+                if child.Text == (options.AppName or "bones hub") then
+                    child.Position, child.Size, child.TextSize = UDim2.fromOffset(77, 20), UDim2.new(1, -196, 0, 24), 18
+                    child.Font, child.TextColor3 = Enum.Font.BuilderSansMedium, colors.Text
+                else
+                    child.Position, child.Size, child.TextSize = UDim2.fromOffset(78, 47), UDim2.new(1, -196, 0, 17), 11
+                    child.TextColor3 = colors.Muted
+                    child.Font = Enum.Font.BuilderSans
+                end
+            elseif child:IsA("TextButton") then
+                child.Position, child.Size, child.Text = UDim2.new(1, -66, 0, 20), UDim2.fromOffset(42, 42), "−"
+                decorate(child)
+            end
+        end
+        header.Size = UDim2.new(1, 0, 0, 82)
+        header.Active = true
+        text(header, "GLASS", 10, colors.Muted, { Name = "GlassEdition", Position = UDim2.new(1, -142, 0, 29), Size = UDim2.fromOffset(64, 24), TextXAlignment = Enum.TextXAlignment.Center })
+        local footer = text(window, "ETHEREAL  /  " .. tostring(options.AppVersion or "3.13"), 10, colors.Muted, {
+            Name = "GlassFooter", Position = UDim2.new(0, 30, 1, -42), Size = UDim2.fromOffset(160, 20) })
+        local layout = strip:FindFirstChildOfClass("UIListLayout")
+        strip.ZIndex = 2
+        local icons = { "◈", "↗", "◷", "◇", "◎", "⚙" }
+        for index, tab in ipairs(ui.Tabs) do
+            tab.Text = icons[index] .. "   " .. ((options.Pages[index] or {}).Name or tostring(index))
+            tab.TextSize, tab.TextXAlignment = 12, Enum.TextXAlignment.Left
+            tab.AutoButtonColor, tab.BackgroundTransparency, tab.ZIndex = false, 1, 2
+            round(tab, 18)
+            make("UIPadding", { PaddingLeft = UDim.new(0, 16), PaddingRight = UDim.new(0, 8) }, tab)
+            connect(tab.MouseEnter, function() if index ~= selected then animate(tab, { BackgroundTransparency = 0.93 }) end end)
+            connect(tab.MouseLeave, function() if index ~= selected then animate(tab, { BackgroundTransparency = 1 }) end end)
+        end
+        local baseSetPage, baseSetVisible, baseDestroy = ui.SetPage, ui.SetVisible, ui.Destroy
+        local function paintTabs()
+            for index, tab in ipairs(ui.Tabs) do
+                tab.BackgroundColor3 = colors.Frost
+                tab.BackgroundTransparency = (compact or not lens.Visible) and index == selected and 0.77 or 1
+                tab.TextColor3 = index == selected and colors.Text or colors.Muted
+                tab.Font = index == selected and Enum.Font.BuilderSansMedium or Enum.Font.BuilderSans
+            end
+        end
+        function ui:SetPage(index)
+            if not alive or not self.Pages[index] then return false end
+            local changed = selected ~= index
+            baseSetPage(self, index)
+            selected = index
+            paintTabs()
+            if not compact then animate(lens, { Position = UDim2.fromOffset(8, 8 + (index - 1) * 54) }, 0.2) end
+            local page = self.Pages[index]
+            if motion and changed then
+                local target = UDim2.fromOffset(compact and 18 or 214, compact and 150 or 92)
+                page.Position = target + UDim2.fromOffset(0, 3)
+                animate(page, { Position = target }, 0.16)
+            else
+                if tweens[page] then tweens[page]:Cancel() tweens[page] = nil end
+                page.Position = UDim2.fromOffset(compact and 18 or 214, compact and 150 or 92)
+            end
+            return true
+        end
+        function ui:Layout(size)
+            compact = size.X < 700
+            local width, height = math.max(240, math.min(960, size.X - 32)), math.max(180, math.min(680, size.Y - 48))
+            window.Size = UDim2.fromOffset(width, height)
+            local x = window.Position.X.Scale * size.X + window.Position.X.Offset
+            local y = window.Position.Y.Scale * size.Y + window.Position.Y.Offset
+            if x < width * 0.5 or x > size.X - width * 0.5 or y < height * 0.5 or y > size.Y - height * 0.5 then
+                window.Position = UDim2.fromScale(0.5, 0.5)
+            end
+            rail.Visible, lens.Visible, footer.Visible = not compact, not compact and height >= 480, not compact
+            rail.Position, rail.Size = UDim2.fromOffset(18, 92), UDim2.new(0, 174, 1, -154)
+            strip.Position = UDim2.fromOffset(compact and 18 or 26, compact and 88 or 100)
+            strip.Size = compact and UDim2.new(1, -36, 0, 48) or UDim2.new(0, 158, 1, -170)
+            layout.FillDirection, layout.Padding = compact and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical, UDim.new(0, 8)
+            strip.ScrollingDirection = compact and Enum.ScrollingDirection.X or Enum.ScrollingDirection.Y
+            strip.AutomaticCanvasSize = compact and Enum.AutomaticSize.X or Enum.AutomaticSize.Y
+            for index, tab in ipairs(self.Tabs) do
+                tab.Size = compact and UDim2.fromOffset(math.max(100, #((options.Pages[index] or {}).Name or "") * 8 + 54), 44) or UDim2.new(1, 0, 0, 46)
+            end
+            for _, page in ipairs(self.Pages) do
+                if tweens[page] then tweens[page]:Cancel() tweens[page] = nil end
+                page.Position = UDim2.fromOffset(compact and 18 or 214, compact and 150 or 92)
+                page.Size = compact and UDim2.new(1, -36, 1, -172) or UDim2.new(1, -236, 1, -112)
+                page.ScrollBarImageColor3, page.ScrollBarThickness = colors.Frost, 2
+                local spacing = page:FindFirstChildOfClass("UIListLayout")
+                if spacing then spacing.Padding = UDim.new(0, 10) end
+            end
+            for _, metrics in ipairs(metricRows) do
+                for _, metric in ipairs(metrics) do metric.ValueLabel.TextSize = compact and 16 or 18 end
+            end
+            paintTabs()
+        end
+        function ui:SetMotionEnabled(value)
+            motion = value ~= false
+            for object, tween in pairs(tweens) do tween:Cancel() tweens[object] = nil end
+            scale.Scale = 1
+            lens.Position = UDim2.fromOffset(8, 8 + (selected - 1) * 54)
+            local camera = workspace.CurrentCamera
+            if camera then self:Layout(camera.ViewportSize) end
+            for _, dropdown in ipairs(dropdowns) do dropdown:SetOpen(dropdown.Open, true) end
+        end
+        function ui:SetVisible(value)
+            if not alive then return end
+            visibilityToken += 1
+            local token = visibilityToken
+            baseSetVisible(self, value)
+            animate(blur, { Size = value == true and 8 or 0 }, 0.2)
+            if value == true then
+                scale.Scale = motion and 0.97 or 1
+                animate(scale, { Scale = 1 }, 0.3, true)
+            elseif motion then
+                window.Visible = true
+                animate(scale, { Scale = 0.97 }, 0.14)
+                task.delay(0.14, function() if alive and token == visibilityToken then window.Visible = false end end)
+            end
+        end
+        local function finish(control)
+            if not control or not control.Frame then return control end
+            local frame = control.Frame
+            if frame.BackgroundTransparency < 1 then surface(frame, 0.93, 18) end
+            for _, object in ipairs(frame:GetDescendants()) do decorate(object) end
+            return control
+        end
+        for _, method in ipairs({ "AddSectionHeader", "AddDivider", "AddButtonRow", "AddInput", "AddInputNumber", "AddLogConsole" }) do
+            local original = ui[method]
+            ui[method] = function(self, ...) return finish(original(self, ...)) end
+        end
+        function ui:AddMultiSelect(page, title, choices, callback)
+            local frame = self:CreateRow(page, 46)
+            frame.Name, frame.ClipsDescendants = "GlassDropdown", true
+            surface(frame, 0.93, 16)
+            choices = table.clone(choices or {})
+            frame:SetAttribute("GlassDropdownChoices", table.concat(choices, "\n"))
+            local hit = make("TextButton", { Name = "DropdownHeader", BackgroundTransparency = 1, Text = "",
+                Size = UDim2.new(1, 0, 0, 46), AutoButtonColor = false, Active = true }, frame)
+            text(hit, title, 12, colors.Text, { Name = "DropdownTitle", Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -126, 1, 0) })
+            local value = text(hit, "Select", 11, colors.Muted, { Name = "DropdownValue", Position = UDim2.new(1, -114, 0, 0),
+                Size = UDim2.fromOffset(76, 46), TextXAlignment = Enum.TextXAlignment.Right, TextWrapped = false })
+            local arrow = text(hit, "⌄", 14, colors.Muted, { Name = "DropdownArrow", Position = UDim2.new(1, -32, 0, 0),
+                Size = UDim2.fromOffset(20, 46), TextXAlignment = Enum.TextXAlignment.Center })
+            local content, selectedItems, buttons, handlers = nil, {}, {}, {}
+            local closed, token = false, 0
+            local control = { Frame = frame, Open = false }
+            local function bind(signal, callback)
+                local connection = signal:Connect(callback)
+                handlers[#handlers + 1] = connection
+                return connection
+            end
+            local function redraw()
+                local values = {}
+                for _, choice in ipairs(choices) do
+                    local chosen = selectedItems[choice] == true
+                    if chosen then values[#values + 1] = choice end
+                    if buttons[choice] then
+                        buttons[choice]:SetAttribute("Selected", chosen)
+                        buttons[choice].BackgroundTransparency = chosen and 0.77 or 1
+                        buttons[choice]:FindFirstChild("Check").Visible = chosen
+                    end
+                end
+                value.Text = #values == 0 and "Select" or tostring(#values) .. " selected"
+                frame:SetAttribute("GlassDropdownSelection", table.concat(values, "\n"))
+            end
+            function control:SetSelected(values)
+                if closed then return end
+                table.clear(selectedItems)
+                for key, item in pairs(values or {}) do
+                    local choice = type(key) == "number" and item or item == true and key or nil
+                    if choice and table.find(choices, choice) then selectedItems[choice] = true end
+                end
+                redraw()
+            end
+            function control:SetOpen(value, immediate)
+                if closed or not alive then return end
+                self.Open, token = value == true, token + 1
+                local revision = token
+                if self.Open and not content then
+                    content = make("ScrollingFrame", { Name = "DropdownOptions", BackgroundTransparency = 1, BorderSizePixel = 0,
+                        Position = UDim2.fromOffset(6, 46), Size = UDim2.new(1, -12, 0, 0), CanvasSize = UDim2.new(),
+                        AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
+                        ScrollBarThickness = 2, ScrollBarImageColor3 = colors.Frost, ClipsDescendants = true, Active = true }, frame)
+                    make("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, content)
+                    make("UIPadding", { PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4), PaddingRight = UDim.new(0, 4) }, content)
+                    for index, choice in ipairs(choices) do
+                        local option = make("TextButton", { Name = "DropdownOption", Text = choice, Font = Enum.Font.BuilderSans,
+                            TextSize = 12, TextColor3 = colors.Text, TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = false,
+                            TextTruncate = Enum.TextTruncate.AtEnd, BackgroundColor3 = colors.Frost, BackgroundTransparency = 1,
+                            BorderSizePixel = 0, AutoButtonColor = false, Active = true, Size = UDim2.new(1, 0, 0, 34), LayoutOrder = index }, content)
+                        round(option, 10)
+                        option:SetAttribute("GlassStyled", true)
+                        make("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 32) }, option)
+                        text(option, "✓", 12, colors.Accent, { Name = "Check", Size = UDim2.fromOffset(20, 34),
+                            Position = UDim2.new(1, -26, 0, 0), TextXAlignment = Enum.TextXAlignment.Center, Visible = false })
+                        buttons[choice] = option
+                        bind(option.Activated, function()
+                            if not self.Open or closed then return end
+                            selectedItems[choice] = not selectedItems[choice] or nil
+                            redraw()
+                            if callback then callback(table.clone(selectedItems)) end
+                        end)
+                    end
+                    if #choices == 0 then
+                        text(content, "No items available", 12, colors.Muted, { Size = UDim2.new(1, 0, 0, 34) })
+                    end
+                    redraw()
+                end
+                local height = self.Open and math.min(204, math.max(1, #choices) * 38 + 4) or 0
+                local properties = { Size = UDim2.new(1, 0, 0, 46 + (self.Open and height + 6 or 0)) }
+                if content then
+                    content.Visible, content.Active = true, self.Open
+                    if self.Open then content.Size = UDim2.new(1, -12, 0, height) end
+                end
+                if immediate or not motion then frame.Size = properties.Size else animate(frame, properties, 0.18) end
+                animate(arrow, { Rotation = self.Open and 180 or 0 }, 0.16)
+                if not self.Open and content then
+                    if immediate or not motion then content.Visible = false else
+                        task.delay(0.18, function() if not closed and revision == token then content.Visible = false end end)
+                    end
+                end
+            end
+            bind(hit.Activated, function() control:SetOpen(not control.Open) end)
+            bind(frame.Destroying, function()
+                closed = true
+                for _, handler in ipairs(handlers) do handler:Disconnect() end
+                table.clear(handlers)
+                for _, object in ipairs({ frame, arrow }) do if tweens[object] then tweens[object]:Cancel() tweens[object] = nil end end
+                local index = table.find(dropdowns, control)
+                if index then table.remove(dropdowns, index) end
+            end)
+            dropdowns[#dropdowns + 1] = control
+            return control
+        end
+        local baseToggle = ui.AddToggle
+        function ui:AddToggle(page, title, default, callback, description)
+            local control = baseToggle(self, page, title, default, callback, description)
+            finish(control)
+            local hit = control.Frame:FindFirstChildOfClass("TextButton")
+            for _, object in ipairs(hit:GetChildren()) do
+                if object:IsA("TextLabel") and object.Text ~= title then object.Visible = false end
+            end
+            local track = make("Frame", { Name = "GlassToggle", Position = UDim2.new(1, -66, 0.5, -14), Size = UDim2.fromOffset(50, 28) }, hit)
+            surface(track, 0.88, 14)
+            local knob = make("Frame", { Name = "GlassKnob", BackgroundColor3 = colors.White, BorderSizePixel = 0,
+                Position = UDim2.fromOffset(3, 3), Size = UDim2.fromOffset(22, 22) }, track)
+            round(knob, 11)
+            stroke(knob, 0.55)
+            local original = control.Set
+            function control:Set(value)
+                original(self, value)
+                animate(track, { BackgroundColor3 = value == true and colors.Accent or colors.Frost,
+                    BackgroundTransparency = value == true and 0.26 or 0.89 })
+                animate(knob, { Position = UDim2.fromOffset(value == true and 25 or 3, 3) }, 0.17)
+            end
+            control:Set(default)
+            return control
+        end
+        local baseMetrics = ui.AddMetricRow
+        function ui:AddMetricRow(page, definitions)
+            local metrics = baseMetrics(self, page, definitions)
+            local frame = metrics[1].Frame
+            frame.Name, frame.Size = "GlassMetrics", UDim2.new(1, 0, 0, 80)
+            surface(frame, 0.93, 18)
+            local headings, values = {}, {}
+            for _, metric in ipairs(metrics) do values[metric.ValueLabel] = true end
+            for _, object in ipairs(frame:GetChildren()) do
+                if object:IsA("TextLabel") and not values[object] then table.insert(headings, object) end
+            end
+            for index, definition in ipairs(definitions) do
+                local x = (index - 1) / #definitions
+                local heading, value = headings[index], metrics[index].ValueLabel
+                heading.Position, heading.Size, heading.TextColor3 = UDim2.new(x, 14, 0, 8), UDim2.new(1 / #definitions, -24, 0, 18), colors.Muted
+                heading.Font, heading.TextSize = Enum.Font.BuilderSans, 11
+                heading.TextWrapped, heading.TextTruncate = false, Enum.TextTruncate.AtEnd
+                value.Position, value.Size, value.TextSize = UDim2.new(x, 14, 0, 28), UDim2.new(1 / #definitions, -24, 0, 24), compact and 16 or 18
+                value.TextWrapped, value.TextTruncate = false, Enum.TextTruncate.AtEnd
+                value.Font, value.TextColor3 = Enum.Font.BuilderSans, colors.Text
+                if definition.Unit and definition.Unit ~= "" then
+                    text(frame, definition.Unit, 10, colors.Muted, { Position = UDim2.new(x, 14, 0, 55), Size = UDim2.new(1 / #definitions, -24, 0, 16), TextWrapped = false, TextTruncate = Enum.TextTruncate.AtEnd })
+                end
+            end
+            metricRows[#metricRows + 1] = metrics
+            return metrics
+        end
+        connect(root.DescendantAdded, function(object)
+            if object:IsA("TextButton") or object:IsA("TextBox") then task.defer(function() if alive and object.Parent then decorate(object) end end) end
+        end)
+        local dragging, dragStart, origin
+        connect(header.InputBegan, function(key)
+            if key.UserInputType == Enum.UserInputType.MouseButton1 or key.UserInputType == Enum.UserInputType.Touch then
+                dragging, dragStart, origin = key, key.Position, window.Position
+            end
+        end)
+        connect(input.InputChanged, function(key)
+            if not dragging or not window.Visible then return end
+            if key.UserInputType ~= Enum.UserInputType.MouseMovement and key ~= dragging then return end
+            local delta = key.Position - dragStart
+            local view = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
+            if not view then return end
+            local centerX = origin.X.Scale * view.X + origin.X.Offset + delta.X
+            local centerY = origin.Y.Scale * view.Y + origin.Y.Offset + delta.Y
+            local halfX, halfY = window.Size.X.Offset * 0.5, window.Size.Y.Offset * 0.5
+            window.Position = UDim2.fromOffset(math.clamp(centerX, halfX, view.X - halfX), math.clamp(centerY, halfY, view.Y - halfY))
+        end)
+        connect(input.InputEnded, function(key) if key == dragging then dragging = nil end end)
+        function ui:Destroy()
+            if not alive then return end
+            alive = false
+            for _, connection in ipairs(connections) do connection:Disconnect() end
+            for _, tween in pairs(tweens) do tween:Cancel() end
+            table.clear(connections)
+            table.clear(tweens)
+            table.clear(metricRows)
+            blur:Destroy()
+            baseDestroy(self)
+        end
+        local restore = root:FindFirstChild("Restore")
+        if restore then decorate(restore) round(restore, 22) end
+        ui:Layout(workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(960, 720))
+        ui:SetPage(options.InitialPage or 1)
+        animate(blur, { Size = 8 }, 0.2)
+        if motion then scale.Scale = 0.97 animate(scale, { Scale = 1 }, 0.3, true) end
+        return ui
+    end
+    return library
+end)()
+
 local function loadUILibrary()
     local input = game:GetService("UserInputService")
+    if Config.UIMode == "Glass" then
+        if input.TouchEnabled then ENV.__BONES_HUB_UI_LIBRARY = nil end
+        return GlassUI
+    end
     if Config.UIMode == "Lightweight" then
         if input.TouchEnabled then ENV.__BONES_HUB_UI_LIBRARY = nil end
         return MobileUI
@@ -3219,7 +3669,7 @@ end
 local mountInterface
 local interfaceConnection, changingInterface, activeUIMode
 local function setUIMode(mode)
-    if mode ~= "Original" and mode ~= "Lightweight" then return false end
+    if mode ~= "Original" and mode ~= "Lightweight" and mode ~= "Glass" then return false end
     if changingInterface then return false end
     if mode == activeUIMode then Config.UIMode = mode saveConfig() return true end
     local previous = Config.UIMode
@@ -3241,7 +3691,8 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.12", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.13", LogoImage = "",
+    InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
     TweenSpeed = 0.14, BarTweenSpeed = 0.16, MiniModeBreakpoint = 640,
@@ -3376,9 +3827,15 @@ UI:AddSectionHeader(6, "Settings", "Detection timing and notification tests")
 UI:AddDivider(6, "Interface")
 UI:AddMetricRow(6, { { Label = "UI Style", Value = Config.UIMode, Unit = "Saved preference" } })
 UI:AddButtonRow(6, {
+    { Text = "Glass UI", Style = Config.UIMode == "Glass" and "primary" or "ghost", Width = 150, Callback = function() setUIMode("Glass") end },
     { Text = "Original UI", Style = Config.UIMode == "Original" and "primary" or "ghost", Width = 150, Callback = function() setUIMode("Original") end },
     { Text = "Lightweight UI", Style = Config.UIMode == "Lightweight" and "primary" or "ghost", Width = 150, Callback = function() setUIMode("Lightweight") end },
 })
+UI:AddToggle(6, "Interface Motion", Config.InterfaceMotion ~= false, function(value)
+    Config.InterfaceMotion = value == true
+    if type(UI.SetMotionEnabled) == "function" then UI:SetMotionEnabled(Config.InterfaceMotion) end
+    saveConfig()
+end)
 UI:AddDivider(6, "Performance")
 Controls.ScanInterval = UI:AddInputNumber(6, "Biome Scanner Interval (Seconds)", {
     Min = 0.15, Max = 5, Default = Config.BiomeScanInterval, Placeholder = "0.5",
@@ -3408,8 +3865,8 @@ updateStatus()
     return ok, result
 end
 
-if ENV.BONES_HUB_UI_MODE == "Original" or ENV.BONES_HUB_UI_MODE == "Lightweight" then Config.UIMode = ENV.BONES_HUB_UI_MODE end
-if Config.UIMode ~= "Lightweight" then Config.UIMode = "Original" end
+if ENV.BONES_HUB_UI_MODE == "Original" or ENV.BONES_HUB_UI_MODE == "Lightweight" or ENV.BONES_HUB_UI_MODE == "Glass" then Config.UIMode = ENV.BONES_HUB_UI_MODE end
+if Config.UIMode ~= "Lightweight" and Config.UIMode ~= "Original" and Config.UIMode ~= "Glass" then Config.UIMode = "Glass" end
 local mountedInterface, interfaceFailure = mountInterface()
 if not mountedInterface then
     AuraNotifications.Destroy()
