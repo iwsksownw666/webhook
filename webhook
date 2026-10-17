@@ -9,6 +9,10 @@ local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then error("[bones hub] LocalPlayer unavailable") end
 
 local ENV = (getgenv and getgenv()) or _G
+local bootStarted = os.clock()
+local previousBoot = ENV.__BONES_HUB_BOOT_STARTED
+if type(previousBoot) == "number" and bootStarted - previousBoot >= 0 and bootStarted - previousBoot < 30 then return end
+ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
@@ -40,27 +44,30 @@ local BIOME_ICON_IDS = {
 }
 
 local BIOMES = {
-    "GLITCHED", "CYBERSPACE", "DREAMSPACE", "HEAVEN", "NULL", "HELL", "STARFALL",
+    "GLITCHED", "CYBERSPACE", "DREAMSPACE", "RADIANT FOREST", "HEAVEN", "NULL", "HELL", "STARFALL",
     "WINDY", "SNOWY", "RAINY", "SAND STORM", "CORRUPTION", "SINGULARITY", "AURORA",
-    "GRAVEYARD", "HOLLOWED", "BLOOD RAIN",
+    "GRAVEYARD", "HOLLOWED", "BLOOD RAIN", "LOST FOREST", "INCINERATOR", "BLAZING SUN", "RED FULL MOON",
 }
-local RARE_BIOMES = { DREAMSPACE = true, GLITCHED = true, CYBERSPACE = true }
+local RARE_BIOMES = { DREAMSPACE = true, GLITCHED = true, CYBERSPACE = true, ["RADIANT FOREST"] = true }
 local BIOME_COLORS = {
     DREAMSPACE = 0xFF6EC7, GLITCHED = 0x00FFB2, CYBERSPACE = 0x00CFFF, HEAVEN = 0xFFF6C8,
     HELL = 0xFF4A4A, CORRUPTION = 0x9B59B6, AURORA = 0x6EE7FF, NULL = 0x8E8E8E,
     SINGULARITY = 0x2E2EFF, STARFALL = 0xFFD166, ["SAND STORM"] = 0xE0C080,
     SNOWY = 0xEAF6FF, RAINY = 0x8FA8C8, WINDY = 0xC8E6C9, GRAVEYARD = 0x706080,
     HOLLOWED = 0xFF8C42, ["BLOOD RAIN"] = 0xA00020,
+    ["RADIANT FOREST"] = 0xD5AEFF, ["LOST FOREST"] = 0x6C9D66, INCINERATOR = 0xFF632E,
+    ["BLAZING SUN"] = 0xFFBF47, ["RED FULL MOON"] = 0xBA2948,
 }
 
 local DEFAULT_CONFIG = {
-    Webhook = "", PSLink = "", AntiAfk = true, BiomeScanInterval = 0.5,
+    Webhook = "", PSLink = "", AntiAfk = true, BiomeScanInterval = 0.5, UIMode = "Original",
     AuraEnabled = false, AuraMinimum = 1000000, AuraWebhook = "", AuraPing = false,
     PingBiomes = {
         HEAVEN = false, NULL = false, HELL = false, STARFALL = false, WINDY = false,
         SNOWY = false, RAINY = false, ["SAND STORM"] = false, CORRUPTION = false,
         SINGULARITY = false, AURORA = false, GRAVEYARD = false, HOLLOWED = false,
-        ["BLOOD RAIN"] = false,
+        ["BLOOD RAIN"] = false, ["LOST FOREST"] = false, INCINERATOR = false,
+        ["BLAZING SUN"] = false, ["RED FULL MOON"] = false,
     },
     PingMerchants = { Mari = false, Jester = false, Rin = false },
 }
@@ -301,10 +308,9 @@ local function normalizeBiome(value)
     if value == nil then return nil end
     local text = tostring(value):gsub("<.->", ""):gsub("[%[%]]", ""):gsub("_", " "):gsub("%-", " "):upper():gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
     if text == "NORMAL" or text == "NONE" or text == "NIL" then return "NORMAL" end
-    if text == "SANDSTORM" then return "SAND STORM" end
-    if text == "BLOODRAIN" then return "BLOOD RAIN" end
+    local compact = text:gsub("%s", "")
     for _, biome in ipairs(BIOMES) do
-        if text == biome then return biome end
+        if text == biome or compact == biome:gsub("%s", "") then return biome end
     end
 end
 
@@ -1585,8 +1591,10 @@ local Potion = (function()
 
     function controller.Mount(page)
         mounted = page
+        selector, selectorSignature = nil, nil
+        table.clear(rows)
         mountSelector({})
-        UI:AddToggle(page, "Auto Craft", false, controller.SetEnabled)
+        UI:AddToggle(page, "Auto Craft", enabled, controller.SetEnabled)
     end
 
     function controller.Destroy()
@@ -2435,7 +2443,7 @@ end)()
             for _, name in ipairs(areaNames) do if values[name] == true then selected[#selected + 1] = name end end
             controller.SelectAreas(selected)
         end)
-        selector:SetSelected({})
+        selector:SetSelected(copy(areas))
         local points = spots()
         FishSpots.Refresh(points)
         FishSpots.Mount(page, function()
@@ -2443,10 +2451,10 @@ end)()
             nextAttempt = 0
             cancel()
         end)
-        UI:AddToggle(page, "Auto Fish", false, controller.SetEnabled)
-        UI:AddToggle(page, "Early Finish", false, controller.SetEarly)
-        UI:AddToggle(page, "Hide Catch Result", true, controller.SetHideResults)
-        UI:AddToggle(page, "Auto Sell When Full", false, controller.SetAutoSell)
+        UI:AddToggle(page, "Auto Fish", enabled, controller.SetEnabled)
+        UI:AddToggle(page, "Early Finish (1.5s)", early, controller.SetEarly)
+        UI:AddToggle(page, "Hide Catch Result", hideResults, controller.SetHideResults)
+        UI:AddToggle(page, "Auto Sell When Full", autoSell, controller.SetAutoSell)
         UI:AddButtonRow(page, {
             { Text = "Instant Sell Fish (All)", Style = "primary", Width = 200, Callback = controller.SellAll },
             { Text = "Stop Selling", Style = "danger", Width = 130, Callback = controller.CancelSale },
@@ -2455,6 +2463,11 @@ end)()
             { Label = "Fish", Value = "--", Unit = "Inventory / Capacity" },
             { Label = "Fish Coins", Value = "--", Unit = "Balance" },
         })
+        local current = snapshot()
+        if current then
+            if metrics[1] and metrics[1].ValueLabel then metrics[1].ValueLabel.Text = tostring(current.Count) .. " / " .. tostring(current.Capacity) end
+            if metrics[2] and metrics[2].ValueLabel then metrics[2].ValueLabel.Text = tostring(current.Coins) end
+        end
     end
 
     function controller.Destroy()
@@ -2509,6 +2522,7 @@ local cachedSpot, cachedSpotId, cachedPoints
 local lastSnapshot, suppressResults, suppressedResults = nil, true, 0
 local sale, session, retired
 local saleSequence, caught, sold, earlyConfirmed = 0, 0, 0, 0
+local earlyLead = 1.5
 local nextCast, nextSale, nextSnapshot = 0, 0, 0
 local saleReady, ownedFishing, resetSale = false, false, false
 local function alive()
@@ -2581,7 +2595,8 @@ listen(packets.reward, function(value)
         caught += 1
         inventoryDirty = true
         bridge:SetAttribute("LastFishUID", value.rewardInfo.uid)
-        if session.deadline and workspace:GetServerTimeNow() < session.deadline then earlyConfirmed += 1 end
+        if session.submitted and session.early and session.deadline and workspace:GetServerTimeNow() < session.deadline then earlyConfirmed += 1 end
+        bridge:SetAttribute("LastRewardLead", session.deadline and session.deadline - workspace:GetServerTimeNow() or nil)
     end
     ownedFishing, session = false, nil
     nextCast = os.clock() + 1
@@ -2597,9 +2612,18 @@ listen(packets.sellAllFishConfirm, function()
 end)
 local rewardCallbacks = packets.reward.getListeners()
 local suppressionReady = false
+local nativeCleanup = {}
+for _, callback in pairs(packets.quit.getListeners()) do
+    if debug.info(callback, "s"):find("ClientHandlers.FishingClient", 1, true) then nativeCleanup.Finish = callback break end
+end
+bridge:SetAttribute("NativeCleanupReady", nativeCleanup.Finish ~= nil)
 for index, original in pairs(rewardCallbacks) do
     if debug.info(original, "s"):find("ClientHandlers.FishingClient", 1, true) then
         local wrapped = function(...)
+            local value = ...
+            if ownedFishing and session and session.submitted and session.early and type(value) == "table" and value.rewardInfo and nativeCleanup.Finish then
+                pcall(nativeCleanup.Finish)
+            end
             if bridge and ownedFishing and suppressResults then
                 suppressedResults += 1
                 if ui.isResultMode then ui.isResultMode = false end
@@ -2741,9 +2765,12 @@ local ok, failure = pcall(function()
                 if not allowed() or bridge:GetAttribute("SellAuthorized") == true then
                     quitOwned()
                 elseif session and session.deadline then
-                    if not session.submitted and workspace:GetServerTimeNow() >= session.deadline - (bridge:GetAttribute("Early") == true and 0.35 or 0.1) then
+                    local lead = bridge:GetAttribute("Early") == true and earlyLead or 0
+                    if not session.submitted and workspace:GetServerTimeNow() >= session.deadline - lead then
                         session.submitted = true
+                        session.early = lead > 0
                         session.waitUntil = os.clock() + 5
+                        bridge:SetAttribute("LastSubmitLead", session.deadline - workspace:GetServerTimeNow())
                         packets.gameResult.send(true)
                     elseif os.clock() > session.waitUntil then
                         quitOwned("Fishing result timed out")
@@ -2787,7 +2814,11 @@ local ok, failure = pcall(function()
         local delay = 0.25
         if sale or bridge:GetAttribute("SellAuthorized") == true then delay = 0.04
         elseif ownedFishing then
-            delay = session and session.deadline and session.deadline - workspace:GetServerTimeNow() < 0.6 and 0.025 or 0.1
+            if session and session.deadline and not session.submitted then
+                local lead = bridge:GetAttribute("Early") == true and earlyLead or 0
+                local untilSubmit = session.deadline - lead - workspace:GetServerTimeNow()
+                delay = math.clamp(untilSubmit, 0.025, 0.1)
+            else delay = 0.1 end
         elseif allowed() then delay = 0.1 end
         task.wait(delay)
     end
@@ -2842,30 +2873,375 @@ if bridge.Parent ~= nil then bridge:SetAttribute("Stopped", true) end
     return controller
 end)()
 
-local source = game:HttpGet(UI_URL, true)
-source = source:gsub("Sla" .. "oqUILib", "bones hub")
-source = source:gsub(LEGACY_UI_ROOT_NAME, UI_ROOT_NAME)
-source = source:gsub("rbxassetid://102126" .. "718358520", "")
-local library = ENV.__BONES_HUB_UI_LIBRARY
-if type(library) ~= "table" or type(library.new) ~= "function" then
-    for attempt = 1, 2 do
-        local ok, value = pcall(function() return loadstring(source)() end)
-        if ok and type(value) == "table" and type(value.new) == "function" then
-            library = value
-            break
+local MobileUI = (function()
+    local library = {}
+    function library.new(options)
+        local input = game:GetService("UserInputService")
+        local player = game:GetService("Players").LocalPlayer
+        local colors = {
+            Canvas = Color3.fromRGB(14, 19, 27), Panel = Color3.fromRGB(20, 28, 39),
+            Raised = Color3.fromRGB(28, 39, 53), Text = Color3.fromRGB(233, 240, 247),
+            Muted = Color3.fromRGB(153, 173, 193), Accent = Color3.fromRGB(130, 220, 203),
+        }
+        local ui = { Mode = "lightweight", Pages = {} }
+        local alive, visible, made = true, true, 0
+        local connections, tabs, pageOrder = {}, {}, {}
+        local function make(class, properties, parent)
+            local object = Instance.new(class)
+            for key, value in pairs(properties or {}) do object[key] = value end
+            object.Parent = parent
+            return object
         end
-        if attempt < 2 then task.wait(0.25) end
+        local function corner(object, radius)
+            make("UICorner", { CornerRadius = UDim.new(0, radius or 8) }, object)
+        end
+        local function label(parent, text, size, color)
+            return make("TextLabel", {
+                BackgroundTransparency = 1, BorderSizePixel = 0, Text = tostring(text or ""),
+                TextColor3 = color or colors.Text, Font = Enum.Font.Gotham, TextSize = size or 13,
+                TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true,
+            }, parent)
+        end
+        local function button(parent, text)
+            local object = make("TextButton", {
+                BackgroundColor3 = colors.Raised, BorderSizePixel = 0, Text = text,
+                TextColor3 = colors.Text, Font = Enum.Font.GothamMedium, TextSize = 13,
+                TextWrapped = true, AutoButtonColor = true,
+            }, parent)
+            corner(object)
+            return object
+        end
+        local function connect(signal, callback)
+            connections[#connections + 1] = signal:Connect(callback)
+        end
+        local gui = make("ScreenGui", {
+            Name = "BonesHubUI", ResetOnSpawn = false, DisplayOrder = 30, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+        })
+        local mounted = pcall(function() gui.Parent = game:GetService("CoreGui") end)
+        if not mounted then gui.Parent = player:WaitForChild("PlayerGui", 10) end
+        local window = make("Frame", { Name = "Window", BackgroundColor3 = colors.Canvas, BorderSizePixel = 0,
+            AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5) }, gui)
+        corner(window, 12)
+        local header = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 48) }, window)
+        local title = label(header, options.AppName or "bones hub", 17, colors.Accent)
+        title.Position, title.Size = UDim2.fromOffset(14, 5), UDim2.new(1, -76, 0, 23)
+        local subtitle = label(header, options.AppSubtitle or "by Ethereal", 11, colors.Muted)
+        subtitle.Position, subtitle.Size = UDim2.fromOffset(14, 27), UDim2.new(1, -76, 0, 16)
+        local close = button(header, "-")
+        close.Position, close.Size = UDim2.new(1, -48, 0, 2), UDim2.fromOffset(44, 44)
+        local restore = button(gui, "bones hub")
+        restore.Name, restore.Position, restore.Size, restore.Visible = "Restore", UDim2.new(0, 12, 0.5, -22), UDim2.fromOffset(104, 44), false
+        local strip = make("ScrollingFrame", {
+            Name = "Tabs", BackgroundTransparency = 1, BorderSizePixel = 0,
+            Position = UDim2.fromOffset(10, 48), Size = UDim2.new(1, -20, 0, 46),
+            CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.X,
+            ScrollingDirection = Enum.ScrollingDirection.X, ScrollBarThickness = 0,
+        }, window)
+        make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, strip)
+        for index, definition in ipairs(options.Pages or {}) do
+            local tab = button(strip, definition.Name)
+            tab.LayoutOrder, tab.Size = index, UDim2.fromOffset(math.max(72, #definition.Name * 8 + 24), 42)
+            tabs[index] = tab
+            local page = make("ScrollingFrame", {
+                Name = "Page" .. tostring(index), BackgroundTransparency = 1, BorderSizePixel = 0,
+                Position = UDim2.fromOffset(12, 100), Size = UDim2.new(1, -24, 1, -110),
+                CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+                ScrollBarThickness = 3, ScrollBarImageColor3 = colors.Accent, Visible = false,
+            }, window)
+            make("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, page)
+            make("UIPadding", { PaddingBottom = UDim.new(0, 12), PaddingRight = UDim.new(0, 5) }, page)
+            ui.Pages[index], pageOrder[index] = page, 0
+            tab.Activated:Connect(function() ui:SetPage(index) end)
+        end
+        local cameraConnection
+        local function resize()
+            local camera = workspace.CurrentCamera
+            local size = camera and camera.ViewportSize or Vector2.new(640, 480)
+            window.Size = UDim2.fromOffset(math.max(240, math.min(620, size.X - 24)), math.max(180, math.min(580, size.Y - 64)))
+        end
+        local function bindCamera()
+            if cameraConnection then cameraConnection:Disconnect() cameraConnection = nil end
+            if workspace.CurrentCamera then cameraConnection = workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(resize) end
+            resize()
+        end
+        connect(workspace:GetPropertyChangedSignal("CurrentCamera"), bindCamera)
+        bindCamera()
+        function ui:SetPage(index)
+            if not self.Pages[index] or not alive then return false end
+            for key, page in ipairs(self.Pages) do
+                page.Visible = key == index
+                tabs[key].BackgroundColor3 = key == index and colors.Accent or colors.Raised
+                tabs[key].TextColor3 = key == index and colors.Canvas or colors.Text
+            end
+            self.CurrentPage = index
+            return true
+        end
+        function ui:SetVisible(value)
+            visible = value == true
+            window.Visible, restore.Visible = visible, not visible
+        end
+        function ui:IsVisible() return alive and visible end
+        close.Activated:Connect(function() ui:SetVisible(false) end)
+        restore.Activated:Connect(function() ui:SetVisible(true) end)
+        connect(input.InputBegan, function(key, processed)
+            if not processed and key.KeyCode == Enum.KeyCode.K and not input:GetFocusedTextBox() then ui:SetVisible(not visible) end
+        end)
+        local function row(page, height)
+            assert(alive and ui.Pages[page], "[bones hub] UI page unavailable")
+            made += 1
+            if made % 14 == 0 then task.wait() end
+            pageOrder[page] += 1
+            local frame = make("Frame", { BackgroundColor3 = colors.Panel, BorderSizePixel = 0,
+                Size = UDim2.new(1, 0, 0, height), LayoutOrder = pageOrder[page] }, ui.Pages[page])
+            corner(frame)
+            return frame
+        end
+        function ui:AddSectionHeader(page, text, description)
+            local frame = row(page, description and 66 or 38)
+            frame.AutomaticSize = Enum.AutomaticSize.Y
+            make("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, frame)
+            make("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, frame)
+            local heading = label(frame, text, 18, colors.Accent)
+            heading.Size, heading.AutomaticSize, heading.LayoutOrder = UDim2.new(1, 0, 0, 24), Enum.AutomaticSize.Y, 0
+            if description then
+                local detail = label(frame, description, 12, colors.Muted)
+                detail.Size, detail.AutomaticSize, detail.LayoutOrder = UDim2.new(1, 0, 0, 0), Enum.AutomaticSize.Y, 1
+            end
+            return { Frame = frame }
+        end
+        function ui:AddDivider(page, text)
+            local frame = row(page, 28)
+            frame.BackgroundTransparency = 1
+            local heading = label(frame, text, 12, colors.Muted)
+            heading.Position, heading.Size = UDim2.fromOffset(2, 0), UDim2.new(1, -4, 1, 0)
+            return { Frame = frame }
+        end
+        function ui:AddToggle(page, text, default, callback)
+            local frame, state = row(page, 48), default == true
+            local control = { Frame = frame }
+            local hit = button(frame, "")
+            hit.BackgroundTransparency, hit.Size = 1, UDim2.fromScale(1, 1)
+            local heading = label(hit, text)
+            heading.Position, heading.Size = UDim2.fromOffset(10, 0), UDim2.new(1, -80, 1, 0)
+            local value = label(hit, "", 12)
+            value.Position, value.Size, value.TextXAlignment = UDim2.new(1, -64, 0, 0), UDim2.fromOffset(52, 48), Enum.TextXAlignment.Right
+            function control:Set(nextValue)
+                state = nextValue == true
+                value.Text, value.TextColor3 = state and "ON" or "OFF", state and colors.Accent or colors.Muted
+            end
+            control:Set(state)
+            hit.Activated:Connect(function()
+                control:Set(not state)
+                if callback then callback(state) end
+            end)
+            return control
+        end
+        function ui:AddButtonRow(page, definitions)
+            local frame = row(page, 44)
+            frame.BackgroundTransparency = 1
+            make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, frame)
+            local controls = { Frame = frame }
+            for index, definition in ipairs(definitions) do
+                local hit = button(frame, definition.Text)
+                hit.Size, hit.LayoutOrder = UDim2.new(1 / #definitions, -6 * (#definitions - 1) / #definitions, 1, 0), index
+                if definition.Style == "primary" then hit.BackgroundColor3, hit.TextColor3 = colors.Accent, colors.Canvas
+                elseif definition.Style == "danger" then hit.TextColor3 = Color3.fromRGB(255, 153, 153) end
+                hit.Activated:Connect(function() if definition.Callback then definition.Callback() end end)
+                controls[index] = hit
+            end
+            return controls
+        end
+        function ui:AddInput(page, text, placeholder, callback)
+            local frame = row(page, 82)
+            local heading = label(frame, text)
+            heading.Position, heading.Size = UDim2.fromOffset(10, 4), UDim2.new(1, -20, 0, 24)
+            local box = make("TextBox", {
+                BackgroundColor3 = colors.Raised, BorderSizePixel = 0, ClearTextOnFocus = false,
+                Position = UDim2.fromOffset(8, 32), Size = UDim2.new(1, -16, 0, 44),
+                Font = Enum.Font.Gotham, TextSize = 12, Text = "", TextColor3 = colors.Text,
+                PlaceholderText = placeholder or "", PlaceholderColor3 = colors.Muted, TextXAlignment = Enum.TextXAlignment.Left,
+            }, frame)
+            corner(box, 6)
+            make("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, box)
+            local control = { Frame = frame, TextBox = box }
+            function control:Set(value) box.Text = tostring(value or "") end
+            box.FocusLost:Connect(function() if callback then callback(box.Text) end end)
+            return control
+        end
+        function ui:AddInputNumber(page, text, settings, callback)
+            local control
+            control = self:AddInput(page, text, settings.Placeholder, function(value)
+                local number = tonumber((value:gsub("[,_%s]", "")))
+                if not number or number ~= number or math.abs(number) == math.huge then control:Set(control.Value) return end
+                number = math.clamp(number, settings.Min or -math.huge, settings.Max or math.huge)
+                control.Value = number
+                control:Set(number)
+                if callback then callback(number) end
+            end)
+            control.Value = settings.Default
+            control:Set(settings.Default)
+            return control
+        end
+        function ui:AddMultiSelect(page, text, choices, callback)
+            local frame = row(page, 48)
+            frame.AutomaticSize = Enum.AutomaticSize.Y
+            make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, frame)
+            local hit = button(frame, "")
+            hit.BackgroundTransparency, hit.Size, hit.LayoutOrder = 1, UDim2.new(1, 0, 0, 48), 0
+            local heading = label(hit, text)
+            heading.Position, heading.Size = UDim2.fromOffset(10, 0), UDim2.new(1, -65, 1, 0)
+            local value = label(hit, "0 +", 12, colors.Accent)
+            value.Position, value.Size, value.TextXAlignment = UDim2.new(1, -52, 0, 0), UDim2.fromOffset(42, 48), Enum.TextXAlignment.Right
+            local selected, optionButtons, content = {}, {}, nil
+            local control = { Frame = frame }
+            local function redraw()
+                local count = 0
+                for _, choice in ipairs(choices) do
+                    if selected[choice] then count += 1 end
+                    if optionButtons[choice] then
+                        optionButtons[choice].Text = (selected[choice] and "[x] " or "[ ] ") .. tostring(choice)
+                        optionButtons[choice].TextColor3 = selected[choice] and colors.Accent or colors.Text
+                    end
+                end
+                value.Text = tostring(count) .. (content and content.Visible and " -" or " +")
+            end
+            function control:SetSelected(values)
+                table.clear(selected)
+                for key, item in pairs(values or {}) do
+                    local choice = type(key) == "number" and item or item == true and key or nil
+                    if choice and table.find(choices, choice) then selected[choice] = true end
+                end
+                redraw()
+            end
+            hit.Activated:Connect(function()
+                if not content then
+                    content = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 1 }, frame)
+                    make("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, content)
+                    for index, choice in ipairs(choices) do
+                        local option = button(content, tostring(choice))
+                        option.Size, option.LayoutOrder = UDim2.new(1, 0, 0, 44), index
+                        optionButtons[choice] = option
+                        option.Activated:Connect(function()
+                            selected[choice] = not selected[choice] or nil
+                            redraw()
+                            if callback then callback(table.clone(selected)) end
+                        end)
+                    end
+                    if #choices == 0 then
+                        local empty = label(content, "No items available", 12, colors.Muted)
+                        empty.Size = UDim2.new(1, 0, 0, 32)
+                    end
+                else content.Visible = not content.Visible end
+                redraw()
+            end)
+            return control
+        end
+        function ui:AddMetricRow(page, definitions)
+            local frame, metrics = row(page, #definitions * 58), {}
+            for index, definition in ipairs(definitions) do
+                local heading = label(frame, definition.Label, 11, colors.Muted)
+                heading.Position, heading.Size = UDim2.fromOffset(10, (index - 1) * 58 + 4), UDim2.new(1, -20, 0, 20)
+                local value = label(frame, definition.Value, 14)
+                value.Position, value.Size = UDim2.fromOffset(10, (index - 1) * 58 + 24), UDim2.new(1, -20, 0, 30)
+                metrics[index] = { Frame = frame, ValueLabel = value }
+            end
+            return metrics
+        end
+        function ui:AddStatusBadge2(page, text, state)
+            local metric = self:AddMetricRow(page, { { Label = text, Value = state } })[1]
+            function metric:SetState(value)
+                self.ValueLabel.Text = tostring(value)
+                self.ValueLabel.TextColor3 = value == "online" and colors.Accent or colors.Muted
+            end
+            metric:SetState(state)
+            return metric
+        end
+        function ui:AddAlert(page, text, detail)
+            return self:AddSectionHeader(page, text, detail)
+        end
+        function ui:AddLogConsole(page, height)
+            local frame = row(page, math.min(height or 160, 180))
+            local scroll = make("ScrollingFrame", { BackgroundTransparency = 1, BorderSizePixel = 0,
+                Position = UDim2.fromOffset(8, 8), Size = UDim2.new(1, -16, 1, -16),
+                CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 2 }, frame)
+            local output = label(scroll, "", 11, colors.Muted)
+            output.Size, output.AutomaticSize, output.TextYAlignment = UDim2.new(1, -6, 0, 0), Enum.AutomaticSize.Y, Enum.TextYAlignment.Top
+            local lines = {}
+            return { Frame = frame, Log = function(_, line)
+                if not alive then return end
+                lines[#lines + 1] = tostring(line):sub(1, 350)
+                if #lines > 40 then table.remove(lines, 1) end
+                output.Text = table.concat(lines, "\n")
+            end }
+        end
+        function ui:SetSidebarUserStatus() end
+        function ui:SetBootStep() end
+        function ui:FinishBootSplash() end
+        function ui:Destroy()
+            if not alive then return end
+            alive = false
+            if cameraConnection then cameraConnection:Disconnect() end
+            for _, connection in ipairs(connections) do connection:Disconnect() end
+            table.clear(connections)
+            gui:Destroy()
+        end
+        ui:SetPage(options.InitialPage or 1)
+        return ui
     end
+    return library
+end)()
+
+local function loadUILibrary()
+    local input = game:GetService("UserInputService")
+    if Config.UIMode == "Lightweight" then
+        if input.TouchEnabled then ENV.__BONES_HUB_UI_LIBRARY = nil end
+        return MobileUI
+    end
+    local cached = ENV.__BONES_HUB_UI_LIBRARY
+    if type(cached) == "table" and type(cached.new) == "function" then return cached end
+    local ok, result = pcall(function()
+        local source = game:HttpGet(UI_URL, true)
+        source = source:gsub("Sla" .. "oqUILib", "bones hub")
+        source = source:gsub(LEGACY_UI_ROOT_NAME, UI_ROOT_NAME)
+        source = source:gsub("rbxassetid://102126" .. "718358520", "")
+        local chunk, failure = loadstring(source)
+        source = nil
+        if not chunk then error(failure) end
+        return chunk()
+    end)
+    if ok and type(result) == "table" and type(result.new) == "function" then
+        ENV.__BONES_HUB_UI_LIBRARY = result
+        return result
+    end
+    return nil, "Original UI unavailable"
 end
-if type(library) ~= "table" or type(library.new) ~= "function" then
-    AuraNotifications.Destroy()
-    Potion.Destroy()
-    FishingAutomation.Destroy()
-    error("[bones hub] UI library unavailable; retry loading the script")
+
+local mountInterface
+local interfaceConnection, changingInterface, activeUIMode
+local function setUIMode(mode)
+    if mode ~= "Original" and mode ~= "Lightweight" then return false end
+    if changingInterface then return false end
+    if mode == activeUIMode then Config.UIMode = mode saveConfig() return true end
+    local previous = Config.UIMode
+    Config.UIMode = mode
+    local ok, failure = mountInterface(6)
+    if not ok then Config.UIMode = previous log(tostring(failure), "ERROR") return false end
+    ENV.BONES_HUB_UI_MODE = mode
+    saveConfig()
+    return true
 end
-ENV.__BONES_HUB_UI_LIBRARY = library
+
+mountInterface = function(page)
+    if changingInterface then return false, "Interface busy" end
+    changingInterface = true
+    local ok, result = pcall(function()
+        local library, failure = loadUILibrary()
+        if not library then error(failure) end
+        if interfaceConnection then interfaceConnection:Disconnect() interfaceConnection = nil end
+        if UI then UI:Destroy() end
+        Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.9", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.12", LogoImage = "",
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
     TweenSpeed = 0.14, BarTweenSpeed = 0.16, MiniModeBreakpoint = 640,
@@ -2895,7 +3271,7 @@ pcall(function()
     if gui then
         gui.Name = UI_ROOT_NAME
         for _, descendant in ipairs(gui:GetDescendants()) do sanitizeBrandObject(descendant) end
-        table.insert(Connections, gui.DescendantAdded:Connect(sanitizeBrandObject))
+        interfaceConnection = gui.DescendantAdded:Connect(sanitizeBrandObject)
     end
 end)
 
@@ -2967,37 +3343,42 @@ Controls.LogConsole = UI:AddLogConsole(3, 200)
 
 UI:SetBootStep("Loading biome counters", 0.5, "biome counts")
 UI:AddSectionHeader(4, "Statistics", "Biome detection totals for this execution")
-UI:AddDivider(4, "Rare Biomes")
 Controls.Counts = {}
-local rareMetrics = UI:AddMetricRow(4, {
-    { Label = "Glitched", Value = "0", Unit = "found" },
-    { Label = "Dreamspace", Value = "0", Unit = "found" },
-    { Label = "Cyberspace", Value = "0", Unit = "found" },
-})
-Controls.Counts.GLITCHED, Controls.Counts.DREAMSPACE, Controls.Counts.CYBERSPACE = rareMetrics[1], rareMetrics[2], rareMetrics[3]
-UI:AddDivider(4, "Other Biomes")
-for index = 4, #BIOMES, 3 do
-    local definitions, names = {}, {}
-    for offset = 0, 2 do
-        local biome = BIOMES[index + offset]
-        if biome then
-            table.insert(definitions, { Label = biome, Value = "0", Unit = "detected" })
-            table.insert(names, biome)
-        end
+for _, group in ipairs({ { Name = "Rare Biomes", Rare = true }, { Name = "Other Biomes", Rare = false } }) do
+    UI:AddDivider(4, group.Name)
+    local biomes = {}
+    for _, biome in ipairs(BIOMES) do
+        if (RARE_BIOMES[biome] == true) == group.Rare then table.insert(biomes, biome) end
     end
-    local row = UI:AddMetricRow(4, definitions)
-    for rowIndex, biome in ipairs(names) do Controls.Counts[biome] = row[rowIndex] end
+    for index = 1, #biomes, 3 do
+        local definitions, names = {}, {}
+        for offset = 0, 2 do
+            local biome = biomes[index + offset]
+            if biome then
+                table.insert(definitions, { Label = biome, Value = tostring(State.Counts[biome] or 0), Unit = "detected" })
+                table.insert(names, biome)
+            end
+        end
+        local row = UI:AddMetricRow(4, definitions)
+        for rowIndex, biome in ipairs(names) do Controls.Counts[biome] = row[rowIndex] end
+    end
 end
 
 UI:SetBootStep("Loading notification controls", 0.67, "pings page")
 UI:AddSectionHeader(5, "Pings", "Discord notification and mention policy")
-UI:AddAlert(5, "Rare weather", "DREAMSPACE, GLITCHED and CYBERSPACE send @everyone and allow only the everyone mention.", "warning")
+UI:AddAlert(5, "Rare weather", "DREAMSPACE, GLITCHED, CYBERSPACE and RADIANT FOREST send @everyone and allow only the everyone mention.", "warning")
 UI:AddAlert(5, "Normal events", "Every normal weather and merchant event is sent, but allowed_mentions.parse is empty so nobody is pinged.", "info")
 UI:AddDivider(5, "Delivery")
 UI:AddAlert(5, "Private delivery", "Weather and merchants use Discord Webhook URL. Aura alerts may use their own URL. Aura cards never include your private-server link.", "info")
 
 UI:SetBootStep("Mounting settings", 0.84, "settings page")
 UI:AddSectionHeader(6, "Settings", "Detection timing and notification tests")
+UI:AddDivider(6, "Interface")
+UI:AddMetricRow(6, { { Label = "UI Style", Value = Config.UIMode, Unit = "Saved preference" } })
+UI:AddButtonRow(6, {
+    { Text = "Original UI", Style = Config.UIMode == "Original" and "primary" or "ghost", Width = 150, Callback = function() setUIMode("Original") end },
+    { Text = "Lightweight UI", Style = Config.UIMode == "Lightweight" and "primary" or "ghost", Width = 150, Callback = function() setUIMode("Lightweight") end },
+})
 UI:AddDivider(6, "Performance")
 Controls.ScanInterval = UI:AddInputNumber(6, "Biome Scanner Interval (Seconds)", {
     Min = 0.15, Max = 5, Default = Config.BiomeScanInterval, Placeholder = "0.5",
@@ -3016,8 +3397,32 @@ UI:AddAlert(6, "Private delivery", "Notifications only use your configured Disco
 
 Potion.Mount(1)
 FishingAutomation.Mount(1)
+UI:SetBootStep("Ready.", 1, "ready")
+UI:FinishBootSplash()
+if page then UI:SetPage(page) end
+Appearance.Finish(game:GetService("CoreGui"):FindFirstChild(UI_ROOT_NAME))
+activeUIMode = Config.UIMode
+updateStatus()
+    end)
+    changingInterface = false
+    return ok, result
+end
+
+if ENV.BONES_HUB_UI_MODE == "Original" or ENV.BONES_HUB_UI_MODE == "Lightweight" then Config.UIMode = ENV.BONES_HUB_UI_MODE end
+if Config.UIMode ~= "Lightweight" then Config.UIMode = "Original" end
+local mountedInterface, interfaceFailure = mountInterface()
+if not mountedInterface then
+    AuraNotifications.Destroy()
+    FishingAutomation.Destroy()
+    Potion.Destroy()
+    Alive = false
+    if UI then pcall(function() UI:Destroy() end) end
+    ENV.__BONES_HUB_BOOT_STARTED = nil
+    error(interfaceFailure)
+end
 
 local API = {}
+function API.SetUIMode(mode) return setUIMode(mode) end
 function API.Start() startMacro() end
 function API.Stop() stopMacro() end
 function API.TestBiome(biome) return sendBiome(normalizeBiome(biome) or "WINDY") end
@@ -3060,6 +3465,7 @@ function API.GetState()
     local observed = currentBiome()
     return {
         Running = State.Running, CurrentBiome = State.CurrentBiome, LastBiome = State.LastBiome,
+        UIMode = activeUIMode,
         LastMerchant = State.LastMerchant, AlertsSent = State.AlertsSent,
         WebhookValid = isWebhook(Config.Webhook), UIVisible = UI:IsVisible(),
         WeatherSource = WeatherSource,
@@ -3080,6 +3486,7 @@ function API.Destroy()
     saveConfig()
     for _, connection in ipairs(Connections) do pcall(function() connection:Disconnect() end) end
     table.clear(Connections)
+    if interfaceConnection then interfaceConnection:Disconnect() interfaceConnection = nil end
     if WeatherBridge then WeatherBridge:SetAttribute("Active", false) WeatherBridge:Destroy() WeatherBridge = nil end
     if UI then pcall(function() UI:Destroy() end) end
     if ENV[API_KEY] == API then ENV[API_KEY] = nil end
@@ -3111,4 +3518,5 @@ pcall(function()
 end)
 log("Ready. Press K to show or hide the window.", "INFO")
 updateStatus()
+if ENV.__BONES_HUB_BOOT_STARTED == bootStarted then ENV.__BONES_HUB_BOOT_STARTED = nil end
 task.spawn(connectMerchantEvents)
