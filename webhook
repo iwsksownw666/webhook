@@ -55,6 +55,7 @@ local BIOME_COLORS = {
 
 local DEFAULT_CONFIG = {
     Webhook = "", PSLink = "", AntiAfk = true, BiomeScanInterval = 0.5,
+    AuraEnabled = false, AuraMinimum = 1000000, AuraWebhook = "", AuraPing = false,
     PingBiomes = {
         HEAVEN = false, NULL = false, HELL = false, STARFALL = false, WINDY = false,
         SNOWY = false, RAINY = false, ["SAND STORM"] = false, CORRUPTION = false,
@@ -744,6 +745,312 @@ local function connectMerchantEvents()
     end)
     if not ok then log("Merchant events unavailable: " .. tostring(err), "WARN") end
 end
+
+local AuraNotifications = (function()
+    local previous = ENV.__BONES_HUB_AURA_RUNTIME
+    if type(previous) == "table" and type(previous.Destroy) == "function" then pcall(previous.Destroy) end
+    local controller = {}
+    local active, revision, generation = true, 0, 0
+    local connections, queue = {}, {}
+    local worker, lastSignature, current = false, nil, nil
+    local delivered, observed, nextSend = 0, 0, 0
+    local lastError
+    local metrics
+
+    local function finite(value)
+        return type(value) == "number" and value == value and value > 0 and value < math.huge
+    end
+
+    local function minimum(value)
+        if type(value) == "string" then value = value:gsub("[,%s_]", "") end
+        local number = tonumber(value)
+        if not finite(number) then return nil end
+        return math.clamp(math.floor(number), 1, 1000000000000)
+    end
+
+    Config.AuraEnabled = Config.AuraEnabled == true
+    Config.AuraPing = Config.AuraPing == true
+    Config.AuraMinimum = minimum(Config.AuraMinimum) or 1000000
+    Config.AuraWebhook = type(Config.AuraWebhook) == "string" and trim(Config.AuraWebhook) or ""
+
+    local function grouped(value)
+        local text = string.format("%.0f", value)
+        return (text:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
+    end
+
+    local function read()
+        local name = trim(LocalPlayer:GetAttribute("AuraName"))
+        local rarity = tonumber(LocalPlayer:GetAttribute("EquippedAuraRarity"))
+        if name == "" or name:lower() == "none" or name:lower() == "nil" or not finite(rarity) then return nil end
+        return { Name = name, Rarity = math.floor(rarity) }
+    end
+
+    local function signature(aura)
+        return aura and (aura.Name .. "\0" .. tostring(aura.Rarity)) or ""
+    end
+
+    local function destination()
+        local custom = trim(Config.AuraWebhook)
+        if custom ~= "" then return custom end
+        return trim(Config.Webhook)
+    end
+
+    local function updateMetrics()
+        if not metrics then return end
+        local values = { current and current.Name or "None", current and ("1 / " .. grouped(current.Rarity)) or "-" }
+        for index, metric in ipairs(metrics) do
+            if metric.ValueLabel and metric.ValueLabel.Text ~= values[index] then metric.ValueLabel.Text = values[index] end
+        end
+    end
+
+    local function payload(aura, test)
+        local name = aura.Name:gsub("[\r\n]", " "):sub(1, 200):gsub("([\\`*_~|>])", "\\%1")
+        return {
+            content = Config.AuraPing and "@everyone" or nil,
+            allowed_mentions = { parse = Config.AuraPing and { "everyone" } or {} },
+            embeds = { {
+                title = test and "Aura Webhook Test" or "Aura Equipped",
+                description = "**" .. name .. "**",
+                color = 0x82DCCB,
+                fields = {
+                    { name = "Player", value = tostring(LocalPlayer.DisplayName) .. " (@" .. tostring(LocalPlayer.Name) .. ")", inline = true },
+                    { name = "Rarity", value = "1 in " .. grouped(aura.Rarity), inline = true },
+                },
+                timestamp = DateTime.now():ToIsoDate(),
+                footer = { text = "bones hub by Ethereal | Aura" },
+            } },
+        }
+    end
+
+    local function post(body, url)
+        if not isWebhook(url) then return false, "Invalid aura webhook" end
+        if type(requestFunction) ~= "function" then return false, "HTTP request API unavailable" end
+        local encoded, json = pcall(HttpService.JSONEncode, HttpService, body)
+        if not encoded then return false, "Aura payload encoding failed" end
+        local done, success, response = false, false, nil
+        local job = task.spawn(function()
+            success, response = pcall(requestFunction, {
+                Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = json, Timeout = 10,
+            })
+            done = true
+        end)
+        local deadline = os.clock() + 12
+        while active and not done and os.clock() < deadline do task.wait(0.1) end
+        if not done then pcall(task.cancel, job) return false, "Aura request timed out" end
+        if not success or type(response) ~= "table" then return false, "Aura request failed" end
+        local status = tonumber(response.StatusCode or response.Status)
+        if status and status >= 200 and status < 300 then return true end
+        if status == 429 then
+            local delay = 2
+            local ok, info = pcall(HttpService.JSONDecode, HttpService, response.Body or "")
+            if ok and type(info) == "table" and finite(tonumber(info.retry_after)) then delay = tonumber(info.retry_after) end
+            return false, "Aura rate limited", math.clamp(delay, 0.25, 15)
+        end
+        return false, status and ("Aura HTTP " .. tostring(status)) or "Aura response status unavailable"
+    end
+
+    local function permitted(entry)
+        return active and entry.Generation == generation and (entry.Test or (Config.AuraEnabled and entry.Aura.Rarity >= Config.AuraMinimum))
+            and entry.Destination == destination() and isWebhook(entry.Destination)
+    end
+
+    local function pump()
+        if worker then return end
+        worker = true
+        task.spawn(function()
+            while active and #queue > 0 do
+                local entry = table.remove(queue, 1)
+                for attempt = 1, 3 do
+                    while permitted(entry) and os.clock() < nextSend do task.wait(math.min(0.25, nextSend - os.clock())) end
+                    if not permitted(entry) then break end
+                    local ok, err, retry = post(payload(entry.Aura, entry.Test), entry.Destination)
+                    nextSend = os.clock() + (retry or 2)
+                    if not active then break end
+                    if ok then
+                        delivered += 1
+                        State.AlertsSent += 1
+                        lastError = nil
+                        log(entry.Test and "Aura webhook test delivered" or ("Aura equipped: " .. entry.Aura.Name .. " (1 in " .. grouped(entry.Aura.Rarity) .. ")"), "INFO")
+                        break
+                    end
+                    lastError = err
+                    if not retry or attempt == 3 then log(err, "WARN") break end
+                end
+            end
+            worker = false
+        end)
+    end
+
+    local function enqueue(aura, test)
+        if not active then return false, "Aura notifier stopped" end
+        local url = destination()
+        if not isWebhook(url) then lastError = "Invalid aura webhook" return false, lastError end
+        if #queue >= 8 then lastError = "Aura queue full" return false, lastError end
+        table.insert(queue, { Aura = aura, Test = test == true, Destination = url, Generation = generation })
+        pump()
+        return true
+    end
+
+    local function observe(aura)
+        local key = signature(aura)
+        if key == lastSignature then return end
+        current, lastSignature = aura, key
+        updateMetrics()
+        if aura then
+            observed += 1
+            if Config.AuraEnabled and aura.Rarity >= Config.AuraMinimum then enqueue(aura, false) end
+        end
+    end
+
+    local function schedule()
+        revision += 1
+        local ticket = revision
+        task.delay(0.2, function()
+            if not active or ticket ~= revision then return end
+            local first = read()
+            task.delay(0.15, function()
+                if not active or ticket ~= revision then return end
+                local second = read()
+                if signature(first) ~= signature(second) then schedule() return end
+                observe(second)
+            end)
+        end)
+    end
+
+    function controller.SetEnabled(value)
+        Config.AuraEnabled = value == true
+        generation += 1
+        table.clear(queue)
+        current = read()
+        lastSignature = signature(current)
+        updateMetrics()
+        saveConfig()
+        return Config.AuraEnabled
+    end
+
+    function controller.SetMinimum(value)
+        local number = minimum(value)
+        if not number then return false end
+        Config.AuraMinimum = number
+        saveConfig()
+        return true
+    end
+
+    function controller.SetWebhook(value)
+        local url = trim(value)
+        if url ~= "" and not isWebhook(url) then return false end
+        Config.AuraWebhook = url
+        generation += 1
+        table.clear(queue)
+        saveConfig()
+        return true
+    end
+
+    function controller.GetState()
+        return {
+            Enabled = Config.AuraEnabled, MinimumRarity = Config.AuraMinimum, MentionEveryone = Config.AuraPing,
+            CurrentAura = current and current.Name or nil, CurrentRarity = current and current.Rarity or nil,
+            Delivered = delivered, ObservedChanges = observed, Queued = #queue, LastError = lastError,
+            WebhookValid = isWebhook(destination()),
+        }
+    end
+
+    function controller.Preview()
+        local aura = read()
+        return aura and payload(aura, false) or nil
+    end
+
+    function controller.Test()
+        local aura = read()
+        if not aura then return false, "No equipped aura data" end
+        return enqueue(aura, true)
+    end
+
+    function controller.Mount(page)
+        UI:AddDivider(page, "Aura Equipment")
+        Controls.AuraEnabled = UI:AddToggle(page, "Aura Equip Alerts", Config.AuraEnabled, controller.SetEnabled)
+        Controls.AuraMinimum = UI:AddInputNumber(page, "Minimum Rarity (1 in N)", {
+            Min = 1, Max = 1000000000000, Default = Config.AuraMinimum, Placeholder = "1000000",
+        }, controller.SetMinimum)
+        Controls.AuraWebhook = UI:AddInput(page, "Aura Webhook URL", "Optional - uses Discord Webhook URL when empty", controller.SetWebhook)
+        Controls.AuraWebhook:Set(Config.AuraWebhook)
+        UI:AddToggle(page, "Aura @everyone", Config.AuraPing, function(value) Config.AuraPing = value == true saveConfig() end)
+        metrics = UI:AddMetricRow(page, {
+            { Label = "Equipped Aura", Value = "None", Unit = "" },
+            { Label = "Rarity", Value = "-", Unit = "" },
+        })
+        UI:AddButtonRow(page, {
+            { Text = "Test Aura Webhook", Style = "ghost", Width = 170, Callback = debounced(controller.Test, 2) },
+        })
+        updateMetrics()
+    end
+
+    function controller.Destroy()
+        active = false
+        generation += 1
+        revision += 1
+        table.clear(queue)
+        for _, connection in ipairs(connections) do connection:Disconnect() end
+        table.clear(connections)
+        if ENV.__BONES_HUB_AURA_RUNTIME == controller then ENV.__BONES_HUB_AURA_RUNTIME = nil end
+    end
+
+    current = read()
+    lastSignature = signature(current)
+    for _, field in ipairs({ "AuraName", "EquippedAuraRarity" }) do
+        table.insert(connections, LocalPlayer:GetAttributeChangedSignal(field):Connect(schedule))
+    end
+    ENV.__BONES_HUB_AURA_RUNTIME = controller
+    return controller
+end)()
+
+local Appearance = (function()
+    local appearance = {}
+    local colors = {
+        Canvas = Color3.fromRGB(14, 19, 27), Panel = Color3.fromRGB(20, 28, 39),
+        Raised = Color3.fromRGB(28, 39, 53), Border = Color3.fromRGB(48, 64, 82),
+        Text = Color3.fromRGB(233, 240, 247), Muted = Color3.fromRGB(153, 173, 193),
+        Accent = Color3.fromRGB(130, 220, 203),
+    }
+
+    local function gray(color)
+        return math.abs(color.R - color.G) < 0.035 and math.abs(color.G - color.B) < 0.035
+    end
+
+    function appearance.Style(object)
+        if object:IsA("GuiObject") then
+            local color = object.BackgroundColor3
+            if object.BackgroundTransparency < 1 and gray(color) then
+                if color.R < 0.055 then object.BackgroundColor3 = colors.Canvas
+                elseif color.R < 0.11 then object.BackgroundColor3 = colors.Panel
+                elseif color.R < 0.17 then object.BackgroundColor3 = colors.Raised
+                elseif color.R < 0.3 then object.BackgroundColor3 = colors.Border end
+            end
+            if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+                if gray(object.TextColor3) then
+                    if object.TextColor3.R >= 0.75 then object.TextColor3 = colors.Text
+                    elseif object.TextColor3.R >= 0.3 then object.TextColor3 = colors.Muted end
+                end
+                if object:IsA("TextBox") then object.ClearTextOnFocus = false end
+                if object:IsA("TextLabel") and object.Text == "bones hub" then
+                    object.TextColor3 = colors.Accent
+                end
+            elseif object:IsA("ScrollingFrame") then
+                object.ScrollBarImageColor3 = colors.Accent
+                object.ScrollBarThickness = 3
+            end
+        elseif object:IsA("UIStroke") and gray(object.Color) then
+            object.Color = colors.Border
+            object.Transparency = math.max(object.Transparency, 0.25)
+        end
+    end
+
+    function appearance.Finish(gui)
+        if not gui then return end
+        for _, object in ipairs(gui:GetDescendants()) do appearance.Style(object) end
+    end
+    return appearance
+end)()
 
 local MovementCoordinator = (function()
     local controller = {}
@@ -2539,11 +2846,29 @@ local source = game:HttpGet(UI_URL, true)
 source = source:gsub("Sla" .. "oqUILib", "bones hub")
 source = source:gsub(LEGACY_UI_ROOT_NAME, UI_ROOT_NAME)
 source = source:gsub("rbxassetid://102126" .. "718358520", "")
-local library = loadstring(source)()
+local library = ENV.__BONES_HUB_UI_LIBRARY
+if type(library) ~= "table" or type(library.new) ~= "function" then
+    for attempt = 1, 2 do
+        local ok, value = pcall(function() return loadstring(source)() end)
+        if ok and type(value) == "table" and type(value.new) == "function" then
+            library = value
+            break
+        end
+        if attempt < 2 then task.wait(0.25) end
+    end
+end
+if type(library) ~= "table" or type(library.new) ~= "function" then
+    AuraNotifications.Destroy()
+    Potion.Destroy()
+    FishingAutomation.Destroy()
+    error("[bones hub] UI library unavailable; retry loading the script")
+end
+ENV.__BONES_HUB_UI_LIBRARY = library
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.8", LogoImage = "",
-    GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 200,
-    WindowWidth = 900, WindowHeight = 560, SplashMode = "boot", BootSteps = 7,
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.9", LogoImage = "",
+    GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
+    WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
+    TweenSpeed = 0.14, BarTweenSpeed = 0.16, MiniModeBreakpoint = 640,
     Pages = { { Name = "main" }, { Name = "Webhook" }, { Name = "Status" }, { Name = "Biome Counts" }, { Name = "Pings" }, { Name = "Settings" } },
     SplashTasks = {
         "Creating interface shell", "Building macro controls", "Registering status panels",
@@ -2561,6 +2886,7 @@ local function sanitizeBrandObject(object)
     elseif object:IsA("ImageLabel") or object:IsA("ImageButton") then
         if object.Image == "rbxassetid://102126" .. "718358520" then object.Image = "" end
     end
+    Appearance.Style(object)
 end
 
 pcall(function()
@@ -2575,7 +2901,7 @@ end)
 
 UI:SetSidebarUserStatus(false)
 UI:SetBootStep("Building macro controls", 0.18, "main page")
-UI:AddSectionHeader(2, "Biome Macro", "Automatic biome and merchant detection for Sol's RNG")
+UI:AddSectionHeader(2, "Notifications", "Weather, merchant stock and aura equipment")
 UI:AddDivider(2, "Control")
 Controls.MainBadge = UI:AddStatusBadge2(2, "Macro State", "offline")
 Controls.StartStop = UI:AddButtonRow(2, {
@@ -2598,6 +2924,7 @@ Controls.Webhook:Set(Config.Webhook)
 UI:AddButtonRow(2, {
     { Text = "Test Webhook", Style = "primary", Width = 150, Callback = debounced(sendWebhookTest, 2) },
 })
+AuraNotifications.Mount(2)
 UI:AddDivider(2, "Session")
 Controls.AntiAfk = UI:AddToggle(2, "Anti-AFK", Config.AntiAfk, function(value)
     Config.AntiAfk = value == true saveConfig() applyAntiAfk()
@@ -2667,7 +2994,7 @@ UI:AddSectionHeader(5, "Pings", "Discord notification and mention policy")
 UI:AddAlert(5, "Rare weather", "DREAMSPACE, GLITCHED and CYBERSPACE send @everyone and allow only the everyone mention.", "warning")
 UI:AddAlert(5, "Normal events", "Every normal weather and merchant event is sent, but allowed_mentions.parse is empty so nobody is pinged.", "info")
 UI:AddDivider(5, "Delivery")
-UI:AddAlert(5, "Private delivery", "All cards are posted only to the Discord webhook entered on the Main page. The private-server link must be a Roblox URL.", "info")
+UI:AddAlert(5, "Private delivery", "Weather and merchants use Discord Webhook URL. Aura alerts may use their own URL. Aura cards never include your private-server link.", "info")
 
 UI:SetBootStep("Mounting settings", 0.84, "settings page")
 UI:AddSectionHeader(6, "Settings", "Detection timing and notification tests")
@@ -2685,7 +3012,7 @@ UI:AddButtonRow(6, {
     { Text = "Test Rare", Style = "primary", Width = 130, Callback = debounced(function() sendBiome("GLITCHED") end, 2) },
     { Text = "Test Merchant", Style = "ghost", Width = 140, Callback = debounced(function() sendMerchant("Mari") end, 2) },
 })
-UI:AddAlert(6, "Outbound safety", "Webhook POST requests only use the exact Discord URL entered on the Main page. No private-server or weather data is sent anywhere else.", "warning")
+UI:AddAlert(6, "Private delivery", "Notifications only use your configured Discord webhook URLs. Aura alerts listen for equipment changes and do not send your current aura on load.", "info")
 
 Potion.Mount(1)
 FishingAutomation.Mount(1)
@@ -2696,6 +3023,12 @@ function API.Stop() stopMacro() end
 function API.TestBiome(biome) return sendBiome(normalizeBiome(biome) or "WINDY") end
 function API.TestMerchant(merchant) return sendMerchant(tostring(merchant or "Mari")) end
 function API.ProbeBiome() return currentBiome() end
+function API.SetAuraEnabled(value) return AuraNotifications.SetEnabled(value) end
+function API.SetAuraMinimum(value) return AuraNotifications.SetMinimum(value) end
+function API.SetAuraWebhook(value) return AuraNotifications.SetWebhook(value) end
+function API.GetAuraState() return AuraNotifications.GetState() end
+function API.PreviewAura() return AuraNotifications.Preview() end
+function API.TestAuraWebhook() return AuraNotifications.Test() end
 function API.SetPotionEnabled(value) return Potion.SetEnabled(value) end
 function API.GetPotionState() return Potion.GetState() end
 function API.SelectPotion(value) return Potion.SelectRecipe(value) end
@@ -2739,6 +3072,7 @@ function API.GetState()
 end
 function API.Destroy()
     if not Alive then return end
+    AuraNotifications.Destroy()
     FishingAutomation.Destroy()
     Potion.Destroy()
     Alive = false
@@ -2769,6 +3103,7 @@ pcall(function()
     local gui = coreGui:FindFirstChild(UI_ROOT_NAME) or coreGui:FindFirstChild(LEGACY_UI_ROOT_NAME)
     if gui then
         gui.Name = UI_ROOT_NAME
+        Appearance.Finish(gui)
         for _, descendant in ipairs(gui:GetDescendants()) do
             if descendant:IsA("ScrollingFrame") then descendant.CanvasPosition = Vector2.zero end
         end
