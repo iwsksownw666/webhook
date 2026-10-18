@@ -61,6 +61,7 @@ local BIOME_COLORS = {
 
 local DEFAULT_CONFIG = {
     AutoWeatherControllers = false,
+    AutoEden = false,
     Webhook = "", PSLink = "", AntiAfk = true, BiomeScanInterval = 0.5, UIMode = "Glass", InterfaceMotion = true, InterfaceStyleVersion = 0,
     AuraEnabled = false, AuraMinimum = 1000000, AuraWebhook = "", AuraPing = false,
     PingBiomes = {
@@ -1948,6 +1949,633 @@ if not ok and active() then bridge:SetAttribute("Error", tostring(err)) end
     end)
     return controller
 end)()
+
+local EdenAutomation = (function()
+local SETTINGS = {
+    Enabled = Config.AutoEden == true,
+    ScanInterval = 1,
+    ArrivalDistance = 5,
+    GridSpacing = 3,
+    RouteMargin = 80,
+    MaxDrop = 10,
+    RouteTimeout = 18,
+    RetryDelay = 5,
+    StairSupports = true,
+    SupportWidth = 10,
+    SupportTransparency = 0.45,
+}
+
+local ENV = getgenv()
+if ENV.AutoEden and ENV.AutoEden.Destroy then ENV.AutoEden.Destroy() end
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+local running, enabled, epoch = true, SETTINGS.Enabled, 0
+local target, status, failure, distance = nil, "Starting", nil, nil
+local movingHumanoid
+local planBusy = false
+local API = {}
+local supportFolder, supportZone
+local supportCount, supportError = 0, nil
+local supportBridges = {}
+local supportSections = {}
+
+local function character()
+    local model = player.Character
+    local humanoid = model and model:FindFirstChildOfClass("Humanoid")
+    local root = model and model:FindFirstChild("HumanoidRootPart")
+    if humanoid and humanoid.Health > 0 and root then return model, humanoid, root end
+end
+
+local function zone()
+    local map = workspace:FindFirstChild("Map")
+    local zones = map and map:FindFirstChild("Zones")
+    return zones and zones:FindFirstChild("Limbo")
+end
+
+local function clearSupports()
+    if supportFolder then supportFolder:Destroy() end
+    supportFolder, supportZone = nil, nil
+    supportCount, supportError = 0, nil
+    table.clear(supportBridges)
+    table.clear(supportSections)
+end
+
+local function buildSupport(bridge, folder, landingParams)
+    local parts, center = {}, Vector3.zero
+    for _, part in ipairs(bridge:GetDescendants()) do
+        if part:IsA("BasePart") and part.CanCollide then
+            table.insert(parts, part)
+            center += part.Position
+        end
+    end
+    if #parts < 2 then return nil, "Stair geometry unavailable" end
+    center /= #parts
+    local xx, xz, zz = 0, 0, 0
+    for _, part in ipairs(parts) do
+        local d = part.Position - center
+        xx += d.X * d.X
+        xz += d.X * d.Z
+        zz += d.Z * d.Z
+    end
+    local angle = math.atan2(2 * xz, xx - zz) / 2
+    local direction = Vector3.new(math.cos(angle), 0, math.sin(angle))
+    local lateral = Vector3.new(-direction.Z, 0, direction.X)
+    local lo, hi, halfWidth = math.huge, -math.huge, SETTINGS.SupportWidth / 2
+    local corners = {}
+    for _, part in ipairs(parts) do
+        for _, x in ipairs({ -0.5, 0.5 }) do
+            for _, z in ipairs({ -0.5, 0.5 }) do
+                local at = part.CFrame:PointToWorldSpace(Vector3.new(part.Size.X * x, part.Size.Y / 2, part.Size.Z * z))
+                local d = (at - center):Dot(direction)
+                table.insert(corners, { D = d, Y = at.Y })
+                lo, hi = math.min(lo, d), math.max(hi, d)
+                halfWidth = math.max(halfWidth, math.abs((at - center):Dot(lateral)) + 1)
+            end
+        end
+    end
+    if hi - lo < 3 or hi - lo > 150 or halfWidth > 12 then return nil, "Unsupported stair bounds" end
+    local lowY, highY = -math.huge, -math.huge
+    for _, point in ipairs(corners) do
+        if point.D <= lo + 4 then lowY = math.max(lowY, point.Y) end
+        if point.D >= hi - 4 then highY = math.max(highY, point.Y) end
+    end
+    local lift = 0.12
+    for _, point in ipairs(corners) do
+        local y = lowY + (highY - lowY) * (point.D - lo) / (hi - lo)
+        lift = math.max(lift, point.Y - y + 0.12)
+    end
+    local function at(d, y)
+        local p = center + direction * d
+        return Vector3.new(p.X, y, p.Z)
+    end
+    local a, b = at(lo, lowY + lift), at(hi, highY + lift)
+    local function landing(edge, sign)
+        for reach = 4, 26, 1 do
+            local candidate = edge + direction * (sign * reach)
+            local hits, minimum, maximum = {}, math.huge, -math.huge
+            for _, side in ipairs({ -3, 0, 3 }) do
+                local origin = candidate + lateral * side + Vector3.new(0, 15, 0)
+                local hit = workspace:Raycast(origin, Vector3.new(0, -30, 0), landingParams)
+                if not hit or hit.Normal.Y < 0.85 then break end
+                table.insert(hits, hit.Position)
+                minimum, maximum = math.min(minimum, hit.Position.Y), math.max(maximum, hit.Position.Y)
+            end
+            if #hits == 3 and maximum - minimum < 0.4 then
+                local point = Vector3.new(candidate.X, maximum + 0.06, candidate.Z)
+                local slope = math.abs(point.Y - edge.Y) / reach
+                if slope <= math.tan(math.rad(32)) then return point end
+            end
+        end
+    end
+    local entry, exit = landing(a, -1), landing(b, 1)
+    if not entry or not exit then return nil, "Supported stair landings unavailable" end
+    local model = Instance.new("Model")
+    model.Name = "StairSection"
+    local function strip(name, first, last)
+        local span = last - first
+        local flat = Vector3.new(span.X, 0, span.Z).Magnitude
+        if math.abs(span.Y) / flat > math.tan(math.rad(32)) then return false end
+        local facing = CFrame.lookAt((first + last) / 2, last)
+        local part = Instance.new("Part")
+        part.Name = name
+        part.Anchored = true
+        part.CanCollide = true
+        part.CanTouch = false
+        part.CanQuery = true
+        part.Size = Vector3.new(halfWidth * 2, 0.35, span.Magnitude + 0.2)
+        part.CFrame = facing - facing.UpVector * (part.Size.Y / 2)
+        part.Material = Enum.Material.SmoothPlastic
+        part.Color = Color3.fromRGB(80, 190, 210)
+        part.Transparency = SETTINGS.SupportTransparency
+        part.TopSurface = Enum.SurfaceType.Smooth
+        part.BottomSurface = Enum.SurfaceType.Smooth
+        part.CastShadow = false
+        part.CustomPhysicalProperties = PhysicalProperties.new(1, 0.7, 0, 100, 100)
+        part.Parent = model
+        return true
+    end
+    if not strip("Entry", entry, a) or not strip("Ramp", a, b) or not strip("Exit", b, exit) then
+        model:Destroy()
+        return nil, "Stair incline exceeds limit"
+    end
+    model.Parent = folder
+    return { Model = model, Entry = entry, Start = a, Finish = b, Exit = exit }
+end
+
+local function ensureSupports()
+    if not running or not enabled or not SETTINGS.StairSupports then clearSupports() return end
+    local current = zone()
+    if not current then clearSupports() return end
+    if current ~= supportZone or not supportFolder or supportFolder.Parent ~= current then
+        clearSupports()
+        local old = current:FindFirstChild("__AutoEdenSupports")
+        if old and old:GetAttribute("AutoEdenOwned") then old:Destroy() end
+        supportFolder = Instance.new("Folder")
+        supportFolder.Name = "__AutoEdenSupports"
+        supportFolder:SetAttribute("AutoEdenOwned", true)
+        supportFolder.Parent, supportZone = current, current
+    end
+    local grounds = {}
+    for _, model in ipairs(current:GetChildren()) do
+        if model.Name == "ground" then table.insert(grounds, model) end
+    end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Include
+    params.FilterDescendantsInstances = grounds
+    params.RespectCanCollide = true
+    supportError = nil
+    for bridge, section in pairs(supportBridges) do
+        if bridge.Parent ~= current or not section.Model.Parent or #section.Model:GetChildren() ~= 3 then
+            section.Model:Destroy()
+            supportBridges[bridge] = nil
+        end
+    end
+    for _, bridge in ipairs(current:GetChildren()) do
+        if bridge:IsA("Model") and bridge.Name == "bridge" and not supportBridges[bridge] then
+            local section, err = buildSupport(bridge, supportFolder, params)
+            if section then supportBridges[bridge] = section else supportError = err end
+        end
+    end
+    table.clear(supportSections)
+    supportCount = 0
+    for _, section in pairs(supportBridges) do
+        table.insert(supportSections, section)
+        supportCount += #section.Model:GetChildren()
+    end
+end
+
+local function setStatus(value, err)
+    failure = err
+    if value ~= status then
+        status = value
+        print("[Auto Eden]", value, err or "")
+    end
+end
+
+local function stopMovement()
+    local _, humanoid, root = character()
+    if humanoid and root and movingHumanoid == humanoid then
+        humanoid:MoveTo(root.Position)
+        humanoid.Jump = false
+    end
+    movingHumanoid = nil
+end
+
+local function positionOf(object)
+    if not object or not object:IsDescendantOf(workspace) then return nil end
+    if object:IsA("ProximityPrompt") then
+        local parent = object.Parent
+        if parent:IsA("Attachment") then return parent.WorldPosition end
+        if parent:IsA("BasePart") then return parent.Position end
+        if parent:IsA("Model") then return parent:GetPivot().Position end
+    elseif object:IsA("BasePart") then
+        return object.Position
+    elseif object:IsA("Model") then
+        local root = object:FindFirstChild("HumanoidRootPart") or object.PrimaryPart
+        return root and root.Position or object:GetPivot().Position
+    end
+end
+
+local function inLimbo(at)
+    local model = zone()
+    if not model or not at then return false end
+    local origin = model:GetPivot().Position
+    return math.abs(at.X - origin.X) < 700 and math.abs(at.Z - origin.Z) < 700
+        and at.Y > origin.Y - 65 and at.Y < origin.Y + 250
+end
+
+local function findTarget()
+    local _, _, root = character()
+    if not root then return end
+    local selected, best = nil, math.huge
+    for _, object in ipairs(workspace:GetDescendants()) do
+        local name = object.Name:lower()
+        local matches = object:IsA("ProximityPrompt") and object.ObjectText:lower() == "eden"
+            or object:IsA("Model") and name == "edenspeaker"
+        local ancestor = object
+        local aura = false
+        if matches then
+            while ancestor and ancestor ~= workspace do
+                if ancestor.Name:match("Aura$") or Players:GetPlayerFromCharacter(ancestor) then aura = true break end
+                ancestor = ancestor.Parent
+            end
+        end
+        if matches and not aura then
+            local at = positionOf(object)
+            if inLimbo(at) then
+                local d = (at - root.Position).Magnitude
+                if d < best then selected, best = object, d end
+            end
+        end
+    end
+    return selected
+end
+
+local function hubBusy()
+    local hub = ENV.__BONES_HUB_MACRO
+    if type(hub) ~= "table" then return false end
+    for _, name in ipairs({ "GetPotionState", "GetFishingState" }) do
+        if type(hub[name]) == "function" then
+            local ok, data = pcall(hub[name])
+            if ok and type(data) == "table" and data.MovementOwner then return true end
+        end
+    end
+    return false
+end
+
+local function parameters()
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Include
+    params.FilterDescendantsInstances = { zone() }
+    params.RespectCanCollide = true
+    params.IgnoreWater = true
+    return params
+end
+
+local function heapPush(heap, entry)
+    local i = #heap + 1
+    while i > 1 do
+        local parent = math.floor(i / 2)
+        if heap[parent].Score <= entry.Score then break end
+        heap[i] = heap[parent]
+        i = parent
+    end
+    heap[i] = entry
+end
+
+local function heapPop(heap)
+    local first = heap[1]
+    local last = table.remove(heap)
+    if #heap > 0 then
+        local i = 1
+        while i * 2 <= #heap do
+            local child = i * 2
+            if child < #heap and heap[child + 1].Score < heap[child].Score then child += 1 end
+            if heap[child].Score >= last.Score then break end
+            heap[i] = heap[child]
+            i = child
+        end
+        heap[i] = last
+    end
+    return first
+end
+
+local function planRoute(start, goal, cancelled)
+    if planBusy then return nil, "Planner busy" end
+    local _, humanoid = character()
+    if not humanoid or not zone() then return nil, "Limbo unavailable" end
+    planBusy = true
+    local function solve()
+        ensureSupports()
+        local began = os.clock()
+        local function valid()
+            return running and os.clock() - began < SETTINGS.RouteTimeout and not (cancelled and cancelled())
+        end
+        local params = parameters()
+        local gravity = workspace.Gravity
+        if gravity <= 0 then return nil, "Invalid gravity" end
+        local impulse = humanoid.UseJumpPower and humanoid.JumpPower or math.sqrt(2 * gravity * humanoid.JumpHeight)
+        local jumpHeight = impulse * impulse / (2 * gravity)
+        local speed = humanoid.WalkSpeed
+        if speed <= 0 or jumpHeight <= 0 then return nil, "Movement unavailable" end
+        local maximumJump = math.min(18, speed * (impulse + math.sqrt(impulse * impulse + 2 * gravity * SETTINGS.MaxDrop)) / gravity * 0.82)
+        local nodes, buckets, seen = {}, {}, {}
+        local step = SETTINGS.GridSpacing
+        local function bucketKey(x, z) return math.floor(x / maximumJump) .. ":" .. math.floor(z / maximumJump) end
+        local function clear(at)
+            return workspace:Raycast(at + Vector3.new(0, 0.3, 0), Vector3.new(0, 4.7, 0), params) == nil
+        end
+        local function add(at)
+            local key = math.round(at.X * 2) .. ":" .. math.round(at.Y * 2) .. ":" .. math.round(at.Z * 2)
+            if seen[key] or not clear(at) then return end
+            local index = #nodes + 1
+            seen[key] = true
+            nodes[index] = { Position = at, Id = index }
+            local bkey = bucketKey(at.X, at.Z)
+            buckets[bkey] = buckets[bkey] or {}
+            table.insert(buckets[bkey], index)
+        end
+        local minY = math.min(start.Y, goal.Y) - 25
+        local top = math.max(start.Y, goal.Y) + math.max(20, jumpHeight * 2)
+        top = math.min(top, 100)
+        local function column(x, z)
+            local y = top
+            for _ = 1, 7 do
+                local hit = workspace:Raycast(Vector3.new(x, y, z), Vector3.new(0, minY - y, 0), params)
+                if not hit then break end
+                if hit.Normal.Y >= 0.7 then add(hit.Position) end
+                y = hit.Position.Y - 0.3
+                if y <= minY then break end
+            end
+        end
+        column(start.X, start.Z)
+        column(goal.X, goal.Z)
+        local margin = SETTINGS.RouteMargin
+        local minX, maxX = math.min(start.X, goal.X) - margin, math.max(start.X, goal.X) + margin
+        local minZ, maxZ = math.min(start.Z, goal.Z) - margin, math.max(start.Z, goal.Z) + margin
+        if maxX - minX > 800 or maxZ - minZ > 800 then return nil, "Target outside route bounds" end
+        local sampled = 0
+        for x = math.floor(minX / step) * step, maxX, step do
+            for z = math.floor(minZ / step) * step, maxZ, step do
+                column(x, z)
+                sampled += 1
+                if sampled % 100 == 0 then
+                    task.wait()
+                    if not valid() then return nil, "Planning cancelled or timed out" end
+                end
+            end
+        end
+        for _, part in ipairs(zone():GetDescendants()) do
+            if part:IsA("BasePart") and part.CanCollide and part.Size.X < 100 and part.Size.Z < 100 then
+                local at = part.Position
+                if at.X >= minX and at.X <= maxX and at.Z >= minZ and at.Z <= maxZ then column(at.X, at.Z) end
+            end
+        end
+        local startNode, goalNode, startError, goalError = nil, nil, math.huge, math.huge
+        for i, node in ipairs(nodes) do
+            local at = node.Position
+            local a, b = (at - start).Magnitude, (at - goal).Magnitude
+            if math.abs(at.Y - (start.Y - 3)) < 4 and a < startError then startNode, startError = i, a end
+            if math.abs(at.Y - (goal.Y - 3)) < 6 and b < goalError then goalNode, goalError = i, b end
+        end
+        if not startNode or startError > 7 then return nil, "No supported start" end
+        if not goalNode or goalError > 9 then return nil, "No supported destination" end
+        local function edge(a, b)
+            local delta = b - a
+            local flat = Vector3.new(delta.X, 0, delta.Z).Magnitude
+            if flat < 0.3 or flat > maximumJump or delta.Y > jumpHeight - 0.7 or delta.Y < -SETTINGS.MaxDrop then return end
+            if flat <= step * 1.6 and math.abs(delta.Y) <= flat * math.tan(math.rad(math.min(32, humanoid.MaxSlopeAngle))) then
+                local supported = true
+                local side = Vector3.new(-delta.Z, 0, delta.X).Unit * 0.8
+                for sample = 1, 3 do
+                    for _, offset in ipairs({ Vector3.zero, side, -side }) do
+                        local at = a:Lerp(b, sample / 4) + offset
+                        local hit = workspace:Raycast(at + Vector3.new(0, 1.5, 0), Vector3.new(0, -3, 0), params)
+                        if not hit or hit.Normal.Y < 0.8 or math.abs(hit.Position.Y - at.Y) > 0.65 then supported = false break end
+                    end
+                    if not supported then break end
+                end
+                if supported and not workspace:Raycast(a + Vector3.new(0, 2, 0), delta, params) then return "Walk", flat end
+            end
+            local discriminant = impulse * impulse - 2 * gravity * delta.Y
+            if discriminant < 0 then return end
+            local flight = (impulse + math.sqrt(discriminant)) / gravity
+            if flat > speed * flight * 0.82 then return end
+            local lateral = Vector3.new(-delta.Z, 0, delta.X).Unit * 0.7
+            for _, offset in ipairs({ Vector3.zero, lateral, -lateral }) do
+                local previous = a + offset + Vector3.new(0, 2.5, 0)
+                for sample = 1, 10 do
+                    local t = sample / 10
+                    local at = a + Vector3.new(delta.X * t, impulse * flight * t - 0.5 * gravity * (flight * t) ^ 2 + 2.5, delta.Z * t) + offset
+                    if workspace:Raycast(previous, at - previous, params) then return end
+                    previous = at
+                end
+            end
+            return "Jump", flat + math.max(0, delta.Y) + 3
+        end
+        local heap, costs, previous, actions, closed = {}, { [startNode] = 0 }, {}, {}, {}
+        heapPush(heap, { Id = startNode, Score = 0 })
+        local expanded = 0
+        while #heap > 0 do
+            local current = heapPop(heap).Id
+            if not closed[current] then
+                if current == goalNode then
+                    local route = {}
+                    repeat
+                        table.insert(route, 1, { Position = nodes[current].Position, Action = actions[current] or "Walk" })
+                        current = previous[current]
+                    until not current
+                    return route, { Method = "Platform graph", Nodes = #nodes, Expanded = expanded, Seconds = os.clock() - began }
+                end
+                closed[current] = true
+                local a = nodes[current].Position
+                local bx, bz = math.floor(a.X / maximumJump), math.floor(a.Z / maximumJump)
+                for dx = -1, 1 do for dz = -1, 1 do
+                    for _, neighbor in ipairs(buckets[(bx + dx) .. ":" .. (bz + dz)] or {}) do
+                        if not closed[neighbor] then
+                            local action, cost = edge(a, nodes[neighbor].Position)
+                            local candidate = cost and costs[current] + cost
+                            if candidate and (not costs[neighbor] or candidate < costs[neighbor]) then
+                                costs[neighbor], previous[neighbor], actions[neighbor] = candidate, current, action
+                                heapPush(heap, { Id = neighbor, Score = candidate + (nodes[neighbor].Position - nodes[goalNode].Position).Magnitude })
+                            end
+                        end
+                    end
+                end end
+                expanded += 1
+                if expanded % 30 == 0 then task.wait() if not valid() then return nil, "Planning cancelled or timed out" end end
+            end
+        end
+        return nil, "No verified platform route"
+    end
+    local ok, route, details = pcall(solve)
+    planBusy = false
+    if not ok then return nil, tostring(route) end
+    return route, details
+end
+
+local function walk(route, selected, token)
+    local model, humanoid, root = character()
+    if not root then return false, "Character unavailable" end
+    local function valid()
+        return running and enabled and epoch == token and player.Character == model and humanoid.Health > 0
+            and positionOf(selected) ~= nil and inLimbo(root.Position) and not hubBusy()
+    end
+    movingHumanoid = humanoid
+    for _, point in ipairs(route) do
+        if not valid() then stopMovement() return false, "Route interrupted" end
+        local at = point.Position
+        local flat = Vector3.new(at.X - root.Position.X, 0, at.Z - root.Position.Z).Magnitude
+        local deadline = os.clock() + math.max(1.5, flat / math.max(1, humanoid.WalkSpeed) * 3 + 1)
+        if point.Action == "Jump" then
+            local groundedUntil = os.clock() + 1
+            while valid() and humanoid.FloorMaterial == Enum.Material.Air and os.clock() < groundedUntil do task.wait(0.03) end
+            if humanoid.FloorMaterial == Enum.Material.Air then stopMovement() return false, "No supported takeoff" end
+            humanoid:MoveTo(at + Vector3.new(0, 3, 0))
+            humanoid.Jump = true
+        else
+            humanoid:MoveTo(at + Vector3.new(0, 3, 0))
+        end
+        local reached = false
+        while valid() and os.clock() < deadline do
+            local delta = root.Position - at
+            if Vector3.new(delta.X, 0, delta.Z).Magnitude <= 1.25 and math.abs(delta.Y - 3) <= 3
+                and humanoid.FloorMaterial ~= Enum.Material.Air then reached = true break end
+            if root.Position.Y < at.Y - 12 then break end
+            task.wait(0.03)
+        end
+        if not reached then stopMovement() return false, "Waypoint not reached" end
+        local destination = positionOf(selected)
+        distance = destination and (root.Position - destination).Magnitude
+        if distance and distance <= SETTINGS.ArrivalDistance then stopMovement() return true end
+    end
+    stopMovement()
+    local destination = positionOf(selected)
+    return destination ~= nil and (root.Position - destination).Magnitude <= SETTINGS.ArrivalDistance, "Destination moved"
+end
+
+function API.SetEnabled(value)
+    enabled = value == true
+    epoch += 1
+    stopMovement()
+    if enabled then
+        local ok, err = pcall(ensureSupports)
+        if not ok then supportError = tostring(err) end
+    else
+        target, distance = nil, nil
+        clearSupports()
+    end
+    setStatus(enabled and "Waiting for Eden" or "Disabled")
+    return enabled
+end
+
+function API.GetState()
+    return { Enabled = enabled, Status = status, Error = failure, Target = target and target:GetFullName(), Distance = distance, Planning = planBusy, Supports = supportCount, SupportError = supportError }
+end
+
+function API.GetSupports()
+    local result = {}
+    for _, section in ipairs(supportSections) do
+        table.insert(result, { Entry = section.Entry, Start = section.Start, Finish = section.Finish, Exit = section.Exit })
+    end
+    return result
+end
+
+function API.PlanRoute(start, goal)
+    assert(typeof(start) == "Vector3" and typeof(goal) == "Vector3", "Vector3 endpoints required")
+    return planRoute(start, goal)
+end
+
+function API.Destroy()
+    running, enabled = false, false
+    epoch += 1
+    stopMovement()
+    clearSupports()
+    if ENV.AutoEden == API then ENV.AutoEden = nil end
+end
+
+ENV.AutoEden = API
+task.spawn(function()
+    local lastAttempt, completed = -math.huge, nil
+    while running do
+        local ok, err = pcall(function()
+            ensureSupports()
+            if not enabled then return end
+            local _, _, root = character()
+            if not root then setStatus("Waiting for character") return end
+            if not inLimbo(root.Position) then target, distance = nil, nil setStatus("Waiting for Limbo") return end
+            target = findTarget()
+            if not target then distance, completed = nil, nil setStatus("Waiting for Eden") return end
+            local destination = positionOf(target)
+            distance = (root.Position - destination).Magnitude
+            if distance <= SETTINGS.ArrivalDistance then completed = target setStatus("Arrived at Eden") return end
+            if completed == target then setStatus("Arrived at Eden") return end
+            if hubBusy() then setStatus("Waiting for movement") return end
+            if os.clock() - lastAttempt < SETTINGS.RetryDelay then return end
+            lastAttempt = os.clock()
+            local selected, token = target, epoch
+            setStatus("Planning route")
+            local route, details = planRoute(root.Position, destination, function()
+                return not enabled or epoch ~= token or positionOf(selected) == nil or not inLimbo(root.Position) or hubBusy()
+            end)
+            if not route then setStatus("Route unavailable", details) return end
+            if not enabled or epoch ~= token then return end
+            setStatus("Walking to Eden")
+            local arrived, reason = walk(route, selected, token)
+            if arrived then completed = selected setStatus("Arrived at Eden") else setStatus("Replanning", reason) end
+        end)
+        if not ok then stopMovement() setStatus("Navigation error", tostring(err)) end
+        task.wait(SETTINGS.ScanInterval)
+    end
+end)
+
+return API
+
+end)()
+
+do
+    local baseSetEnabled = EdenAutomation.SetEnabled
+    local toggle, rows, syncing
+    local function refresh()
+        if not rows then return end
+        local state = EdenAutomation.GetState()
+        if rows[1].ValueLabel and rows[1].ValueLabel.Parent then
+            rows[1].ValueLabel.Text = state.Status or "Disabled"
+        end
+        if rows[2].ValueLabel and rows[2].ValueLabel.Parent then
+            rows[2].ValueLabel.Text = state.SupportError or tostring(state.Supports or 0) .. " parts"
+        end
+    end
+    function EdenAutomation.SetEnabled(value)
+        local enabled = baseSetEnabled(value)
+        Config.AutoEden = enabled
+        if toggle and type(toggle.Set) == "function" then
+            syncing = true
+            pcall(toggle.Set, toggle, enabled)
+            syncing = false
+        end
+        saveConfig()
+        refresh()
+        return enabled
+    end
+    function EdenAutomation.Mount(page)
+        UI:AddDivider(page, "Eden")
+        toggle = UI:AddToggle(page, "Auto Eden", EdenAutomation.GetState().Enabled, function(value)
+            if not syncing then EdenAutomation.SetEnabled(value) end
+        end)
+        rows = UI:AddMetricRow(page, {
+            { Label = "Status", Value = "Starting", Unit = "Eden navigation" },
+            { Label = "Stair Supports", Value = "0 parts", Unit = "Created while enabled" },
+        })
+        refresh()
+    end
+    task.spawn(function()
+        while Alive do
+            refresh()
+            task.wait(0.5)
+        end
+    end)
+end
 
 local FishingAutomation = (function()
     local controller = {}
@@ -4055,6 +4683,7 @@ UI:AddAlert(6, "Private delivery", "Notifications only use your configured Disco
 
 Potion.Mount(1)
 WeatherControllers.Mount(1)
+EdenAutomation.Mount(1)
 FishingAutomation.Mount(1)
 UI:SetBootStep("Ready.", 1, "ready")
 UI:FinishBootSplash()
@@ -4073,6 +4702,7 @@ local mountedInterface, interfaceFailure = mountInterface()
 if not mountedInterface then
     AuraNotifications.Destroy()
     WeatherControllers.Destroy()
+    EdenAutomation.Destroy()
     FishingAutomation.Destroy()
     Potion.Destroy()
     Alive = false
@@ -4100,6 +4730,8 @@ function API.SelectPotion(value) return Potion.SelectRecipe(value) end
 function API.SelectPotions(values) return Potion.SelectRecipes(values) end
 function API.SetWeatherControllersEnabled(value) return WeatherControllers.SetEnabled(value) end
 function API.GetWeatherControllersState() return WeatherControllers.GetState() end
+function API.SetAutoEdenEnabled(value) return EdenAutomation.SetEnabled(value) end
+function API.GetAutoEdenState() return EdenAutomation.GetState() end
 function API.SetFishingEnabled(value) return FishingAutomation.SetEnabled(value) end
 function API.SelectFishingAreas(values) return FishingAutomation.SelectAreas(values) end
 function API.SelectFishingSpots(values) return FishingAutomation.SelectSpots(values) end
@@ -4142,6 +4774,7 @@ function API.Destroy()
     if not Alive then return end
     AuraNotifications.Destroy()
     WeatherControllers.Destroy()
+    EdenAutomation.Destroy()
     FishingAutomation.Destroy()
     Potion.Destroy()
     Alive = false
