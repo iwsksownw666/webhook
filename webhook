@@ -60,6 +60,7 @@ local BIOME_COLORS = {
 }
 
 local DEFAULT_CONFIG = {
+    AutoWeatherControllers = false,
     Webhook = "", PSLink = "", AntiAfk = true, BiomeScanInterval = 0.5, UIMode = "Glass", InterfaceMotion = true, InterfaceStyleVersion = 0,
     AuraEnabled = false, AuraMinimum = 1000000, AuraWebhook = "", AuraPing = false,
     PingBiomes = {
@@ -1748,6 +1749,206 @@ local Potion = (function()
     return controller
 end)()
 
+local WeatherControllers = (function()
+    local controller = {}
+    local living, enabled = true, Config.AutoWeatherControllers == true
+    local bridge, rows, toggle
+    local syncingToggle = false
+    local definitions = {
+        { Key = "StrangeController", Item = "Strange Controller", Cooldown = "StrangeControllerCoolDown" },
+        { Key = "BiomeRandomizer", Item = "Biome Randomizer", Cooldown = "BiomeRandomizerCoolDown" },
+    }
+
+    local function stopStandalone()
+        local gui = LocalPlayer:FindFirstChild("PlayerGui")
+        local old = gui and gui:FindFirstChild("AutoWeatherControllerStatus")
+        if old then old:SetAttribute("Enabled", false) end
+    end
+
+    function controller.GetState()
+        local result = { Enabled = enabled, Controllers = {} }
+        local updated = bridge and bridge:GetAttribute("UpdatedAt")
+        result.DataReady = bridge ~= nil and bridge.Parent ~= nil and type(updated) == "number"
+            and workspace:GetServerTimeNow() - updated < 3
+        result.Error = bridge and bridge:GetAttribute("Error")
+        for _, item in ipairs(definitions) do
+            local remaining = bridge and bridge:GetAttribute(item.Key .. "Remaining")
+            result.Controllers[item.Key] = {
+                Owned = result.DataReady and bridge:GetAttribute(item.Key .. "Owned") or false,
+                Remaining = result.DataReady and type(remaining) == "number" and remaining >= 0 and remaining or nil,
+                Status = result.Error and "Unavailable" or result.DataReady and bridge:GetAttribute(item.Key .. "State") or "Waiting for data",
+                Sent = bridge and bridge:GetAttribute(item.Key .. "Sent") or 0,
+                Confirmed = bridge and bridge:GetAttribute(item.Key .. "Confirmed") or 0,
+            }
+        end
+        return result
+    end
+
+    local function refresh()
+        if not rows then return end
+        local current = controller.GetState()
+        for index, item in ipairs(definitions) do
+            local state = current.Controllers[item.Key]
+            local metrics = rows[index]
+            if metrics[1].ValueLabel and metrics[1].ValueLabel.Parent then
+                metrics[1].ValueLabel.Text = state.Remaining and tostring(state.Remaining) .. " s" or "--"
+            end
+            if metrics[2].ValueLabel and metrics[2].ValueLabel.Parent then
+                metrics[2].ValueLabel.Text = state.Status or "Waiting for data"
+            end
+        end
+    end
+
+    function controller.SetEnabled(value)
+        enabled = value == true
+        Config.AutoWeatherControllers = enabled
+        if enabled then stopStandalone() end
+        if bridge and bridge.Parent then bridge:SetAttribute("Enabled", enabled) end
+        if toggle and type(toggle.Set) == "function" then
+            syncingToggle = true
+            pcall(toggle.Set, toggle, enabled)
+            syncingToggle = false
+        end
+        saveConfig()
+        refresh()
+        return enabled
+    end
+
+    function controller.Mount(page)
+        UI:AddDivider(page, "Weather Controllers")
+        toggle = UI:AddToggle(page, "Auto Controllers", enabled, function(value)
+            if not syncingToggle then controller.SetEnabled(value) end
+        end)
+        rows = {}
+        for index, item in ipairs(definitions) do
+            rows[index] = UI:AddMetricRow(page, {
+                { Label = item.Item, Value = "--", Unit = "Cooldown remaining" },
+                { Label = "Status", Value = "Waiting for data", Unit = "Ownership and cooldown" },
+            })
+        end
+        refresh()
+    end
+
+    function controller.Destroy()
+        living, enabled = false, false
+        rows, toggle = nil, nil
+        if bridge then
+            bridge:SetAttribute("Enabled", false)
+            bridge:SetAttribute("Active", false)
+            bridge:Destroy()
+            bridge = nil
+        end
+    end
+
+    task.spawn(function()
+        local runner = ENV.run_on_actor or run_on_actor
+        local actor = game:GetService("ReplicatedFirst"):FindFirstChild("ClientHandlers")
+        local core = game:GetService("CoreGui")
+        local old = core:FindFirstChild("BonesHubWeatherControllers")
+        if old then old:SetAttribute("Active", false) old:Destroy() end
+        if not living or not Alive then return end
+        bridge = Instance.new("Folder")
+        bridge.Name = "BonesHubWeatherControllers"
+        bridge:SetAttribute("Active", true)
+        bridge:SetAttribute("Enabled", enabled)
+        bridge.Parent = core
+        if enabled then stopStandalone() end
+        if type(runner) ~= "function" or not actor then
+            bridge:SetAttribute("Error", "Actor support unavailable")
+            return
+        end
+        local ok, err = pcall(runner, actor, [==[
+if setthreadidentity then setthreadidentity(8) end
+local rs = game:GetService("ReplicatedStorage")
+local player = game:GetService("Players").LocalPlayer
+local bridge = game:GetService("CoreGui"):FindFirstChild("BonesHubWeatherControllers")
+if not bridge then return end
+local function active()
+    return bridge.Parent ~= nil and bridge:GetAttribute("Active") == true
+end
+local ok, err = pcall(function()
+    local replicas = require(rs.ReplicaController)
+    local packets = require(rs.Packets.Inventory)
+    local items = {
+        { Key = "StrangeController", Item = "Strange Controller", Cooldown = "StrangeControllerCoolDown" },
+        { Key = "BiomeRandomizer", Item = "Biome Randomizer", Cooldown = "BiomeRandomizerCoolDown" },
+    }
+    local lastPacket = -math.huge
+    local function state(item, value)
+        bridge:SetAttribute(item.Key .. "State", value)
+    end
+    local function count(item, suffix)
+        bridge:SetAttribute(item.Key .. suffix, (bridge:GetAttribute(item.Key .. suffix) or 0) + 1)
+    end
+    while active() do
+        local now = os.clock()
+        local uid = player:GetAttribute("UID")
+        local replica = uid and replicas._replicas[uid]
+        local data = replica and replica.Class == "PlayerData" and replica.Data
+        local inventory = data and data.Inventory
+        for _, item in ipairs(items) do
+            local entry = type(inventory) == "table" and inventory[item.Item]
+            local amount = type(entry) == "table" and entry.Amount
+            local inventoryReady = type(inventory) == "table" and (entry == nil or type(amount) == "number" and amount == amount and amount >= 0 and amount < math.huge)
+            local owned = inventoryReady and entry ~= nil and amount > 0
+            local cd = data and data[item.Cooldown]
+            local valid = type(cd) == "number" and cd == cd and cd >= 0 and cd < math.huge
+            bridge:SetAttribute(item.Key .. "Owned", owned == true)
+            bridge:SetAttribute(item.Key .. "Remaining", owned and valid and math.ceil(cd) or -1)
+            if valid and cd > 0 then
+                if item.Pending then count(item, "Confirmed") end
+                item.Pending, item.Blocked = nil, nil
+            elseif item.Pending and now - item.Pending >= 8 then
+                item.Pending, item.Blocked = nil, true
+            end
+            if not inventoryReady then
+                state(item, "Checking inventory")
+            elseif not owned then
+                state(item, "Not owned")
+            elseif not valid then
+                state(item, "Waiting for cooldown")
+            elseif item.Blocked then
+                state(item, "No confirmation")
+            elseif item.Pending then
+                state(item, "Confirming")
+            elseif not bridge:GetAttribute("Enabled") then
+                state(item, "Disabled")
+            elseif cd > 0 then
+                state(item, "Cooling down")
+            elseif now - lastPacket < 1 then
+                state(item, "Ready")
+            elseif active() and bridge:GetAttribute("Enabled") == true and data[item.Cooldown] == 0
+                and type(data.Inventory[item.Item]) == "table" and type(data.Inventory[item.Item].Amount) == "number"
+                and data.Inventory[item.Item].Amount > 0 then
+                item.Pending, lastPacket = now, now
+                count(item, "Sent")
+                state(item, "Confirming")
+                local sent, failure = pcall(packets.UseItem.send, { itemName = item.Item, amount = 1 })
+                if not sent then
+                    item.Pending, item.Blocked = nil, true
+                    state(item, "Send failed")
+                    bridge:SetAttribute(item.Key .. "Error", tostring(failure))
+                end
+            end
+        end
+        bridge:SetAttribute("UpdatedAt", workspace:GetServerTimeNow())
+        task.wait(0.1)
+    end
+end)
+if not ok and active() then bridge:SetAttribute("Error", tostring(err)) end
+]==])
+        if not ok and bridge and bridge.Parent then bridge:SetAttribute("Error", tostring(err)) end
+    end)
+
+    task.spawn(function()
+        while living and Alive do
+            pcall(refresh)
+            task.wait(0.25)
+        end
+    end)
+    return controller
+end)()
+
 local FishingAutomation = (function()
     local controller = {}
     local bridge, metrics, selector
@@ -1913,7 +2114,7 @@ local FishSpots = (function()
         if mountedPage == nil or not UI then return end
         local order
         if selector and selector.Frame then
-            pcall(function() order = selector.Frame.LayoutOrder end)
+            pcall(function() if selector.Frame.Parent then order = selector.Frame.LayoutOrder end end)
             pcall(function() selector.Frame:Destroy() end)
         end
         local labels = {}
@@ -3853,6 +4054,7 @@ UI:AddButtonRow(6, {
 UI:AddAlert(6, "Private delivery", "Notifications only use your configured Discord webhook URLs. Aura alerts listen for equipment changes and do not send your current aura on load.", "info")
 
 Potion.Mount(1)
+WeatherControllers.Mount(1)
 FishingAutomation.Mount(1)
 UI:SetBootStep("Ready.", 1, "ready")
 UI:FinishBootSplash()
@@ -3870,6 +4072,7 @@ if Config.UIMode ~= "Lightweight" and Config.UIMode ~= "Original" and Config.UIM
 local mountedInterface, interfaceFailure = mountInterface()
 if not mountedInterface then
     AuraNotifications.Destroy()
+    WeatherControllers.Destroy()
     FishingAutomation.Destroy()
     Potion.Destroy()
     Alive = false
@@ -3895,6 +4098,8 @@ function API.SetPotionEnabled(value) return Potion.SetEnabled(value) end
 function API.GetPotionState() return Potion.GetState() end
 function API.SelectPotion(value) return Potion.SelectRecipe(value) end
 function API.SelectPotions(values) return Potion.SelectRecipes(values) end
+function API.SetWeatherControllersEnabled(value) return WeatherControllers.SetEnabled(value) end
+function API.GetWeatherControllersState() return WeatherControllers.GetState() end
 function API.SetFishingEnabled(value) return FishingAutomation.SetEnabled(value) end
 function API.SelectFishingAreas(values) return FishingAutomation.SelectAreas(values) end
 function API.SelectFishingSpots(values) return FishingAutomation.SelectSpots(values) end
@@ -3936,6 +4141,7 @@ end
 function API.Destroy()
     if not Alive then return end
     AuraNotifications.Destroy()
+    WeatherControllers.Destroy()
     FishingAutomation.Destroy()
     Potion.Destroy()
     Alive = false
