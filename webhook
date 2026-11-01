@@ -31,6 +31,92 @@ pcall(function()
     if legacy then legacy:Destroy() end
 end)
 
+local ScriptCompatibility = (function()
+    local controller = {}
+    local active, detected, started = false, false, false
+    local connections, roots, watched = {}, {}, {}
+    local matchedPath
+    local function disconnect()
+        for _, connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
+        table.clear(connections)
+        for _, entries in pairs(watched) do
+            for _, connection in ipairs(entries) do pcall(function() connection:Disconnect() end) end
+        end
+        table.clear(watched)
+        table.clear(roots)
+    end
+    local function isXTWindow(object)
+        if not object:IsA("ScreenGui") then return false end
+        local name=object.Name:lower()
+        return name=="xthub" or name=="xt hub" or name:match("^xthub[_%-]")~=nil
+    end
+    function controller.Start(onDetected)
+        if started then return not detected end
+        started,active=true,true
+        local function inspect(object)
+            if not active or not isXTWindow(object) then return end
+            detected,active=true,false
+            matchedPath=object:GetFullName()
+            disconnect()
+            onDetected(matchedPath)
+        end
+        local function watch(object)
+            if not active or not object:IsA("ScreenGui") or watched[object] then return end
+            inspect(object)
+            if not active then return end
+            watched[object]={
+                object:GetPropertyChangedSignal("Name"):Connect(function() inspect(object) end),
+                object.AncestryChanged:Connect(function()
+                    if object.Parent==nil then
+                        local entries=watched[object]
+                        watched[object]=nil
+                        for _,connection in ipairs(entries or {}) do connection:Disconnect() end
+                    else inspect(object) end
+                end),
+            }
+        end
+        local function bind(root)
+            if not active or not root or roots[root] then return end
+            roots[root]=true
+            connections[#connections+1]=root.DescendantAdded:Connect(watch)
+            watch(root)
+            if not active then return end
+            for _,object in ipairs(root:GetDescendants()) do
+                if not active then break end
+                watch(object)
+            end
+        end
+        -- Connect before scanning so a UI added during startup is not missed.
+        connections[#connections+1]=LocalPlayer.ChildAdded:Connect(function(child)
+            if child:IsA("PlayerGui") then bind(child) end
+        end)
+        bind(game:GetService("CoreGui"))
+        bind(LocalPlayer:FindFirstChildOfClass("PlayerGui"))
+        local hidden=ENV.gethui or gethui or ENV.get_hidden_gui or get_hidden_gui
+        if active and type(hidden)=="function" then
+            local ok,root=pcall(hidden)
+            if ok then bind(root) end
+        end
+        return not detected
+    end
+    function controller.Destroy()
+        active=false
+        disconnect()
+    end
+    function controller.GetState()
+        return { Active=active, Detected=detected, MatchedPath=matchedPath }
+    end
+    return controller
+end)()
+
+if not ScriptCompatibility.Start(function()
+    local running=ENV[API_KEY]
+    LocalPlayer:Kick("Bones Hub: XT Hub detected. Close XT Hub before using Bones Hub.")
+    if type(running)=="table" and type(running.Destroy)=="function" then pcall(running.Destroy) end
+end) then
+    ENV.__BONES_HUB_BOOT_STARTED=nil
+    return
+end
 local CONFIG_DIR = "BiomeMacroConfigs"
 local CONFIG_FILE = CONFIG_DIR .. "/BonesHub_" .. tostring(LocalPlayer.UserId) .. ".json"
 local LEGACY_CONFIG_FILE = CONFIG_DIR .. "/Config_" .. tostring(LocalPlayer.UserId) .. ".json"
@@ -8423,7 +8509,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.29", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.30", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -8602,6 +8688,7 @@ end
 Config.UIMode = "Original"
 local mountedInterface, interfaceFailure = mountInterface()
 if not mountedInterface then
+    ScriptCompatibility.Destroy()
     AuraNotifications.Destroy()
     WeatherControllers.Destroy()
     EdenAutomation.Destroy()
@@ -8637,6 +8724,7 @@ function API.SelectHalloweenAuras(values) return Halloween.SelectAuras(values) e
 function API.SetHalloweenDamage(name, value) return Halloween.SetDamage(name, value) end
 function API.SetAutomationEnabled(feature, value) return Automation.SetEnabled(feature, value) end
 function API.SelectAutomation(feature, values) return Automation.Select(feature, values) end
+function API.GetScriptCompatibilityState() return ScriptCompatibility.GetState() end
 function API.GetNavigationState() return Navigation.GetState() end
 function API.SetAutoReexecute(value) return Reexecution.SetEnabled(value) end
 function API.GetReexecutionState() return Reexecution.GetState() end
@@ -8704,6 +8792,7 @@ function API.Destroy()
     if not Alive then return end
     saveConfig()
     Alive = false
+    ScriptCompatibility.Destroy()
     AuraNotifications.Destroy()
     WeatherControllers.Destroy()
     EdenAutomation.Destroy()
@@ -8755,6 +8844,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.29")
+local loader, failure = loadstring(source, "BonesHub 3.30")
 if not loader then error(failure) end
 return loader()
