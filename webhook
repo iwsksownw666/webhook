@@ -1477,6 +1477,7 @@ local Navigation = (function()
                 index+=1 jumped,recovered=false,false bestDistance,progressAt=math.huge,os.clock()
                 continue
             end
+            local cornerDrive
             local canAdvance = offset.Magnitude <= tolerance or passed
             if canAdvance and not final and not onBridge and points[index+1].Action~=Enum.PathWaypointAction.Jump
                 and not (type(waypoint) == "table" and waypoint.Straight) then
@@ -1488,6 +1489,15 @@ local Navigation = (function()
                 end
                 if not clearValue then
                     canAdvance = offset.Magnitude <= 0.65
+                    -- MoveTo stops about one stud short. Drive through a guarded
+                    -- corner only along a checked incoming corridor, then turn.
+                    if not canAdvance and index>1 and offset.Magnitude<=1.6 then
+                        local incoming=flat(position-points[index-1].Position)
+                        if incoming.Magnitude>0.1 then
+                            local drive=Vector3.new(position.X,root.Position.Y,position.Z)+incoming.Unit*1.25
+                            if clearCorridor(root.Position,drive,ray,0.9) then cornerDrive=drive end
+                        end
+                    end
                 end
             end
             if not final and canAdvance and (above>=-2 and above<=6 or index==1 and offset.Magnitude<=1.5)
@@ -1498,7 +1508,7 @@ local Navigation = (function()
                 continue
             end
             if index ~= sentIndex or os.clock() - sentAt >= 0.75 then
-                command(humanoid, position)
+                command(humanoid, cornerDrive or position)
                 sentIndex, sentAt = index, os.clock()
             end
             local distance = flat(root.Position-position).Magnitude
@@ -7329,11 +7339,14 @@ local HalloweenRules = (function()
                             if skill.Lock >= 4 and context.Health < 45 then effectiveness = 0 end
                             if name == "Rush" and (context.Health < 65 or context.Pressure > 1) then effectiveness = 0 end
                             if context.Recovering and (skill.Preferred or math.min(12,skill.Range*0.65)) < 16 then effectiveness = 0 end
+                            if (context.Height or 0) > (skill.MaxHeight or 9) then effectiveness = 0 end
+                            if skill.Windup and skill.Width and (context.Speed or 0)*skill.Windup > skill.Width then effectiveness = 0 end
                         end
                         local approach = context and math.max(0,(context.Distance or 0)-skill.Range*0.8)/math.max(8,context.WalkSpeed or 16) or 0
+                        local usefulDamage = context and type(context.TargetHealth)=="number" and math.min(damage,math.max(1,context.TargetHealth)) or damage
                         if effectiveness > 0 then ready[#ready + 1] = { Aura = aura, Skill = name, Key = key, Range = skill.Range, Preferred = skill.Preferred, AimLead = skill.AimLead, Lock = skill.Lock,
                             Stable = skill.Stable, MaxSpeed = skill.MaxSpeed, Windup = skill.Windup, Width = skill.Width, MaxHeight = skill.MaxHeight, AimMode = skill.AimMode,
-                            Score = context and damage * effectiveness / (skill.Lock + approach + (aura.Id == current and 0.1 or 0.65)) or damage,
+                            Score = context and usefulDamage * effectiveness / (skill.Lock + approach + (aura.Id == current and 0.1 or 0.65)) or damage,
                             Source = sample and "Solo damage estimate" or skill.Unmeasured and "Unmeasured fallback" or "Wiki estimate" } end
                         total += damage
                     end
@@ -7894,11 +7907,14 @@ local HalloweenRules = (function()
                             if skill.Lock >= 4 and context.Health < 45 then effectiveness = 0 end
                             if name == "Rush" and (context.Health < 65 or context.Pressure > 1) then effectiveness = 0 end
                             if context.Recovering and (skill.Preferred or math.min(12,skill.Range*0.65)) < 16 then effectiveness = 0 end
+                            if (context.Height or 0) > (skill.MaxHeight or 9) then effectiveness = 0 end
+                            if skill.Windup and skill.Width and (context.Speed or 0)*skill.Windup > skill.Width then effectiveness = 0 end
                         end
                         local approach = context and math.max(0,(context.Distance or 0)-skill.Range*0.8)/math.max(8,context.WalkSpeed or 16) or 0
+                        local usefulDamage = context and type(context.TargetHealth)=="number" and math.min(damage,math.max(1,context.TargetHealth)) or damage
                         if effectiveness > 0 then ready[#ready + 1] = { Aura = aura, Skill = name, Key = key, Range = skill.Range, Preferred = skill.Preferred, AimLead = skill.AimLead, Lock = skill.Lock,
                             Stable = skill.Stable, MaxSpeed = skill.MaxSpeed, Windup = skill.Windup, Width = skill.Width, MaxHeight = skill.MaxHeight, AimMode = skill.AimMode,
-                            Score = context and damage * effectiveness / (skill.Lock + approach + (aura.Id == current and 0.1 or 0.65)) or damage,
+                            Score = context and usefulDamage * effectiveness / (skill.Lock + approach + (aura.Id == current and 0.1 or 0.65)) or damage,
                             Source = sample and "Solo damage estimate" or skill.Unmeasured and "Unmeasured fallback" or "Wiki estimate" } end
                         total += damage
                     end
@@ -8067,6 +8083,7 @@ end
 
 local listeners, cooldowns, blocked, unavailable = {}, {}, {}, {}
 local owned, pendingEquip, pendingCast, current = {}, nil, nil, nil
+local approachTarget
 local rotationAura, spent, learned, turnStarted = nil, {}, {}, false
 local requested, confirmed, nextInventory, castUntil, equipSettled = 0, 0, 0, 0, 0
 local motionTarget, motionPosition, motionAt, stableSince = nil, nil, 0, 0
@@ -8178,6 +8195,7 @@ local ok, failure = pcall(function()
         local point = target and target:FindFirstChild("HumanoidRootPart")
         local hp = target and HalloweenRules.Health(target)
         local valid = point and HalloweenRules.Attackable(target, folder)
+        if valid then watch(target) end
         if d and now >= nextInventory then
             nextInventory = now + 0.5
             HalloweenRules.Discover(d, metadata)
@@ -8217,7 +8235,7 @@ local ok, failure = pcall(function()
                 end
             end
         end
-        if pendingCast and not pendingCast.Started and not pendingCast.Confirmed and now >= pendingCast.Deadline - 18.5 then pendingCast.Deadline = now end
+        if pendingCast and not pendingCast.Started and not pendingCast.Confirmed and now >= pendingCast.AckDeadline then pendingCast.Deadline = now end
         if pendingCast and (now >= pendingCast.Deadline or pendingCast.Confirmed and now >= castUntil) then
             local after = pendingCast.Target.Parent and HalloweenRules.Health(pendingCast.Target)
             if after and pendingCast.Before and after < pendingCast.Before and pendingCast.Solo and HalloweenRules.CanSampleDamage(player,players,pendingCast.Target) then
@@ -8241,7 +8259,8 @@ local ok, failure = pcall(function()
         if Vector3.new(velocity.X,0,velocity.Z).Magnitude > 1.2 then stableSince = now end
         motionTarget, motionPosition, motionAt = target, point and point.Position, now
         local context = { Speed = Vector3.new(velocity.X,0,velocity.Z).Magnitude, Health = humanoid and humanoid.Health / math.max(1,humanoid.MaxHealth) * 100 or 0, Pressure = tonumber(bridge:GetAttribute("CloseEnemies")) or 0,
-            StableFor = now-stableSince, Distance = point and root and (point.Position-root.Position).Magnitude or 0, WalkSpeed = humanoid and humanoid.WalkSpeed or 16, Recovering = bridge:GetAttribute("Recovering") == true }
+            StableFor = now-stableSince, Distance = point and root and (point.Position-root.Position).Magnitude or 0, WalkSpeed = humanoid and humanoid.WalkSpeed or 16, Recovering = bridge:GetAttribute("Recovering") == true,
+            TargetHealth = hp, Height = point and root and math.abs(point.Position.Y-root.Position.Y) or 0 }
         local desired = HalloweenRules.Next(owned, cooldowns, blocked, unavailable, now, turnStarted and current or nil, spent, scores, learned, context)
         if not desired and #owned == 1 and next(spent) then spent = {} desired = HalloweenRules.Next(owned, cooldowns, blocked, unavailable, now, current, spent, scores, learned, context) end
         if desired then
@@ -8255,6 +8274,7 @@ local ok, failure = pcall(function()
         attr("NextAura", desired and desired.Aura.Label or "Cooling down") attr("NextSkill", desired and desired.Skill or "None")
         if pendingCast and (not humanoid or humanoid.Health <= 0 or pendingCast.Character ~= nil and pendingCast.Character ~= character) then pendingCast=nil castUntil=0 spent={} turnStarted=false end
         attr("Casting", pendingCast ~= nil)
+        if target~=approachTarget or not valid then attr("NeedsApproach",false) approachTarget=target end
         local active = d and humanoid and humanoid.Health > 0 and root and not root.Anchored and valid
             and bridge:GetAttribute("FarmEnabled") == true and bridge:GetAttribute("Permit") == true
         if active and desired and not pendingEquip and not pendingCast and now >= castUntil and now >= equipSettled and inventoryFree() then
@@ -8272,8 +8292,10 @@ local ok, failure = pcall(function()
                 if entry and not skillUI:GetDisabled(desired.Skill) then
                     local direction, aimPoint = HalloweenRules.Aim(root.Position, point.Position, velocity, desired.AimLead)
                     local params = RaycastParams.new() params.FilterType = Enum.RaycastFilterType.Exclude params.RespectCanCollide = true
-                    params.FilterDescendantsInstances = { character, folder }
+                    -- Orbs can live outside NPCs; exclude their own collision body.
+                    params.FilterDescendantsInstances = { character, target, folder }
                     local obstructed = workspace:Raycast(root.Position,aimPoint-root.Position,params)
+                    attr("NeedsApproach",obstructed~=nil)
                     local canCast, reason = HalloweenRules.CastWindow(desired,root.Position,point.Position,velocity,now-stableSince,obstructed == nil)
                     if not canCast then blocked[desired.Key] = now+0.6 attr("CastStatus",reason) direction = nil end
                     if direction then
@@ -8288,7 +8310,7 @@ local ok, failure = pcall(function()
                                 if animation:IsA("Animation") and HalloweenRules.Normalize(name) == HalloweenRules.Normalize(desired.Skill) then animations[animation.AnimationId] = true end
                             end
                         end
-                        pendingCast = { Character = character, Key = desired.Key, Skill = desired.Skill, Range = desired.Range, Preferred = desired.Preferred, Target = target, Before = hp, Solo = #players:GetPlayers() == 1, Animations = animations, Deadline = now + 20 }
+                        pendingCast = { Character = character, Key = desired.Key, Skill = desired.Skill, Range = desired.Range, Preferred = desired.Preferred, Target = target, Before = hp, Solo = #players:GetPlayers() == 1, Animations = animations, AckDeadline = now+1.5, Deadline = now + math.clamp(desired.Lock+3,4,15) }
                         requested += 1
                         packets.UseSkill.send({ SkillName = desired.Skill, LookVector = direction, MouseHit = CFrame.lookAt and CFrame.lookAt(aimPoint, aimPoint + direction) or CFrame.new(aimPoint) })
                         attr("RequestedCasts", requested) attr("LastSkill", desired.Aura.Label .. " / " .. desired.Skill)
@@ -8412,7 +8434,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
     local function groundGoal(point, model, root)
         local params = RaycastParams.new()
         params.FilterType, params.RespectCanCollide = Enum.RaycastFilterType.Exclude, true
-        params.FilterDescendantsInstances = { model, npcFolder }
+        params.FilterDescendantsInstances = { model, npcFolder, target }
         local hit = workspace:Raycast(point + Vector3.new(0, 7, 0), Vector3.new(0, -24, 0), params)
         if not hit or hit.Normal.Y < 0.65 or math.abs(hit.Position.Y - (root.Position.Y - 3)) > 7 then return nil end
         local offset = Vector3.new(point.X - root.Position.X, 0, point.Z - root.Position.Z)
@@ -8431,17 +8453,29 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         local offset = root.Position - point.Position offset = Vector3.new(offset.X, 0, offset.Z)
         if offset.Magnitude < 0.1 then return end
         local preferred=bridge and tonumber(bridge:GetAttribute("PreferredDistance")) or range*0.5
-        local candidate = point.Position + offset.Unit * math.clamp(preferred, 6, math.max(6,range*0.8))
+        local distance=math.clamp(preferred, 6, math.max(6,range*0.8))
         local params = RaycastParams.new() params.FilterType, params.RespectCanCollide = Enum.RaycastFilterType.Exclude, true
-        params.FilterDescendantsInstances = { model, npcFolder }
-        local hit = workspace:Raycast(candidate + Vector3.new(0, 10, 0), Vector3.new(0, -60, 0), params)
-        if not hit or hit.Normal.Y < 0.65 then return end
-        local direct = groundGoal(candidate, model, root)
-        if direct and (direct-root.Position).Magnitude <= 60 then
-            local samples = math.max(1, math.ceil((direct-root.Position).Magnitude/6))
-            for i=1,samples-1 do if not groundGoal(root.Position:Lerp(direct,i/samples),model,root) then direct=nil break end end
-        else direct=nil end
-        return hit.Position, direct
+        params.FilterDescendantsInstances = { model, npcFolder, target }
+        local forward=offset.Unit local side=Vector3.new(-forward.Z,0,forward.X)
+        local fallback
+        for _,angle in ipairs({0,45,-45,90,-90,135,-135,180}) do
+            local radians=math.rad(angle)
+            local candidate=point.Position+(forward*math.cos(radians)+side*math.sin(radians))*distance
+            local hit=workspace:Raycast(candidate+Vector3.new(0,10,0),Vector3.new(0,-60,0),params)
+            if hit and hit.Normal.Y>=0.65 then
+                local standing=hit.Position+Vector3.new(0,3,0)
+                if math.abs(standing.Y-point.Position.Y)<=8 and not workspace:Raycast(standing,point.Position-standing,params) then
+                    fallback=fallback or hit.Position
+                    local direct=groundGoal(candidate,model,root)
+                    if direct and (direct-root.Position).Magnitude<=60 then
+                        local samples=math.max(1,math.ceil((direct-root.Position).Magnitude/6))
+                        for i=1,samples-1 do if not groundGoal(root.Position:Lerp(direct,i/samples),model,root) then direct=nil break end end
+                    else direct=nil end
+                    if direct then return hit.Position,direct end
+                end
+            end
+        end
+        return fallback
     end
     local function updateSettings()
         attribute("FarmEnabled", enabled())
@@ -8593,8 +8627,10 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             end
         end
         attribute("CloseEnemies",pressure)
+        local safeOrb = HalloweenRules.IsOrb(target) and nearest > 45 and now-recentDamage>2
         local retreatAt=math.max(Config.HalloweenRetreatHP,45)
-        if hpPercent <= retreatAt or hpPercent<65 and pressure>=2 then recovering=true end
+        if safeOrb then recovering=false
+        elseif hpPercent <= retreatAt or hpPercent<65 and pressure>=2 then recovering=true end
         if recovering and hpPercent >= math.min(90,retreatAt+25) and now-recentDamage>2 then recovering=false end
         attribute("Recovering",recovering)
         local warnings = Config.HalloweenAutoDodge and hazards(now) or {}
@@ -8655,7 +8691,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         end
         -- Jumping in place is not route progress.
         if not lastPosition or Vector3.new(lastPosition.X-root.Position.X,0,lastPosition.Z-root.Position.Z).Magnitude > 0.6 then lastPosition,lastProgressAt=root.Position,os.clock() end
-        if distance <= preferred + 1.5 then
+        if distance <= preferred + 1.5 and bridge:GetAttribute("NeedsApproach") ~= true then
             if moving or moveGoal then moveEpoch += 1 moving=false moveGoal=nil humanoid:MoveTo(root.Position) end
             lastProgressAt=os.clock() moveGoal=nil
             status = "Attacking " .. HalloweenRules.Label(target)
@@ -8676,7 +8712,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             if direct and os.clock() >= forcePathUntil then
                 nextChase=os.clock()+0.4 moveDirect(humanoid,root,direct,false) status="Approaching "..HalloweenRules.Label(target) routeReason="Direct ground route" return
             end
-            moving = true moveEpoch += 1 local token, serial, selected, deadline = epoch, moveEpoch, target, os.clock() + 8
+            moving = true moveEpoch += 1 local token, serial, selected, deadline = epoch, moveEpoch, target, os.clock() + 25
             nextChase = os.clock() + 1 status = "Approaching " .. HalloweenRules.Label(target)
             task.spawn(function()
                 local worked, reached, reason = pcall(Navigation.PathWalk or Navigation.Walk, goal, function()
@@ -8926,7 +8962,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.33", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.34", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -9262,6 +9298,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.33")
+local loader, failure = loadstring(source, "BonesHub 3.34")
 if not loader then error(failure) end
 return loader()
