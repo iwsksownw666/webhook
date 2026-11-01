@@ -1819,6 +1819,8 @@ local Potion = (function()
         local ticket, arguments = sequence, table.pack(...)
         local auxiliary = game:GetService("CoreGui"):FindFirstChild("BonesHubAutomationBridge")
         local merchant = game:GetService("CoreGui"):FindFirstChild("BonesHubMerchantBridge")
+        local combat = game:GetService("CoreGui"):FindFirstChild("BonesHubHalloweenBridge")
+        if combat and combat:GetAttribute("InventoryReserved")==true then return false,"Inventory busy","busy" end
         if merchant and (merchant:GetAttribute("InventoryReserved") == true or merchant:GetAttribute("PurchaseInFlight") == true) then return false, "Inventory busy", "busy" end
         if auxiliary and (auxiliary:GetAttribute("DeleteBusy") == true or auxiliary:GetAttribute("CraftBusy") == true or (auxiliary:GetAttribute("ItemBusyUntil") or 0) > os.clock() or (auxiliary:GetAttribute("MutationPauseUntil") or 0) > os.clock()) then return false, "Inventory busy", "busy" end
         local weatherItems = game:GetService("CoreGui"):FindFirstChild("BonesHubWeatherControllers")
@@ -1872,42 +1874,17 @@ local Potion = (function()
         if cauldron and cauldron:IsA("Model") then return cauldron:GetPivot().Position end
     end
 
-    local function portalPosition(destination)
-        local _, _, root = currentCharacter()
-        if not root then return nil end
-        local selected, best
-        for _, portal in ipairs(game:GetService("CollectionService"):GetTagged("StellaPortal")) do
-            local position = portal:IsA("Model") and portal:GetPivot().Position or portal:IsA("BasePart") and portal.Position
-            if position and (position - destination).Magnitude > 500 then
-                local distance = (position - root.Position).Magnitude
-                if not best or distance < best then selected, best = position, distance end
-            end
-        end
-        return selected
-    end
-
     local function travel(destination, token, reach)
-        local character, humanoid, root = currentCharacter()
+        local _, _, root = currentCharacter()
         if not root then return false, "Character unavailable" end
         if (root.Position - destination).Magnitude > 1000 then
             local data = readSnapshot()
-            if not (data and data.PortalUnlocked or bridge and bridge:GetAttribute("PortalUnlocked") == true) then return false, "Stella shortcut is locked" end
-            local portal = portalPosition(destination)
-            if not portal then return false, "Portal unavailable" end
-            setStatus("Walking to portal")
-            local ok, err = walkPortal(portal, token)
-            if not ok then return false, err end
-            local deadline = os.clock() + 10
-            movingHumanoid = humanoid
-            while active(token) and LocalPlayer.Character == character and humanoid.Health > 0 and (root.Position - destination).Magnitude > 1000 and os.clock() < deadline do
-                humanoid:MoveTo(portal)
-                task.wait(0.25)
+            if not (data and data.PortalUnlocked or bridge and bridge:GetAttribute("PortalUnlocked") == true) then
+                return false, "Stella shortcut is locked"
             end
-            movingHumanoid = nil
-            if not active(token) then return false, "Stopped" end
-            if LocalPlayer.Character ~= character or humanoid.Health <= 0 then return false, "Character changed" end
-            if (root.Position - destination).Magnitude > 1000 then return false, "Portal did not respond" end
         end
+        -- Shared navigation recognizes a native portal transfer even when the
+        -- entry waypoint stops early. Do not run a second portal state machine.
         return walkPortal(destination, token, reach)
     end
 
@@ -1918,6 +1895,18 @@ local Potion = (function()
             if data and predicate(data) then return data end
             task.wait(0.15)
         end
+    end
+
+    local function callWhenReady(remote, token, ...)
+        local deadline=os.clock()+12
+        while active(token) do
+            local ok,err,outcome=callRemote(remote,token,...)
+            if ok or outcome~="busy" then return ok,err,outcome end
+            if os.clock()>=deadline then return false,err,"busy" end
+            setStatus("Waiting for inventory operations at cauldron")
+            task.wait(0.2)
+        end
+        return false,"Stopped","not-sent"
     end
 
     local function cycleRecipe(token)
@@ -1946,11 +1935,7 @@ local Potion = (function()
                 return
             end
         end
-        local available = false
-        for _, ingredient in ipairs(data.Ingredients or {}) do
-            if ingredient.Required > ingredient.Added and ingredient.Owned > 0 then available = true break end
-        end
-        if not ready and not available then setStatus("Waiting for ingredients") return end
+        if not ready then setStatus("Waiting for complete ingredients") return end
         local _, _, root = currentCharacter()
         local target = cauldronPosition()
         if not root or not target then setStatus("Waiting for cauldron") return end
@@ -1959,9 +1944,11 @@ local Potion = (function()
         if not arrived then setStatus("Movement paused", movementError) nextAttempt = os.clock() + 30 return end
         local function make()
             if not active(token) then return end
-            local latest = readSnapshot()
-            local _, filled = plan(latest)
-            if not latest then return end
+            local latest = awaitData(function() return true end,token,6)
+            if not latest then setStatus("Waiting for fresh crafting data") nextAttempt=os.clock()+10 return end
+            local ready,filled = plan(latest)
+            if not ready then setStatus("Ingredients changed during travel") nextAttempt=os.clock()+10 return end
+            if bridge and bridge.Parent then bridge:SetAttribute("MutationPending",true) end
             local _, _, currentRoot = currentCharacter()
             if not currentRoot or (currentRoot.Position - target).Magnitude > 12 then setStatus("Outside crafting range") return end
             local remote = ReplicatedStorage:FindFirstChild("Remote")
@@ -1973,7 +1960,7 @@ local Potion = (function()
                 for _, ingredient in ipairs(latest.Ingredients) do
                     expected[ingredient.Name] = math.min(ingredient.Required, ingredient.Added + ingredient.Owned)
                 end
-                local ok, err = callRemote(remote.AddAllIngredients, token, namespace, recipeName, true)
+                local ok, err = callWhenReady(remote.AddAllIngredients, token, namespace, recipeName, true)
                 if not ok then setStatus("Add failed", err) nextAttempt = os.clock() + 30 return end
                 latest = awaitData(function(value)
                     for _, ingredient in ipairs(value.Ingredients) do
@@ -1993,17 +1980,16 @@ local Potion = (function()
             local previousCount = latest.Count
             setStatus("Crafting " .. recipeName)
             pendingOutcomes[recipeName] = previousCount
-            local ok, err, outcome = callRemote(remote.CraftRecipe, token, namespace, recipeName)
+            local ok, err, outcome = callWhenReady(remote.CraftRecipe, token, namespace, recipeName)
             if not ok then
-                if outcome == "rejected" then pendingOutcomes[recipeName] = nil end
+                if outcome == "rejected" or outcome=="busy" or outcome=="not-sent" then pendingOutcomes[recipeName] = nil end
                 setStatus("Craft failed", err)
                 nextAttempt = os.clock() + 30
                 return
             end
             local confirmed = awaitData(function(value) return value.Count > previousCount end, token, 8)
             if confirmed then
-                completed += 1
-                pendingOutcomes[recipeName] = nil
+                if pendingOutcomes[recipeName]~=nil then completed += 1 pendingOutcomes[recipeName]=nil end
                 log(recipeName .. " crafted; inventory " .. tostring(previousCount) .. " -> " .. tostring(confirmed.Count), "INFO")
                 setStatus("Craft confirmed")
             else
@@ -2052,12 +2038,10 @@ local Potion = (function()
             if data then
                 local ready, filled = plan(data)
                 if ready or filled or (pendingOutcomes[name] and data.Count > pendingOutcomes[name]) then available = true end
-                for _, ingredient in ipairs(data.Ingredients or {}) do
-                    if ingredient.Required > ingredient.Added and ingredient.Owned > 0 then available = true break end
-                end
+
             end
         end
-        if not available then manualOnce = false MovementCoordinator.Cancel("Potion") return false end
+        if not available then manualOnce = false setStatus("Waiting for complete ingredients") MovementCoordinator.Cancel("Potion") return false end
         movementTicket = MovementCoordinator.Acquire("Potion")
         if not movementTicket then manualOnce = false return false end
         busy, navigationOwner, operationEpoch = true, "Potion", epoch
@@ -7745,8 +7729,12 @@ local Halloween = (function()
     local nextChoice, nextChase, nextMetrics, lastCommand, lastDraw, leaseAt = 0, 0, 0, 0, 0, 0
     local recovering, syncing = false, false
     local previousHP, recentDamage = nil, 0
-    local combatHoldUntil = 0
-    local unreachable, lastProgressAt, lastPosition, routeReason = {}, 0, nil, nil
+    local combatHoldUntil,orbUnlockUntil = 0,0
+    local pathTargetPosition
+    local unreachable, lastProgressAt, lastPosition, routeReason = setmetatable({}, {__mode="k"}), 0, nil, nil
+    local observedCharacter,combatWatch
+    local approachPhase,forceApproachUntil,recoveries,lastRecovery,lastStepAt=0,0,0,nil,0
+    local actorRestarts,actorStartingAt=0,0
     local forcePathUntil, directStalls = 0, 0
     local bounty = HalloweenBounty.Create({ Alive = function() return living and Alive end, Enabled = function() return Config.HalloweenAutoBounty == true end })
     local reports = HalloweenReports.Create({
@@ -8020,10 +8008,10 @@ local HalloweenRules = (function()
 end)()
 
 local HalloweenCombatLog = {}
-function HalloweenCombatLog.Create(userId, clock)
+function HalloweenCombatLog.Create(userId, clock, seed)
     local self = {}
     local tracked = setmetatable({}, { __mode = "k" })
-    local total, totalOrbs, sequence = 0, 0, 0
+    local total, totalOrbs, sequence = seed and seed.Kills or 0, seed and seed.Orbs or 0, seed and seed.Sequence or 0
     local kills, orbs, names, rewards = 0, 0, {}, {}
     local baseline, recent, lastEvent, rewardUntil = nil, {}, 0, 0
     local function collect(gain)
@@ -8085,9 +8073,10 @@ local listeners, cooldowns, blocked, unavailable = {}, {}, {}, {}
 local owned, pendingEquip, pendingCast, current = {}, nil, nil, nil
 local approachTarget
 local rotationAura, spent, learned, turnStarted = nil, {}, {}, false
-local requested, confirmed, nextInventory, castUntil, equipSettled = 0, 0, 0, 0, 0
+local requested, confirmed, nextInventory, castUntil, equipSettled = bridge:GetAttribute("RequestedCasts") or 0, bridge:GetAttribute("ConfirmedCasts") or 0, 0, 0, 0
+local frameErrors,totalErrors=0,bridge:GetAttribute("ActorErrors") or 0
 local motionTarget, motionPosition, motionAt, stableSince = nil, nil, 0, 0
-local combatLog = HalloweenCombatLog.Create(player.UserId, function() return workspace:GetServerTimeNow() end)
+local combatLog = HalloweenCombatLog.Create(player.UserId, function() return workspace:GetServerTimeNow() end, {Kills=bridge:GetAttribute("OwnKills"),Orbs=bridge:GetAttribute("OwnOrbs"),Sequence=bridge:GetAttribute("ReportSequence")})
 local watched, deathConnections, pendingDeaths = setmetatable({}, { __mode = "k" }), {}, {}
 local function elevate() if setthreadidentity then setthreadidentity(8) end end
 local function alive() elevate() return bridge.Parent ~= nil and bridge:GetAttribute("Active") == true end
@@ -8167,7 +8156,7 @@ local ok, failure = pcall(function()
         end
     end)
     if packets.UseSkill.listen then bind(packets.UseSkill, function(reply)
-        if pendingCast and reply.SkillName == pendingCast.Skill then pendingCast.Started = true end
+        if pendingCast and reply.SkillName == pendingCast.Skill then pendingCast.Started = true attr("WorkerBusyUntil",math.max(castUntil,pendingCast.Confirmed and 0 or pendingCast.Deadline)) end
     end) end
     if packets.CancelSkill then bind(packets.CancelSkill, function(name)
         if pendingCast and pendingCast.Skill == name then pendingCast.Deadline = workspace:GetServerTimeNow() end
@@ -8176,6 +8165,7 @@ local ok, failure = pcall(function()
         if pendingEquip and not reply.s then pendingEquip.Failed = true attr("EquipStatus", tostring(reply.m or "Equip rejected")) end
     end)
     while alive() do
+        local frameOk,frameError=pcall(function()
         local now, d = workspace:GetServerTimeNow(), data()
         attr("Heartbeat", now)
         local character = player.Character
@@ -8189,7 +8179,7 @@ local ok, failure = pcall(function()
         for model, connection in pairs(deathConnections) do if not model.Parent then connection:Disconnect() deathConnections[model] = nil end end
         combatLog.Sample(d,rewardBusy())
         local report = combatLog.TakeReady()
-        if report then attr("CombatReport",http:JSONEncode(report)) end
+        if report then attr("CombatReport",http:JSONEncode(report)) attr("ReportSequence",report.Sequence) end
         local combatStats = combatLog.GetState()
         attr("OwnKills",combatStats.Kills) attr("OwnOrbs",combatStats.Orbs)
         local point = target and target:FindFirstChild("HumanoidRootPart")
@@ -8208,9 +8198,9 @@ local ok, failure = pcall(function()
         if current ~= rotationAura then rotationAura = current spent = {} end
         if pendingEquip then
             if d and HalloweenRules.Equipped(d, pendingEquip.Aura) then
-                pendingEquip = nil equipSettled = now + 0.3 attr("InventoryReserved", false) attr("EquipStatus", "Equipped")
+                pendingEquip = nil attr("EquipBusyUntil",0) equipSettled = now + 0.3 attr("InventoryReserved", false) attr("EquipStatus", "Equipped")
             elseif pendingEquip.Failed or now >= pendingEquip.Deadline then
-                unavailable[pendingEquip.Aura.Id] = now + 8 pendingEquip = nil attr("InventoryReserved", false)
+                unavailable[pendingEquip.Aura.Id] = now + 8 pendingEquip = nil attr("EquipBusyUntil",0) attr("InventoryReserved", false)
                 attr("EquipStatus", "Skipping unavailable aura")
             end
         end
@@ -8262,7 +8252,7 @@ local ok, failure = pcall(function()
             StableFor = now-stableSince, Distance = point and root and (point.Position-root.Position).Magnitude or 0, WalkSpeed = humanoid and humanoid.WalkSpeed or 16, Recovering = bridge:GetAttribute("Recovering") == true,
             TargetHealth = hp, Height = point and root and math.abs(point.Position.Y-root.Position.Y) or 0 }
         local desired = HalloweenRules.Next(owned, cooldowns, blocked, unavailable, now, turnStarted and current or nil, spent, scores, learned, context)
-        if not desired and #owned == 1 and next(spent) then spent = {} desired = HalloweenRules.Next(owned, cooldowns, blocked, unavailable, now, current, spent, scores, learned, context) end
+        if not desired and next(spent) then spent = {} desired = HalloweenRules.Next(owned, cooldowns, blocked, unavailable, now, current, spent, scores, learned, context) end
         if desired then
             local setting = tonumber(bridge:GetAttribute("EngageDistance")) or 12
             desired.Range = math.min(desired.Range, math.max(setting, desired.Preferred and desired.Preferred+5 or setting))
@@ -8271,9 +8261,11 @@ local ok, failure = pcall(function()
         attr("DataReady", d ~= nil) attr("HasOwnedAura", #owned > 0) attr("CurrentAura", current or "None")
         attr("AttackRange", pendingCast and pendingCast.Range or desired and desired.Range or 25)
         attr("ScoreSource", desired and desired.Source or "Cooling down")
+        attr("NoReadySkills",desired==nil)
         attr("NextAura", desired and desired.Aura.Label or "Cooling down") attr("NextSkill", desired and desired.Skill or "None")
         if pendingCast and (not humanoid or humanoid.Health <= 0 or pendingCast.Character ~= nil and pendingCast.Character ~= character) then pendingCast=nil castUntil=0 spent={} turnStarted=false end
         attr("Casting", pendingCast ~= nil)
+        attr("WorkerBusyUntil",pendingCast and math.max(castUntil,pendingCast.Started and not pendingCast.Confirmed and pendingCast.Deadline or 0) or 0)
         if target~=approachTarget or not valid then attr("NeedsApproach",false) approachTarget=target end
         local active = d and humanoid and humanoid.Health > 0 and root and not root.Anchored and valid
             and bridge:GetAttribute("FarmEnabled") == true and bridge:GetAttribute("Permit") == true
@@ -8281,6 +8273,7 @@ local ok, failure = pcall(function()
             if not HalloweenRules.Equipped(d, desired.Aura) then
                 turnStarted = true
                 pendingEquip = { Aura = desired.Aura, Deadline = now + 4 }
+                attr("EquipBusyUntil",now+4)
                 attr("InventoryReserved", true) attr("EquipStatus", "Equipping " .. desired.Aura.Label)
                 if desired.Aura.Special then storage.EquipSpecial.send(tostring(desired.Aura.Index))
                 else storage.Equip.send({ i = desired.Aura.Index, s = false }) end
@@ -8311,6 +8304,7 @@ local ok, failure = pcall(function()
                             end
                         end
                         pendingCast = { Character = character, Key = desired.Key, Skill = desired.Skill, Range = desired.Range, Preferred = desired.Preferred, Target = target, Before = hp, Solo = #players:GetPlayers() == 1, Animations = animations, AckDeadline = now+1.5, Deadline = now + math.clamp(desired.Lock+3,4,15) }
+                        attr("WorkerBusyUntil",castUntil)
                         requested += 1
                         packets.UseSkill.send({ SkillName = desired.Skill, LookVector = direction, MouseHit = CFrame.lookAt and CFrame.lookAt(aimPoint, aimPoint + direction) or CFrame.new(aimPoint) })
                         attr("RequestedCasts", requested) attr("LastSkill", desired.Aura.Label .. " / " .. desired.Skill)
@@ -8321,7 +8315,15 @@ local ok, failure = pcall(function()
                 end
             end
         end
-        task.wait(0.1)
+        end)
+        if frameOk then
+            frameErrors=0 attr("Error",nil)
+        else
+            frameErrors+=1 totalErrors+=1 attr("ActorErrors",totalErrors)
+            attr("Error",tostring(frameError)) attr("Permit",false)
+        end
+        if frameErrors>=8 then break end
+        task.wait(frameOk and 0.1 or math.min(3,0.25*2^math.min(frameErrors,4)))
     end
 end)
 elevate()
@@ -8458,7 +8460,9 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         params.FilterDescendantsInstances = { model, npcFolder, target }
         local forward=offset.Unit local side=Vector3.new(-forward.Z,0,forward.X)
         local fallback
-        for _,angle in ipairs({0,45,-45,90,-90,135,-135,180}) do
+        local angles={0,45,-45,90,-90,135,-135,180}
+        for index=1,#angles do
+            local angle=angles[(index-1+approachPhase)%#angles+1]
             local radians=math.rad(angle)
             local candidate=point.Position+(forward*math.cos(radians)+side*math.sin(radians))*distance
             local hit=workspace:Raycast(candidate+Vector3.new(0,10,0),Vector3.new(0,-60,0),params)
@@ -8525,6 +8529,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             AutoBounty = Config.HalloweenAutoBounty == true, Bounty = bounty.GetState(), CombatAlerts = Config.HalloweenCombatAlerts == true, CombatWebhook = reports.GetState(),
             OwnKills = bridge and bridge:GetAttribute("OwnKills") or 0, CastStatus = bridge and bridge:GetAttribute("CastStatus"),
             ESPTracked = esp.Tracked, ESPVisible = esp.Visible, PathStatus = routeReason,
+            Recoveries=recoveries, LastRecovery=lastRecovery, ActorRestarts=actorRestarts, ActorErrors=bridge and bridge:GetAttribute("ActorErrors") or 0,
             Tracked = count, Target = target and HalloweenRules.Label(target), MovementOwner = MovementCoordinator.GetState().Owner, Dodging = dodgeGoal ~= nil,
             CurrentAura = bridge and bridge:GetAttribute("CurrentAura"), NextAura = bridge and bridge:GetAttribute("NextAura"), NextSkill = bridge and bridge:GetAttribute("NextSkill"),
             OwnedAuras = bridge and bridge:GetAttribute("OwnedAuras"), OwnedCount = bridge and bridge:GetAttribute("OwnedCount"), RequestedCasts = bridge and bridge:GetAttribute("RequestedCasts"), ConfirmedCasts = bridge and bridge:GetAttribute("ConfirmedCasts"),
@@ -8581,21 +8586,42 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
     end
     local function step()
         local now = workspace:GetServerTimeNow()
+        local elapsed=math.clamp(os.clock()-lastStepAt,0,0.25) lastStepAt=os.clock()
+        if LocalPlayer.Character~=observedCharacter then
+            release() observedCharacter=LocalPlayer.Character
+            recovering,previousHP,recentDamage=false,nil,now
+            combatWatch=nil approachPhase,forceApproachUntil,directStalls=0,0,0
+            forcePathUntil,nextChase,combatHoldUntil,orbUnlockUntil=0,0,0,0
+            target,targetRoot=nil,nil nextChoice=0
+        end
         if os.clock() >= nextChoice then
             nextChoice = os.clock() + 0.35 attachNPCs()
             local _, _, root = character()
             if root and enabled() then
                 local chosen, point = choose(root)
-                if target ~= chosen then moveEpoch += 1 moving=false lastPosition=nil end target, targetRoot = chosen, point
+                if target ~= chosen then moveEpoch += 1 moving=false lastPosition=nil combatWatch=nil approachPhase,forceApproachUntil=0,0 end target, targetRoot = chosen, point
             else target, targetRoot = nil, nil end
             if targetValue then targetValue.Value = target end
         end
         local model, humanoid, root = character()
         local hasTarget = enabled() and root and target and targetRoot and targetRoot.Parent and HalloweenRules.Attackable(target, npcFolder)
-        if hasTarget then combatHoldUntil = os.clock() + 2 end
-        local pending = enabled() and root ~= nil and (hasTarget ~= nil and hasTarget ~= false or os.clock() < combatHoldUntil)
+        if hasTarget then
+            combatHoldUntil = os.clock() + 2
+            if target.HasTag and target:HasTag("orbMinion") then orbUnlockUntil=os.clock()+8 end
+        end
+        local unlocking=false
+        if lease and root and os.clock()<orbUnlockUntil then
+            for orb in pairs(orbs) do
+                local point=orb.Parent and orb:FindFirstChild("HumanoidRootPart")
+                if point and orb:GetAttribute("isLocked")==true and (point.Position-root.Position).Magnitude<120 then unlocking=true break end
+            end
+        end
+        local pending = enabled() and root ~= nil and (hasTarget ~= nil and hasTarget ~= false or os.clock() < combatHoldUntil or unlocking)
         attribute("CombatPending", pending == true)
         attribute("DemandUpdatedAt", now)
+        if MovementCoordinator.Wants("Merchant") or MovementCoordinator.GetState().Owner=="Merchant" then
+            release() status="Yielding to merchant" return
+        end
         if not enabled() or not target or not targetRoot or not targetRoot.Parent or not root then
             if not (pending and lease) and (lease or MovementCoordinator.Wants("Halloween")) then release() end
             attribute("Permit", false)
@@ -8604,7 +8630,12 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             return
         end
         local health = HalloweenRules.Health(target)
-        if health and health <= 0 then release() target, targetRoot = nil, nil return end
+        if health and health <= 0 then
+            attribute("Permit",false) moveEpoch+=1 moving=false
+            target,targetRoot=nil,nil nextChoice=0
+            if not pending then release() end
+            return
+        end
         if not bridge or bridge:GetAttribute("Stopped") == true or now - (bridge:GetAttribute("Heartbeat") or 0) > 2 or bridge:GetAttribute("DataReady") ~= true or bridge:GetAttribute("HasOwnedAura") ~= true then attribute("CombatPending", false) release() status = "Waiting for an owned combat aura" return end
         if MovementCoordinator.Wants("Merchant") or (MovementCoordinator.GetState().Owner == "Merchant") then release() status = "Yielding to merchant" return end
         if not lease then lease = MovementCoordinator.AcquirePriority("Halloween") if lease then leaseAt = os.clock() end end
@@ -8682,6 +8713,36 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         local range = tonumber(bridge:GetAttribute("AttackRange")) or 25
         local preferred = math.min(range*0.85,tonumber(bridge:GetAttribute("PreferredDistance")) or range*0.65)
         local distance = (targetRoot.Position - root.Position).Magnitude
+        if moving and pathTargetPosition and (targetRoot.Position-pathTargetPosition).Magnitude>10 then
+            moveEpoch+=1 moving=false nextChase=os.clock()+0.2
+            humanoid:MoveTo(root.Position) moveGoal=nil
+            lastPosition,lastProgressAt=root.Position,os.clock()
+            routeReason="Target moved; updating route"
+        end
+        local requested=tonumber(bridge:GetAttribute("RequestedCasts")) or 0
+        if not combatWatch or combatWatch.Target~=target then
+            combatWatch={Target=target,HP=health,Elapsed=0,Requested=requested,Failures=0}
+        elseif type(health)=="number" and type(combatWatch.HP)=="number" and health~=combatWatch.HP then
+            combatWatch.HP,combatWatch.Elapsed,combatWatch.Requested,combatWatch.Failures=health,0,requested,0
+        end
+        if distance<=range+3 then combatWatch.Elapsed+=elapsed end
+        -- Health progress is used only for recovery, never as personal damage credit.
+        if type(health)=="number" and combatWatch.Elapsed>=12 and requested-combatWatch.Requested>=2
+            and bridge:GetAttribute("Casting")~=true and bridge:GetAttribute("InventoryReserved")~=true
+            and bridge:GetAttribute("NoReadySkills")~=true then
+            combatWatch.Elapsed,combatWatch.Requested=0,requested combatWatch.Failures+=1
+            recoveries+=1 lastRecovery="No target damage; changing attack position"
+            approachPhase=(approachPhase+1)%8 forceApproachUntil=os.clock()+6
+            moveEpoch+=1 moving=false moveGoal=nil nextChase=0
+            lastPosition,lastProgressAt=root.Position,os.clock() directStalls,forcePathUntil=0,0
+            humanoid:MoveTo(root.Position)
+            routeReason=lastRecovery
+            if combatWatch.Failures>=3 then
+                unreachable[target]=os.clock()+12 combatHoldUntil=os.clock()+12
+                target,targetRoot=nil,nil attribute("Permit",false)
+                status="Temporarily skipping unresponsive target" return
+            end
+        end
         if bridge:GetAttribute("Casting") == true then
             if distance <= range then
                 if moving or moveGoal then moveEpoch += 1 moving=false moveGoal=nil humanoid:MoveTo(root.Position) end
@@ -8691,7 +8752,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         end
         -- Jumping in place is not route progress.
         if not lastPosition or Vector3.new(lastPosition.X-root.Position.X,0,lastPosition.Z-root.Position.Z).Magnitude > 0.6 then lastPosition,lastProgressAt=root.Position,os.clock() end
-        if distance <= preferred + 1.5 and bridge:GetAttribute("NeedsApproach") ~= true then
+        if distance <= preferred + 1.5 and bridge:GetAttribute("NeedsApproach") ~= true and os.clock()>=forceApproachUntil then
             if moving or moveGoal then moveEpoch += 1 moving=false moveGoal=nil humanoid:MoveTo(root.Position) end
             lastProgressAt=os.clock() moveGoal=nil
             status = "Attacking " .. HalloweenRules.Label(target)
@@ -8712,6 +8773,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             if direct and os.clock() >= forcePathUntil then
                 nextChase=os.clock()+0.4 moveDirect(humanoid,root,direct,false) status="Approaching "..HalloweenRules.Label(target) routeReason="Direct ground route" return
             end
+            pathTargetPosition=targetRoot.Position
             moving = true moveEpoch += 1 local token, serial, selected, deadline = epoch, moveEpoch, target, os.clock() + 25
             nextChase = os.clock() + 1 status = "Approaching " .. HalloweenRules.Label(target)
             task.spawn(function()
@@ -8770,8 +8832,38 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         local runner = ENV.run_on_actor or run_on_actor
         local actor = game:GetService("ReplicatedFirst"):FindFirstChild("ClientHandlers")
         if type(runner) ~= "function" or not actor then errorText = "Actor support unavailable" return end
-        local ok, failure = pcall(runner, actor, ACTOR_SOURCE)
-        if not ok then errorText = tostring(failure) end
+        local function launch()
+            actorStartingAt=os.clock()
+            bridge:SetAttribute("Stopped",false) bridge:SetAttribute("Active",true)
+            bridge:SetAttribute("Heartbeat",workspace:GetServerTimeNow())
+            bridge:SetAttribute("DataReady",false) bridge:SetAttribute("Error",nil)
+            updateSettings()
+            local ok,failure=pcall(runner,actor,ACTOR_SOURCE)
+            if not ok then errorText=tostring(failure) bridge:SetAttribute("Active",false) return false end
+            errorText=nil return true
+        end
+        local launched=launch()
+        local stopping=not launched
+        local restartAt=os.clock()+2
+        local backoff=2
+        while living and Alive and bridge.Parent do
+            task.wait(0.5)
+            local stale=workspace:GetServerTimeNow()-(bridge:GetAttribute("Heartbeat") or 0)>3
+            if not stopping and (bridge:GetAttribute("Stopped")==true or stale and os.clock()-actorStartingAt>4) then
+                stopping=true restartAt=os.clock()+backoff
+                bridge:SetAttribute("Active",false) release()
+                lastRecovery="Restarting unresponsive combat worker"
+            end
+            if stopping and bridge:GetAttribute("Stopped")==true and os.clock()>=restartAt
+                and workspace:GetServerTimeNow()>=math.max(tonumber(bridge:GetAttribute("WorkerBusyUntil")) or 0,tonumber(bridge:GetAttribute("EquipBusyUntil")) or 0) then
+                -- Start only after the previous worker acknowledged shutdown.
+                -- A hung worker must never overlap another packet sender.
+                if living and Alive then
+                    actorRestarts+=1 launched=launch() stopping=not launched
+                    backoff=math.min(30,backoff*2) restartAt=os.clock()+backoff
+                end
+            elseif not stopping and not stale and os.clock()-actorStartingAt>20 then backoff=2 end
+        end
     end)
     task.spawn(function()
         while living and Alive do
@@ -8962,7 +9054,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.34", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.35", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -9298,6 +9390,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.34")
+local loader, failure = loadstring(source, "BonesHub 3.35")
 if not loader then error(failure) end
 return loader()
