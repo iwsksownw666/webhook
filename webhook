@@ -1155,7 +1155,10 @@ end)()
 
 local Navigation = (function()
     local controller = {}
-    local state = { Status = "Idle", Commands = 0, Replans = 0, Bridges = 0 }
+    local state = { Status = "Idle", Commands = 0, Replans = 0, Bridges = 0, StepJumps = 0, Recoveries = 0, CornerGuards = 0, StepProbes = 0, SmoothedWaypoints = 0 }
+    local stepHumanoid, stepAt = nil, -math.huge
+    local probeHumanoid, probeAt, probeModel, probeRay = nil, -math.huge, nil, nil
+    local jumpHumanoid, jumpOrigin, jumpCount, jumpLast, jumpCooldown = nil, nil, 0, -math.huge, 0
     local function flat(vector)
         return Vector3.new(vector.X, 0, vector.Z)
     end
@@ -1178,6 +1181,139 @@ local Navigation = (function()
         state.Commands += 1
         state.Target = tostring(position)
     end
+    local function requestJump(humanoid,root,goal)
+        if root.Anchored or humanoid.FloorMaterial == Enum.Material.Air then return false end
+        if jumpHumanoid ~= humanoid or not jumpOrigin or flat(root.Position-jumpOrigin).Magnitude > 7
+            or root.Position.Y-jumpOrigin.Y>=1.5 and flat(root.Position-jumpOrigin).Magnitude>1.5 then
+            jumpHumanoid,jumpOrigin,jumpCount,jumpCooldown=humanoid,root.Position,0,0
+            state.JumpBlocked=false
+        end
+        if os.clock()<jumpCooldown or os.clock()-jumpLast<1.1 then return false end
+        if jumpCount>=2 then jumpCooldown=os.clock()+8 state.JumpBlocked=true return false end
+        jumpCount+=1 jumpLast=os.clock()
+        state.JumpAttempts=(state.JumpAttempts or 0)+1
+        humanoid.Jump=true
+        humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+        command(humanoid,goal)
+        return true
+    end
+    local function straight(a,b,c)
+        local incoming, outgoing = b-a, c-b
+        local first, second = flat(incoming), flat(outgoing)
+        if first.Magnitude < 0.1 or second.Magnitude < 0.1 then return false end
+        return first.Unit:Dot(second.Unit) > 0.9995
+            and math.abs(incoming.Y/first.Magnitude-outgoing.Y/second.Magnitude) < 0.05
+    end
+    local function compact(points)
+        local route = {}
+        for i, point in ipairs(points) do
+            local previous, following = points[i-1], points[i+1]
+            local jumping = point.Action == Enum.PathWaypointAction.Jump
+                or previous and previous.Action == Enum.PathWaypointAction.Jump
+                or following and following.Action == Enum.PathWaypointAction.Jump
+            if not previous or not following or jumping or not straight(previous.Position,point.Position,following.Position)
+                or not straight(route[#route].Position,point.Position,following.Position)
+                or (flat(point.Position-route[#route].Position)).Magnitude >= 12 then
+                route[#route+1] = { Position=point.Position, Action=point.Action, PathIndex=i }
+            else state.SmoothedWaypoints += 1 end
+        end
+        for i=2,#route-1 do
+            local point = route[i]
+            point.Straight = point.Action ~= Enum.PathWaypointAction.Jump and route[i+1].Action ~= Enum.PathWaypointAction.Jump
+                and straight(route[i-1].Position,point.Position,route[i+1].Position)
+        end
+        return route
+    end
+    local function clearCorridor(from, goal, ray, width)
+        local delta = goal - from
+        local horizontal = flat(delta)
+        if horizontal.Magnitude < 0.1 then return true end
+        local side = Vector3.new(-horizontal.Z, 0, horizontal.X).Unit * width
+        for _, shift in ipairs({ Vector3.new(0,0,0), side, side * -1 }) do
+            for _, up in ipairs({ 0, 1.5 }) do
+                if workspace:Raycast(from + shift + Vector3.new(0,up,0), delta, ray) then return false end
+            end
+        end
+        return true
+    end
+    local function escape(model, humanoid, root, destination, active, deadline)
+        if root.Anchored or humanoid.FloorMaterial == Enum.Material.Air then return false end
+        local height = clearance(model, humanoid, root)
+        local feet = root.Position - Vector3.new(0,height,0)
+        local ray = RaycastParams.new()
+        ray.FilterType = Enum.RaycastFilterType.Exclude
+        ray.FilterDescendantsInstances = { model }
+        ray.RespectCanCollide, ray.IgnoreWater = true, true
+        local forward = flat(destination-root.Position)
+        if forward.Magnitude < 0.1 then return false end
+        forward = forward.Unit
+        local side = Vector3.new(-forward.Z,0,forward.X)
+        local best, bestScore
+        -- Check both sides and the space behind us; do not choose an unchecked diagonal.
+        local checked = 0
+        for _, distance in ipairs({ 4, 7 }) do
+            for _, angle in ipairs({ 90, -90, 135, -135, 180, 45, -45 }) do
+                if not active() or root.Anchored or os.clock() >= deadline then return false end
+                checked += 1
+                if checked % 2 == 0 then task.wait(0.01) end
+                local radians = math.rad(angle)
+                local delta = (forward * math.cos(radians) + side * math.sin(radians)) * distance
+                local floor = workspace:Raycast(feet + delta + Vector3.new(0,3,0), Vector3.new(0,-5,0), ray)
+                if floor and floor.Normal.Y > 0.7 and math.abs(floor.Position.Y-feet.Y) <= 1.25 then
+                    local goal = floor.Position + Vector3.new(0,height,0)
+                    if clearCorridor(root.Position,goal,ray,1.1) then
+                        local supported = true
+                        for i=1,3 do
+                            local probe = feet + delta * (i/4)
+                            local support = workspace:Raycast(probe+Vector3.new(0,2,0),Vector3.new(0,-4,0),ray)
+                            if not support or support.Normal.Y < 0.7 or math.abs(support.Position.Y-feet.Y)>1.25 then supported=false break end
+                        end
+                        local score = flat(goal-destination).Magnitude + distance * 0.2
+                        if supported and (not bestScore or score < bestScore) then best,bestScore=goal,score end
+                    end
+                end
+            end
+        end
+        if not best or not active() then return false end
+        command(humanoid,best)
+        state.Status = "Moving clear of obstacle"
+        state.Recoveries += 1
+        local untilAt = math.min(deadline,os.clock()+1.25)
+        local start = root.Position
+        while active() and os.clock()<untilAt and not root.Anchored and flat(root.Position-best).Magnitude>0.9 do task.wait(0.05) end
+        if not active() or root.Anchored then return false end
+        command(humanoid,root.Position)
+        return flat(root.Position-start).Magnitude > 1
+    end
+    -- Non-yielding: shared by path following and combat's direct ground movement.
+    function controller.TryStep(model, humanoid, root, destination)
+        if root.Anchored or humanoid.Health <= 0 or humanoid.FloorMaterial == Enum.Material.Air then return false end
+        if stepHumanoid == humanoid and os.clock() - stepAt < 0.8 then return false end
+        if probeHumanoid == humanoid and os.clock() - probeAt < 0.2 then return false end
+        local offset = flat(destination - root.Position)
+        if offset.Magnitude < 0.75 then return false end
+        probeHumanoid, probeAt = humanoid, os.clock()
+        state.StepProbes += 1
+        if model ~= probeModel then
+            probeRay = RaycastParams.new()
+            probeRay.FilterType = Enum.RaycastFilterType.Exclude
+            probeRay.FilterDescendantsInstances = { model }
+            probeRay.RespectCanCollide, probeRay.IgnoreWater = true, true
+            probeModel = model
+        end
+        local ray = probeRay
+        local height = clearance(model, humanoid, root)
+        local feet = root.Position - Vector3.new(0, height, 0)
+        local forward = offset.Unit * math.min(3, offset.Magnitude)
+        local low = workspace:Raycast(feet + Vector3.new(0, 0.5, 0), forward, ray)
+        if not low or workspace:Raycast(feet + Vector3.new(0, 4.5, 0), forward, ray) then return false end
+        local landing = workspace:Raycast(feet + forward + Vector3.new(0, 4.5, 0), Vector3.new(0, -7, 0), ray)
+        if not landing or landing.Normal.Y < 0.65 or landing.Position.Y < feet.Y - 1.5 or landing.Position.Y > feet.Y + 3.5 then return false end
+        if not requestJump(humanoid,root,destination) then return false end
+        stepHumanoid, stepAt = humanoid, os.clock()
+        state.StepJumps += 1
+        return true
+    end
     local function follow(points, destination, valid, radius, deadline, blocked)
         local model, humanoid, root = character()
         if not model then return false, "Character unavailable" end
@@ -1187,11 +1323,16 @@ local Navigation = (function()
         end
         local function arrived()
             local delta = root.Position - destination
-            return flat(delta).Magnitude <= radius and math.abs(delta.Y) <= math.max(5, height + 1)
+            return humanoid.FloorMaterial~=Enum.Material.Air and flat(delta).Magnitude <= radius and delta.Y >= -0.75 and delta.Y <= math.max(5, height + 1)
         end
         local index, sentIndex, sentAt = 1, 0, 0
-        local progressAt, previous, jumped = os.clock(), root.Position, false
+        local lastFlatPosition=root.Position
+        local progressAt, jumped, jumpAt = os.clock(), false, 0
+        local bestDistance = math.huge
         local recovered = false
+        local surfaces={}
+        local nearSurfaces={}
+        local clearIndex, clearAt, clearFrom, clearValue = 0, -math.huge, nil, false
         local ray = RaycastParams.new()
         ray.FilterType = Enum.RaycastFilterType.Exclude
         ray.FilterDescendantsInstances = { model }
@@ -1201,16 +1342,34 @@ local Navigation = (function()
             if root.Anchored then return false, "Character locked by active fishing session" end
             if arrived() then return true end
             if index > #points then break end
-            if blocked and blocked(index) then return false, "Path obstructed" end
             local waypoint = points[index]
+            if blocked and blocked(type(waypoint) == "table" and waypoint.PathIndex or index) then return false, "Path obstructed" end
             local position = waypoint.Position
             local offset = flat(position - root.Position)
+            -- Navmesh height can sit above the actual collision floor (notably
+            -- the shop ledge). Resolve once, rather than trying to climb air.
+            if not (type(waypoint)=="table" and waypoint.Bridge) then
+                if surfaces[index]==nil then
+                    local floor=workspace:Raycast(position+Vector3.new(0,1.5,0),Vector3.new(0,-7,0),ray)
+                    surfaces[index]=floor and floor.Normal.Y>.65 and math.abs(floor.Position.Y-position.Y)<=4 and floor.Position or false
+                end
+                if surfaces[index] then position=surfaces[index] end
+                if offset.Magnitude<2.5 and position.Y<root.Position.Y-height-2 and not nearSurfaces[index] then
+                    nearSurfaces[index]=true
+                    local floor=workspace:Raycast(Vector3.new(position.X,root.Position.Y+1,position.Z),Vector3.new(0,-height-5,0),ray)
+                    if floor and floor.Normal.Y>.65 and math.abs(floor.Position.Y-(root.Position.Y-height))<=1.25 then
+                        surfaces[index]=floor.Position position=floor.Position
+                    end
+                end
+            end
             local final = index == #points
             local jump = waypoint.Action == Enum.PathWaypointAction.Jump
-            local tolerance = final and radius or math.clamp(humanoid.WalkSpeed * 0.18, 2, 3.5)
+            local onBridge = type(waypoint) == "table" and waypoint.Bridge
+            local tolerance = final and radius or onBridge and 1.5 or 1.1
             local vertical = math.abs(root.Position.Y - position.Y - height)
+            local above = root.Position.Y-position.Y-height
             local passed = false
-            if index > 1 and not jump and not final then
+            if index > 1 and not jump and not final and above>=-2 and above<=6 then
                 local segment = flat(position - points[index - 1].Position)
                 if segment.Magnitude > 0.1 then
                     local axis = segment.Unit
@@ -1219,45 +1378,54 @@ local Navigation = (function()
                 end
             end
             if jump and offset.Magnitude <= 4 and not jumped and humanoid.FloorMaterial ~= Enum.Material.Air then
-                humanoid.Jump = true
-                humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-                jumped = true
+                local landing = position
+                if requestJump(humanoid,root,landing) then
+                    jumped, jumpAt = true, os.clock()
+                    sentIndex,sentAt=index,os.clock()
+                end
             end
-            if not final and (offset.Magnitude <= tolerance or passed) and vertical <= 4 then
-                index += 1
-                jumped, recovered = false, false
+            -- Keep moving through a jump link in the air; waiting to land at
+            -- the lip before advancing can strand the character below it.
+            if jump and jumped and not final and os.clock()-jumpAt>=0.1
+                and (humanoid.FloorMaterial == Enum.Material.Air or offset.Magnitude<=1.1) then
+                index+=1 jumped,recovered=false,false bestDistance,progressAt=math.huge,os.clock()
                 continue
             end
-            if index ~= sentIndex or os.clock() - sentAt >= 6 then
+            local canAdvance = offset.Magnitude <= tolerance or passed
+            if canAdvance and not final and not onBridge and points[index+1].Action~=Enum.PathWaypointAction.Jump
+                and not (type(waypoint) == "table" and waypoint.Straight) then
+                local nextGoal = points[index+1].Position + Vector3.new(0,height,0)
+                if clearIndex ~= index or os.clock()-clearAt >= 0.2 or not clearFrom or flat(root.Position-clearFrom).Magnitude>0.75 then
+                    clearIndex, clearAt, clearFrom = index, os.clock(), root.Position
+                    clearValue = clearCorridor(root.Position,nextGoal,ray,0.9)
+                    if not clearValue and offset.Magnitude > 0.65 then state.CornerGuards += 1 end
+                end
+                if not clearValue then
+                    canAdvance = offset.Magnitude <= 0.65
+                end
+            end
+            if not final and canAdvance and (above>=-2 and above<=6 or index==1 and offset.Magnitude<=1.5)
+                and (not jump or jumped and os.clock() - jumpAt >= 0.2 and humanoid.FloorMaterial ~= Enum.Material.Air) then
+                index += 1
+                jumped, recovered = false, false
+                bestDistance, progressAt = math.huge, os.clock()
+                continue
+            end
+            if index ~= sentIndex or os.clock() - sentAt >= 0.75 then
                 command(humanoid, position)
                 sentIndex, sentAt = index, os.clock()
             end
-            if (flat(root.Position - previous)).Magnitude >= 0.35 then
-                previous, progressAt = root.Position, os.clock()
+            local distance = flat(root.Position-position).Magnitude
+            if distance < bestDistance - 0.25 and flat(root.Position-lastFlatPosition).Magnitude>=0.25 then
+                bestDistance = distance
+                progressAt = os.clock()
+                lastFlatPosition=root.Position
             end
+            if not (type(waypoint) == "table" and waypoint.Bridge) then controller.TryStep(model, humanoid, root, position) end
             local stalled = os.clock() - progressAt
-            if stalled > 1.25 and not jumped and humanoid.FloorMaterial ~= Enum.Material.Air then
-                humanoid.Jump = true
-                humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-                jumped = true
-            end
-            if stalled > 2 and not recovered and offset.Magnitude > 0.5 and humanoid.FloorMaterial ~= Enum.Material.Air then
+            if stalled > 1.75 and not recovered and offset.Magnitude > 0.5 and humanoid.FloorMaterial ~= Enum.Material.Air and not onBridge then
                 recovered = true
-                local axis = offset.Unit
-                local feet = root.Position - Vector3.new(0, height, 0)
-                local obstacle = workspace:Raycast(feet + Vector3.new(0, 0.8, 0), axis * math.min(3.5, offset.Magnitude), ray)
-                local back = root.Position - axis * 4
-                local floor = workspace:Raycast(back + Vector3.new(0, 3, 0), Vector3.new(0, -height - 8, 0), ray)
-                if obstacle and floor and floor.Normal.Y > 0.65 and math.abs(floor.Position.Y - feet.Y) < 3 then
-                    command(humanoid, floor.Position)
-                    local untilAt = os.clock() + 0.3
-                    while active() and os.clock() < untilAt do task.wait(0.05) end
-                    if not active() then return false, "Stopped or character changed" end
-                    command(humanoid, position)
-                    humanoid.Jump = true
-                    humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-                    previous, progressAt = root.Position, os.clock()
-                end
+                if escape(model,humanoid,root,destination,active,deadline) then return false,"Obstacle cleared; recomputing route" end
             end
             if stalled > 3 then return false, "Route made no progress" end
             if type(waypoint) == "table" and waypoint.Bridge and root.Position.Y < position.Y - 4 then return false, "Fell below bridge" end
@@ -1266,40 +1434,47 @@ local Navigation = (function()
         if not active() then return false, "Stopped or character changed" end
         return arrived(), "Route timed out"
     end
-    function controller.PathWalk(destination, valid, radius)
+    local function pathWalk(destination, valid, radius)
         radius = math.clamp(tonumber(radius) or 3, 0.75, 9)
         local model, humanoid, root = character()
         if not model then return false, "Character unavailable" end
         if root.Anchored then return false, "Character locked by active fishing session" end
-        local deadline, failure = os.clock() + 90, "Route unavailable"
-        local function active() return valid() and LocalPlayer.Character == model and humanoid.Health > 0 end
+        local deadline, failure = os.clock() + 45, "Route unavailable"
+        local function active() return Alive and valid() and LocalPlayer.Character == model and humanoid.Health > 0 end
         for attempt = 1, 4 do
             if not active() then return false, "Stopped or character changed" end
             local offset = root.Position - destination
-            if flat(offset).Magnitude <= radius and math.abs(offset.Y) <= 5 then return true end
+            if humanoid.FloorMaterial~=Enum.Material.Air and flat(offset).Magnitude <= radius and offset.Y >= -0.75 and offset.Y <= math.max(5, clearance(model, humanoid, root) + 1) then state.Status="Arrived" return true end
             state.Status = "Computing route"
-            local path = game:GetService("PathfindingService"):CreatePath({ AgentRadius = 1.6, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 6 })
+            local path = game:GetService("PathfindingService"):CreatePath({ AgentRadius = attempt == 1 and 2 or 2.5, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 3 })
             local done, computed = false, false
             local startPosition = root.Position
-            task.spawn(function()
+            local worker = task.spawn(function()
                 computed = pcall(function() path:ComputeAsync(startPosition, destination) end)
                 done = true
             end)
             local untilAt = math.min(deadline, os.clock() + 7)
             while active() and not done and os.clock() < untilAt do task.wait(0.05) end
-            if not active() then return false, "Stopped or character changed" end
-            if not done then return false, "Path computation timed out" end
+            if not active() or not done then
+                if worker and not done then pcall(task.cancel, worker) end
+                if not active() then return false, "Stopped or character changed" end
+                state.Status = "Path computation timed out"
+                return false, state.Status
+            end
             if computed and path.Status == Enum.PathStatus.Success then
                 local blockedAt, current = math.huge, 1
                 local connection = path.Blocked:Connect(function(value)
                     if value >= current then blockedAt = math.min(blockedAt, value) end
                 end)
                 state.Status = "Walking"
-                local ok, reason = follow(path:GetWaypoints(), destination, active, radius, deadline, function(index)
-                    current = index
-                    return blockedAt <= index
+                local ran, ok, reason = pcall(function()
+                    return follow(compact(path:GetWaypoints()), destination, active, radius, deadline, function(index)
+                        current = index
+                        return blockedAt <= index
+                    end)
                 end)
                 connection:Disconnect()
+                if not ran then ok, reason = false, tostring(ok) end
                 if ok then
                     command(humanoid, root.Position)
                     humanoid.Jump = false
@@ -1316,6 +1491,65 @@ local Navigation = (function()
         if active() then command(humanoid, root.Position) end
         state.Status = failure
         return false, failure
+    end
+    function controller.PathWalk(destination, valid, radius)
+        local model,humanoid,root=character()
+        if not root then return false,"Character unavailable" end
+        if (root.Position-destination).Magnitude>1000 then
+            local portals=game:GetService("CollectionService"):GetTagged("StellaPortal")
+            local entry,exit,best
+            for _,portal in ipairs(portals) do
+                local position=portal:IsA("Model") and portal:GetPivot().Position or portal:IsA("BasePart") and portal.Position
+                if position then
+                    if (position-root.Position).Magnitude<1000 and (position-destination).Magnitude>1000 then
+                        local distance=(position-root.Position).Magnitude
+                        if not best or distance<best then entry,best=position,distance end
+                    end
+                    if (position-destination).Magnitude<1000 then exit=position end
+                end
+            end
+            if not entry or not exit then
+                state.Status="Region portal unavailable; waiting for map streaming"
+                return false,state.Status
+            end
+            local streamed=false
+            task.spawn(function()
+                pcall(function() LocalPlayer:RequestStreamAroundAsync(entry,2) end)
+                streamed=true
+            end)
+            local streamUntil=os.clock()+2.5
+            while not streamed and Alive and valid() and os.clock()<streamUntil do task.wait(0.05) end
+            if not Alive or not valid() then return false,"Stopped" end
+            state.Status="Walking to region portal"
+            local reached,reason=pathWalk(entry,function()
+                return valid() and LocalPlayer.Character==model and humanoid.Health>0 and (root.Position-entry).Magnitude<1000
+            end,2)
+            -- A touch can transfer the character before the approach returns.
+            if not valid() or LocalPlayer.Character~=model or humanoid.Health<=0 then return false,"Stopped or character changed" end
+            if (root.Position-exit).Magnitude>300 then
+                if not reached then return false,reason end
+                state.Status="Crossing region portal"
+                local deadline=os.clock()+6
+                while Alive and valid() and LocalPlayer.Character==model and humanoid.Health>0 and not root.Anchored
+                    and os.clock()<deadline and (root.Position-exit).Magnitude>300 do
+                    command(humanoid,entry)
+                    task.wait(0.2)
+                end
+                if not valid() or LocalPlayer.Character~=model or humanoid.Health<=0 then return false,"Stopped or character changed" end
+                if (root.Position-exit).Magnitude>300 then
+                    if not root.Anchored then command(humanoid,root.Position) end
+                    state.Status="Region portal did not activate; shortcut may be locked"
+                    return false,state.Status
+                end
+            end
+            state.RegionTransfers=(state.RegionTransfers or 0)+1
+            state.Status="Waiting for region transfer to settle"
+            local settleUntil=os.clock()+4
+            while Alive and valid() and LocalPlayer.Character==model and humanoid.Health>0 and root.Anchored and os.clock()<settleUntil do task.wait(0.05) end
+            if not Alive or not valid() or LocalPlayer.Character~=model or humanoid.Health<=0 then return false,"Stopped or character changed" end
+            if root.Anchored then return false,"Region transfer still holds character; retry after release" end
+        end
+        return pathWalk(destination,valid,radius)
     end
     local function bridgePoints()
         local map = workspace:FindFirstChild("Map")
@@ -1340,6 +1574,7 @@ local Navigation = (function()
         local model, humanoid, root = character()
         if not root then return false, "Character unavailable" end
         local start = root.Position
+        if (start-destination).Magnitude>1000 then return controller.PathWalk(destination,valid,radius) end
         local east = start.X < 417 and destination.X > 420 and start.X > 0 and start.X < 650
         local west = start.X > 362 and start.X < 650 and destination.X > 0 and destination.X < 360
         if east or west then
@@ -4015,12 +4250,19 @@ end)()
         navigation = true
         local character = LocalPlayer.Character
         movingHumanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local deadline = os.clock() + 45
         local ran, ok, err = pcall(walkTo, position, function()
-            return valid(token) and MovementCoordinator.IsOwner(owner, movementTicket) and not MovementCoordinator.Wants("Merchant") and not combatPending()
+            return os.clock() < deadline and valid(token) and LocalPlayer.Character == character
+                and MovementCoordinator.IsOwner(owner, movementTicket) and not MovementCoordinator.Wants("Merchant") and not combatPending()
         end, reach or 3)
+        if movingHumanoid and LocalPlayer.Character == character and MovementCoordinator.IsOwner(owner, movementTicket) then
+            local root = rootPart()
+            if root and not root.Anchored then movingHumanoid:MoveTo(root.Position) end
+        end
         navigation, movingHumanoid = false, nil
         if not ran then return false, tostring(ok) end
         if not valid(token) then return false, "Stopped" end
+        if not ok and os.clock() >= deadline then return false, "Fishing route timed out; choosing another approach" end
         return ok, err
     end
 
@@ -7165,6 +7407,7 @@ local Halloween = (function()
     local previousHP, recentDamage = nil, 0
     local combatHoldUntil = 0
     local unreachable, lastProgressAt, lastPosition, routeReason = {}, 0, nil, nil
+    local forcePathUntil, directStalls = 0, 0
     local ACTOR_SOURCE = [======[
 if setthreadidentity then setthreadidentity(8) end
 local rs, core = game:GetService("ReplicatedStorage"), game:GetService("CoreGui")
@@ -7714,6 +7957,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         return Vector3.new(point.X, hit.Position.Y + 3, point.Z)
     end
     local function moveDirect(humanoid, root, goal, urgent)
+        if Navigation.TryStep then Navigation.TryStep(LocalPlayer.Character, humanoid, root, goal) end
         if urgent or not moveGoal or (moveGoal - goal).Magnitude > 2.5 or os.clock() - lastCommand > 1.5 then
             if os.clock() - lastCommand >= 0.15 or urgent then
                 humanoid:MoveTo(goal) lastCommand, moveGoal = os.clock(), goal
@@ -7926,20 +8170,27 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
                 status = "Using " .. tostring(bridge:GetAttribute("LastSkill") or "skill") return
             end
         end
-        if not lastPosition or (lastPosition-root.Position).Magnitude > 0.6 then lastPosition,lastProgressAt=root.Position,os.clock() end
+        -- Jumping in place is not route progress.
+        if not lastPosition or Vector3.new(lastPosition.X-root.Position.X,0,lastPosition.Z-root.Position.Z).Magnitude > 0.6 then lastPosition,lastProgressAt=root.Position,os.clock() end
         if distance <= preferred + 1.5 then
             if moving or moveGoal then moveEpoch += 1 moving=false moveGoal=nil humanoid:MoveTo(root.Position) end
             lastProgressAt=os.clock() moveGoal=nil
             status = "Attacking " .. HalloweenRules.Label(target)
-        elseif os.clock()-lastProgressAt > 3.5 then
+        elseif not moving and os.clock()-lastProgressAt > 2 then
             moveEpoch += 1 moving=false nextChase=os.clock()+0.4
-            humanoid.Jump=true unreachable[target]=os.clock()+3 routeReason="No movement progress; selecting another approach"
-            target,targetRoot=nil,nil lastPosition=nil attribute("Permit",false) status="Finding another route"
+            humanoid:MoveTo(root.Position) moveGoal=nil
+            directStalls += 1 forcePathUntil=os.clock()+12
+            lastProgressAt=os.clock() lastPosition=root.Position
+            routeReason="Direct route stalled; switching to pathfinding" status="Finding another route"
+            if directStalls >= 2 then
+                unreachable[target]=os.clock()+5 target,targetRoot=nil,nil lastPosition=nil directStalls=0
+                attribute("Permit",false)
+            end
         elseif not moving and os.clock() >= nextChase then
             local goal,direct = chaseGoal(model,root,targetRoot,range)
             if not goal then unreachable[target]=os.clock()+3 target,targetRoot=nil,nil attribute("Permit",false) status="Finding reachable ground" return end
             if HalloweenRules.Danger(goal, warnings, Config.HalloweenDodgeMargin, now) > 0 then attribute("Permit", false) status = "Waiting for attack area to clear" return end
-            if direct then
+            if direct and os.clock() >= forcePathUntil then
                 nextChase=os.clock()+0.4 moveDirect(humanoid,root,direct,false) status="Approaching "..HalloweenRules.Label(target) routeReason="Direct ground route" return
             end
             moving = true moveEpoch += 1 local token, serial, selected, deadline = epoch, moveEpoch, target, os.clock() + 8
@@ -7950,10 +8201,11 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
                 end, 3)
                 if moveEpoch == serial then
                     moving = false
+                    lastPosition,lastProgressAt=root.Position,os.clock()
                     if not worked or not reached then
                         routeReason=tostring(not worked and reached or reason or "Route incomplete")
                         if target==selected then unreachable[selected]=os.clock()+2 target,targetRoot=nil,nil attribute("Permit",false) end
-                    else routeReason="Arrived" end
+                    else routeReason="Arrived" directStalls=0 end
                 end
             end)
         end
@@ -8171,7 +8423,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.25", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.29", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -8503,6 +8755,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.25")
+local loader, failure = loadstring(source, "BonesHub 3.29")
 if not loader then error(failure) end
 return loader()
