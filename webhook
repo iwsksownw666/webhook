@@ -6568,7 +6568,8 @@ local MerchantRules = (function()
         local products = {}
         for id, product in pairs(info.product_list or {}) do
             if type(product) == "table" and type(product.ProductName) == "string" and table.find(selections or {}, product.ProductName) then
-                local stock = product.StockLeft
+                local stock = product.QuantityLeft
+                if stock == nil then stock = product.StockLeft end
                 if stock == "Unlimited" or type(stock) == "number" and stock > 0 then
                     products[#products + 1] = { Id = tostring(id), Name = product.ProductName, Index = tonumber(product.Index) or math.huge }
                 end
@@ -6934,7 +6935,8 @@ local MerchantRules = (function()
         local products = {}
         for id, product in pairs(info.product_list or {}) do
             if type(product) == "table" and type(product.ProductName) == "string" and table.find(selections or {}, product.ProductName) then
-                local stock = product.StockLeft
+                local stock = product.QuantityLeft
+                if stock == nil then stock = product.StockLeft end
                 if stock == "Unlimited" or type(stock) == "number" and stock > 0 then
                     products[#products + 1] = { Id = tostring(id), Name = product.ProductName, Index = tonumber(product.Index) or math.huge }
                 end
@@ -8650,7 +8652,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.31", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.32", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -8985,6 +8987,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.31")
+local loader, failure = loadstring(source, "BonesHub 3.32")
 if not loader then error(failure) end
 return loader()
