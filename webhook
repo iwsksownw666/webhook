@@ -156,7 +156,7 @@ local function preloadPacketNamespaces()
 end
 task.spawn(preloadPacketNamespaces)
 local DEFAULT_CONFIG = {
-    HalloweenAutoFarm = false, HalloweenAutoOrbs = false, HalloweenAutoBounty = false, HalloweenESP = false, HalloweenAutoDodge = true, HalloweenAutoEquip = true, HalloweenRotateAuras = true,
+    HalloweenAutoFarm = false, HalloweenAutoOrbs = false, HalloweenAutoBounty = false, HalloweenCombatAlerts = false, HalloweenCombatWebhook = "", HalloweenESP = false, HalloweenAutoDodge = true, HalloweenAutoEquip = true, HalloweenRotateAuras = true,
     HalloweenAuras = { "Archangel", "Pixelation", "Starscourge_Radiant" }, HalloweenTargets = { "Boss", "Orb", "Minion" }, HalloweenDamageScores = {},
     HalloweenSearchDistance = 1000, HalloweenESPDistance = 5000, HalloweenDodgeMargin = 4, HalloweenRetreatHP = 20, HalloweenEngageDistance = 12,
     AutoMerchant = false, MerchantSelections = { Mari = {}, Jester = {}, Rin = {} }, MerchantCatalogs = { Mari = {}, Jester = {}, Rin = {} }, MerchantPurchases = {}, MerchantAmounts = { Mari = {}, Jester = {}, Rin = {} },
@@ -7204,7 +7204,10 @@ local HalloweenRules = (function()
     local utility = { ["Time Stop"] = true, ["Heal Pad"] = true, ["OpenSwap"] = true, ["Form Shift"] = true, x = true,
         Lightspeed = true, ["Blooming Lotus"] = true, Reverberation = true, ["Yield My Flesh..."] = true, ["Sweet Confession"] = true }
     local estimates = {
-        Luminosity = { Brilliance = { Damage = 70, Lock = 4.6, Range = 26, Preferred = 17, AimLead = 0.5 }, ["Blinding Witness"] = { Damage = 35, Lock = 2.8, Range = 14, Preferred = 10, AimLead = 0.2 }, Prism = { Damage = 25, Lock = 2.6, Range = 24, Preferred = 16 }, Annihilate = { Damage = 15, Lock = 1, Range = 9, Preferred = 6, AimLead = 0.15 } },
+        -- Current wiki: Brilliance 4.3s/front pillar; Witness 2.5s/radial slash;
+        -- Prism 2.3s/self-area rain; Annihilate 0.7s/front slash. Native client
+        -- visual timings corroborate the long startup. Hitbox sizes are conservative estimates.
+        Luminosity = { Brilliance = { Damage = 70, Lock = 5.2, Range = 22, Preferred = 15, AimLead = 4.3, Stable = 0.8, MaxSpeed = 1.2, Windup = 4.3, Width = 5, MaxHeight = 5 }, ["Blinding Witness"] = { Damage = 35, Lock = 3, Range = 14, Preferred = 9, AimLead = 2.5, Windup = 2.5, AimMode = "SelfArea", MaxHeight = 5 }, Prism = { Damage = 25, Lock = 2.8, Range = 18, Preferred = 11, AimLead = 2.3, Windup = 2.3, AimMode = "SelfArea", MaxHeight = 5 }, Annihilate = { Damage = 15, Lock = 1.2, Range = 9, Preferred = 6, AimLead = 0.7, Windup = 0.7, Width = 4, MaxHeight = 4 } },
         BLOODLUST = { Bloodthirst = { Damage = 35, Lock = 1.5, Range = 26, Preferred = 18 } },
         Chromatic_Genesis = { ["Divine Impact"] = { Damage = 38, Lock = 2.2, Range = 50, Preferred = 28 } },
         Frigid = { ["Frozen Spikes"] = { Damage = 15, Lock = 2, Range = 50, Preferred = 28, AimLead = 0.4 } },
@@ -7229,7 +7232,8 @@ local HalloweenRules = (function()
                         if type(skill) == "string" and not utility[skill] and not profile.Skills[skill] then
                             local melee = skill:lower():find("slash", 1, true) or skill:lower():find("sword", 1, true) or skill:lower():find("bite", 1, true)
                             local estimate = estimates[id] and estimates[id][skill]
-                            profile.Skills[skill] = { Range = estimate and estimate.Range or (melee and 12 or 28), Preferred = estimate and estimate.Preferred, AimLead = estimate and estimate.AimLead, Lock = estimate and estimate.Lock or 1.5, Damage = estimate and estimate.Damage or 1, Unmeasured = estimate == nil }
+                            profile.Skills[skill] = { Range = estimate and estimate.Range or (melee and 12 or 28), Preferred = estimate and estimate.Preferred, AimLead = estimate and estimate.AimLead, Lock = estimate and estimate.Lock or 1.5, Damage = estimate and estimate.Damage or 1, Unmeasured = estimate == nil,
+                                Stable = estimate and estimate.Stable, MaxSpeed = estimate and estimate.MaxSpeed, Windup = estimate and estimate.Windup, Width = estimate and estimate.Width, MaxHeight = estimate and estimate.MaxHeight, AimMode = estimate and estimate.AimMode }
                         end
                     end
                     if next(profile.Skills) then rules.Profiles[id] = profile end
@@ -7321,13 +7325,15 @@ local HalloweenRules = (function()
                         if context then
                             if name == "Prism" then effectiveness = 0.35 end
                             if name == "Mania!" then effectiveness = 0.35 end
-                            if name == "Brilliance" and (context.Speed > 4 or context.Health < 65 or context.Pressure > 1) then effectiveness = 0 end
+                            if name == "Brilliance" and ((context.Speed or 0) > (skill.MaxSpeed or 1.2) or context.Health < 75 or context.Pressure > 1 or (context.StableFor or 0) < (skill.Stable or 0.8)) then effectiveness = 0 end
                             if skill.Lock >= 4 and context.Health < 45 then effectiveness = 0 end
                             if name == "Rush" and (context.Health < 65 or context.Pressure > 1) then effectiveness = 0 end
                             if context.Recovering and (skill.Preferred or math.min(12,skill.Range*0.65)) < 16 then effectiveness = 0 end
                         end
                         local approach = context and math.max(0,(context.Distance or 0)-skill.Range*0.8)/math.max(8,context.WalkSpeed or 16) or 0
-                        if effectiveness > 0 then ready[#ready + 1] = { Aura = aura, Skill = name, Key = key, Range = skill.Range, Preferred = skill.Preferred, AimLead = skill.AimLead, Lock = skill.Lock, Score = context and damage * effectiveness / (skill.Lock + approach + (aura.Id == current and 0.1 or 0.65)) or damage,
+                        if effectiveness > 0 then ready[#ready + 1] = { Aura = aura, Skill = name, Key = key, Range = skill.Range, Preferred = skill.Preferred, AimLead = skill.AimLead, Lock = skill.Lock,
+                            Stable = skill.Stable, MaxSpeed = skill.MaxSpeed, Windup = skill.Windup, Width = skill.Width, MaxHeight = skill.MaxHeight, AimMode = skill.AimMode,
+                            Score = context and damage * effectiveness / (skill.Lock + approach + (aura.Id == current and 0.1 or 0.65)) or damage,
                             Source = sample and "Solo damage estimate" or skill.Unmeasured and "Unmeasured fallback" or "Wiki estimate" } end
                         total += damage
                     end
@@ -7353,6 +7359,24 @@ local HalloweenRules = (function()
         local predicted = position + flatVelocity * (lead or 0)
         local direction = Vector3.new(predicted.X-origin.X,0,predicted.Z-origin.Z)
         return direction.Magnitude > 0.01 and direction.Unit or nil, predicted
+    end
+    function rules.CastWindow(skill, origin, position, velocity, stableFor, clear)
+        if not clear then return false, "Attack line obstructed" end
+        if math.abs(position.Y-origin.Y) > (skill.MaxHeight or 9) then return false, "Waiting for matching elevation" end
+        local speed = Vector3.new(velocity.X,0,velocity.Z).Magnitude
+        if skill.MaxSpeed and speed > skill.MaxSpeed or skill.Stable and stableFor < skill.Stable then return false, "Waiting for stable target" end
+        local lead=skill.AimLead
+        if skill.AimMode=="SelfArea" then
+            local offset=Vector3.new(position.X-origin.X,0,position.Z-origin.Z)
+            if offset.Magnitude>0.01 then
+                local toward=-(offset.X*velocity.X+offset.Z*velocity.Z)/offset.Magnitude
+                if toward>0 then lead=math.min(lead or 0,math.max(0,(offset.Magnitude-6)/toward)) end
+            end
+        end
+        local _, predicted = rules.Aim(origin,position,velocity,lead)
+        if (predicted-origin).Magnitude > skill.Range then return false, "Predicted impact out of range" end
+        if skill.Windup and skill.Width and speed * skill.Windup > skill.Width then return false, "Target may leave attack area" end
+        return true
     end
     function rules.CanSampleDamage(player, players, target)
         if #players:GetPlayers() ~= 1 or not target or target:GetAttribute("gotAttackedBy") ~= player.UserId then return false end
@@ -7606,6 +7630,97 @@ function HalloweenBounty.Create(options)
     return self
 end
 
+local HalloweenReports = {}
+function HalloweenReports.Create(options)
+    local self = {}
+    local living, sequence, sent, nextSend, generation = true, 0, 0, 0, 0
+    local queued, pending, lastError = nil, nil, nil
+    local spawn, cancel, clock = options.Spawn or task.spawn, options.Cancel or task.cancel, options.Clock or os.clock
+    local function destination() return options.Destination() end
+    local function valid() return living and options.Enabled() and options.ValidURL(destination()) end
+    local function lines(map)
+        local result = {}
+        for name, amount in pairs(map or {}) do
+            if type(name)=="string" and type(amount)=="number" and amount>0 and amount<math.huge then
+                result[#result+1]=name:gsub("[\r\n`*_~|]", ""):sub(1,100) .. " ×" .. tostring(math.floor(amount))
+            end
+        end
+        table.sort(result)
+        return table.concat(result,"\n"):sub(1,1000)
+    end
+    local function enqueue(report)
+        if queued and queued.Destination~=destination() then queued=nil end
+        if not queued then queued={ Sequence=report.Sequence,Kills=0,Orbs=0,TotalKills=0,Enemies={},Rewards={},Destination=destination() } end
+        queued.Kills += tonumber(report.Kills) or 0 queued.Orbs += tonumber(report.Orbs) or 0 queued.TotalKills=math.max(queued.TotalKills,tonumber(report.TotalKills) or 0)
+        for _,key in ipairs({"Enemies","Rewards"}) do
+            for name,count in pairs(report[key] or {}) do if type(name)=="string" and type(count)=="number" and count>0 and count<math.huge then queued[key][name]=(queued[key][name] or 0)+count end end
+        end
+    end
+    function self.Payload(report)
+        local rewards = lines(report.Rewards)
+        return { allowed_mentions = { parse = {} }, embeds = { {
+            title = "Halloween Combat Report", color = 0xFFD737,
+            fields = {
+                { name = "Player", value = tostring(options.Player()):sub(1,150), inline = false },
+                { name = "Your defeats (last hit)", value = tostring(report.Kills or 0), inline = true },
+                { name = "Session defeats", value = tostring(report.TotalKills or 0), inline = true },
+                { name = "Orbs broken (last hit)", value = tostring(report.Orbs or 0), inline = true },
+                { name = "Enemies", value = lines(report.Enemies) ~= "" and lines(report.Enemies) or "None", inline = false },
+                { name = "Rewards received", value = rewards ~= "" and rewards or "No gains confirmed", inline = false },
+            },
+            footer = { text = "Bones Hub | Rewards show inventory gains near credited defeats" },
+        } } }
+    end
+    function self.Accept(report)
+        if type(report)~="table" or type(report.Sequence)~="number" or report.Sequence<=sequence then return end
+        sequence=report.Sequence
+        if not valid() then return end
+        enqueue(report)
+    end
+    function self.Reset()
+        generation+=1 queued=nil
+        if pending and pending.Thread then pcall(cancel,pending.Thread) end
+        pending=nil
+    end
+    function self.GetState() return { Sent=sent,Error=lastError,Pending=pending~=nil or queued~=nil,Configured=options.ValidURL(destination()) } end
+    function self.Destroy() living=false self.Reset() end
+    function self.Step()
+        if not living then return end
+        if not valid() then self.Reset() return end
+        local now=clock()
+        if queued and queued.Destination~=destination() then queued=nil end
+        if pending then
+            if pending.Destination~=destination() or pending.Generation~=generation then self.Reset() return end
+            if not pending.Done then
+                if now-pending.Started<12 then return end
+                if pending.Thread then pcall(cancel,pending.Thread) end
+                pending=nil lastError="Combat webhook timed out; delivery unconfirmed" nextSend=now+5 return
+            end
+            local operation=pending
+            local result=operation.Result pending=nil nextSend=now+3
+            local response=result[1] and result[2]
+            local status=type(response)=="table" and tonumber(response.StatusCode or response.Status)
+            if status and status>=200 and status<300 then sent+=1 lastError=nil
+            elseif status==429 then
+                enqueue(operation.Report)
+                nextSend=now+30 lastError="Combat webhook rate limited; queued"
+            else lastError=status and "Combat webhook HTTP "..tostring(status) or "Combat webhook delivery unconfirmed" end
+        end
+        if queued and now>=nextSend then
+            local report=queued queued=nil
+            local operation={Started=now,Generation=generation,Destination=destination(),Report=report}
+            pending=operation
+            operation.Thread=spawn(function()
+                operation.Result=table.pack(pcall(function() return options.Request({
+                    Url=operation.Destination,Method="POST",Headers={["Content-Type"]="application/json"},Body=options.Encode(self.Payload(report)),Timeout=10,
+                }) end))
+                operation.Done=true
+            end)
+        end
+    end
+    return self
+end
+
 local Halloween = (function()
     local controller = {}
     local core = game:GetService("CoreGui")
@@ -7621,6 +7736,15 @@ local Halloween = (function()
     local unreachable, lastProgressAt, lastPosition, routeReason = {}, 0, nil, nil
     local forcePathUntil, directStalls = 0, 0
     local bounty = HalloweenBounty.Create({ Alive = function() return living and Alive end, Enabled = function() return Config.HalloweenAutoBounty == true end })
+    local reports = HalloweenReports.Create({
+        Enabled = function() return Config.HalloweenCombatAlerts == true end,
+        Destination = function() local custom = trim(Config.HalloweenCombatWebhook or "") return custom ~= "" and custom or trim(Config.Webhook or "") end,
+        ValidURL = function(url) return isWebhook(url) end,
+        Player = function() return tostring(LocalPlayer.DisplayName) .. " (@" .. tostring(LocalPlayer.Name) .. ")" end,
+        Encode = function(value) return HttpService:JSONEncode(value) end,
+        Request = function(options) if type(requestFunction) ~= "function" then error("HTTP request API unavailable") end return requestFunction(options) end,
+    })
+    local lastReport
     local ACTOR_SOURCE = [======[
 if setthreadidentity then setthreadidentity(8) end
 local rs, core = game:GetService("ReplicatedStorage"), game:GetService("CoreGui")
@@ -7645,7 +7769,10 @@ local HalloweenRules = (function()
     local utility = { ["Time Stop"] = true, ["Heal Pad"] = true, ["OpenSwap"] = true, ["Form Shift"] = true, x = true,
         Lightspeed = true, ["Blooming Lotus"] = true, Reverberation = true, ["Yield My Flesh..."] = true, ["Sweet Confession"] = true }
     local estimates = {
-        Luminosity = { Brilliance = { Damage = 70, Lock = 4.6, Range = 26, Preferred = 17, AimLead = 0.5 }, ["Blinding Witness"] = { Damage = 35, Lock = 2.8, Range = 14, Preferred = 10, AimLead = 0.2 }, Prism = { Damage = 25, Lock = 2.6, Range = 24, Preferred = 16 }, Annihilate = { Damage = 15, Lock = 1, Range = 9, Preferred = 6, AimLead = 0.15 } },
+        -- Current wiki: Brilliance 4.3s/front pillar; Witness 2.5s/radial slash;
+        -- Prism 2.3s/self-area rain; Annihilate 0.7s/front slash. Native client
+        -- visual timings corroborate the long startup. Hitbox sizes are conservative estimates.
+        Luminosity = { Brilliance = { Damage = 70, Lock = 5.2, Range = 22, Preferred = 15, AimLead = 4.3, Stable = 0.8, MaxSpeed = 1.2, Windup = 4.3, Width = 5, MaxHeight = 5 }, ["Blinding Witness"] = { Damage = 35, Lock = 3, Range = 14, Preferred = 9, AimLead = 2.5, Windup = 2.5, AimMode = "SelfArea", MaxHeight = 5 }, Prism = { Damage = 25, Lock = 2.8, Range = 18, Preferred = 11, AimLead = 2.3, Windup = 2.3, AimMode = "SelfArea", MaxHeight = 5 }, Annihilate = { Damage = 15, Lock = 1.2, Range = 9, Preferred = 6, AimLead = 0.7, Windup = 0.7, Width = 4, MaxHeight = 4 } },
         BLOODLUST = { Bloodthirst = { Damage = 35, Lock = 1.5, Range = 26, Preferred = 18 } },
         Chromatic_Genesis = { ["Divine Impact"] = { Damage = 38, Lock = 2.2, Range = 50, Preferred = 28 } },
         Frigid = { ["Frozen Spikes"] = { Damage = 15, Lock = 2, Range = 50, Preferred = 28, AimLead = 0.4 } },
@@ -7670,7 +7797,8 @@ local HalloweenRules = (function()
                         if type(skill) == "string" and not utility[skill] and not profile.Skills[skill] then
                             local melee = skill:lower():find("slash", 1, true) or skill:lower():find("sword", 1, true) or skill:lower():find("bite", 1, true)
                             local estimate = estimates[id] and estimates[id][skill]
-                            profile.Skills[skill] = { Range = estimate and estimate.Range or (melee and 12 or 28), Preferred = estimate and estimate.Preferred, AimLead = estimate and estimate.AimLead, Lock = estimate and estimate.Lock or 1.5, Damage = estimate and estimate.Damage or 1, Unmeasured = estimate == nil }
+                            profile.Skills[skill] = { Range = estimate and estimate.Range or (melee and 12 or 28), Preferred = estimate and estimate.Preferred, AimLead = estimate and estimate.AimLead, Lock = estimate and estimate.Lock or 1.5, Damage = estimate and estimate.Damage or 1, Unmeasured = estimate == nil,
+                                Stable = estimate and estimate.Stable, MaxSpeed = estimate and estimate.MaxSpeed, Windup = estimate and estimate.Windup, Width = estimate and estimate.Width, MaxHeight = estimate and estimate.MaxHeight, AimMode = estimate and estimate.AimMode }
                         end
                     end
                     if next(profile.Skills) then rules.Profiles[id] = profile end
@@ -7762,13 +7890,15 @@ local HalloweenRules = (function()
                         if context then
                             if name == "Prism" then effectiveness = 0.35 end
                             if name == "Mania!" then effectiveness = 0.35 end
-                            if name == "Brilliance" and (context.Speed > 4 or context.Health < 65 or context.Pressure > 1) then effectiveness = 0 end
+                            if name == "Brilliance" and ((context.Speed or 0) > (skill.MaxSpeed or 1.2) or context.Health < 75 or context.Pressure > 1 or (context.StableFor or 0) < (skill.Stable or 0.8)) then effectiveness = 0 end
                             if skill.Lock >= 4 and context.Health < 45 then effectiveness = 0 end
                             if name == "Rush" and (context.Health < 65 or context.Pressure > 1) then effectiveness = 0 end
                             if context.Recovering and (skill.Preferred or math.min(12,skill.Range*0.65)) < 16 then effectiveness = 0 end
                         end
                         local approach = context and math.max(0,(context.Distance or 0)-skill.Range*0.8)/math.max(8,context.WalkSpeed or 16) or 0
-                        if effectiveness > 0 then ready[#ready + 1] = { Aura = aura, Skill = name, Key = key, Range = skill.Range, Preferred = skill.Preferred, AimLead = skill.AimLead, Lock = skill.Lock, Score = context and damage * effectiveness / (skill.Lock + approach + (aura.Id == current and 0.1 or 0.65)) or damage,
+                        if effectiveness > 0 then ready[#ready + 1] = { Aura = aura, Skill = name, Key = key, Range = skill.Range, Preferred = skill.Preferred, AimLead = skill.AimLead, Lock = skill.Lock,
+                            Stable = skill.Stable, MaxSpeed = skill.MaxSpeed, Windup = skill.Windup, Width = skill.Width, MaxHeight = skill.MaxHeight, AimMode = skill.AimMode,
+                            Score = context and damage * effectiveness / (skill.Lock + approach + (aura.Id == current and 0.1 or 0.65)) or damage,
                             Source = sample and "Solo damage estimate" or skill.Unmeasured and "Unmeasured fallback" or "Wiki estimate" } end
                         total += damage
                     end
@@ -7794,6 +7924,24 @@ local HalloweenRules = (function()
         local predicted = position + flatVelocity * (lead or 0)
         local direction = Vector3.new(predicted.X-origin.X,0,predicted.Z-origin.Z)
         return direction.Magnitude > 0.01 and direction.Unit or nil, predicted
+    end
+    function rules.CastWindow(skill, origin, position, velocity, stableFor, clear)
+        if not clear then return false, "Attack line obstructed" end
+        if math.abs(position.Y-origin.Y) > (skill.MaxHeight or 9) then return false, "Waiting for matching elevation" end
+        local speed = Vector3.new(velocity.X,0,velocity.Z).Magnitude
+        if skill.MaxSpeed and speed > skill.MaxSpeed or skill.Stable and stableFor < skill.Stable then return false, "Waiting for stable target" end
+        local lead=skill.AimLead
+        if skill.AimMode=="SelfArea" then
+            local offset=Vector3.new(position.X-origin.X,0,position.Z-origin.Z)
+            if offset.Magnitude>0.01 then
+                local toward=-(offset.X*velocity.X+offset.Z*velocity.Z)/offset.Magnitude
+                if toward>0 then lead=math.min(lead or 0,math.max(0,(offset.Magnitude-6)/toward)) end
+            end
+        end
+        local _, predicted = rules.Aim(origin,position,velocity,lead)
+        if (predicted-origin).Magnitude > skill.Range then return false, "Predicted impact out of range" end
+        if skill.Windup and skill.Width and speed * skill.Windup > skill.Width then return false, "Target may leave attack area" end
+        return true
     end
     function rules.CanSampleDamage(player, players, target)
         if #players:GetPlayers() ~= 1 or not target or target:GetAttribute("gotAttackedBy") ~= player.UserId then return false end
@@ -7855,10 +8003,75 @@ local HalloweenRules = (function()
     return rules
 end)()
 
+local HalloweenCombatLog = {}
+function HalloweenCombatLog.Create(userId, clock)
+    local self = {}
+    local tracked = setmetatable({}, { __mode = "k" })
+    local total, totalOrbs, sequence = 0, 0, 0
+    local kills, orbs, names, rewards = 0, 0, {}, {}
+    local baseline, recent, lastEvent, rewardUntil = nil, {}, 0, 0
+    local function collect(gain)
+        for name, count in pairs(gain) do rewards[name] = (rewards[name] or 0) + count end
+    end
+    function self.Observe(id, hp, attacker, kind, label)
+        if type(hp) ~= "number" then return end
+        local prior = tracked[id]
+        if not prior then tracked[id] = { HP = hp } return end
+        local before = prior.HP prior.HP = hp
+        if prior.Counted or before <= 0 or hp > 0 then return end
+        prior.Counted = true
+        -- This replicated field identifies the latest damage owner. Do not credit
+        -- disappearance, an earlier hit, or another player's final hit.
+        if userId == nil or attacker == nil or tostring(attacker) ~= tostring(userId) then return end
+        if kind == "Orb" then orbs += 1 totalOrbs += 1 else kills += 1 total += 1 end
+        local name = tostring(label or kind):sub(1,120)
+        names[name] = (names[name] or 0) + 1
+        local now = clock()
+        if kills + orbs == 1 then
+            for _, sample in ipairs(recent) do if now-sample.At <= 0.5 then collect(sample.Gain) end end
+        end
+        table.clear(recent) lastEvent, rewardUntil = now, now+3
+    end
+    function self.Sample(data, busy)
+        if type(data) ~= "table" then baseline = nil return end
+        local current = { Coins = tonumber(data.Coins) or 0 }
+        for name, entry in pairs(data.Inventory or {}) do
+            local amount = tonumber(type(entry) == "table" and entry.Amount or entry)
+            if type(name) == "string" and amount and amount == amount and amount < math.huge then current[name] = amount end
+        end
+        local now, gain = clock(), {}
+        if baseline and not busy then
+            for name, value in pairs(current) do
+                local delta = value - (baseline[name] or 0)
+                if delta > 0 then gain[name] = delta end
+            end
+            if next(gain) then
+                if kills + orbs > 0 and now <= rewardUntil then collect(gain) lastEvent = now
+                else recent[#recent+1] = {At=now,Gain=gain} end
+            end
+        end
+        if busy then table.clear(recent) end
+        while recent[1] and now-recent[1].At > 0.5 do table.remove(recent,1) end
+        baseline = current
+    end
+    function self.TakeReady()
+        if kills + orbs == 0 or clock()-lastEvent < 3 then return end
+        sequence += 1
+        local report = { Sequence = sequence, Kills = kills, Orbs = orbs, TotalKills = total, TotalOrbs = totalOrbs, Enemies = names, Rewards = rewards }
+        kills, orbs, names, rewards = 0, 0, {}, {}
+        return report
+    end
+    function self.GetState() return { Kills = total, Orbs = totalOrbs, PendingKills = kills } end
+    return self
+end
+
 local listeners, cooldowns, blocked, unavailable = {}, {}, {}, {}
 local owned, pendingEquip, pendingCast, current = {}, nil, nil, nil
 local rotationAura, spent, learned, turnStarted = nil, {}, {}, false
 local requested, confirmed, nextInventory, castUntil, equipSettled = 0, 0, 0, 0, 0
+local motionTarget, motionPosition, motionAt, stableSince = nil, nil, 0, 0
+local combatLog = HalloweenCombatLog.Create(player.UserId, function() return workspace:GetServerTimeNow() end)
+local watched, deathConnections, pendingDeaths = setmetatable({}, { __mode = "k" }), {}, {}
 local function elevate() if setthreadidentity then setthreadidentity(8) end end
 local function alive() elevate() return bridge.Parent ~= nil and bridge:GetAttribute("Active") == true end
 local function attr(k, v) elevate() if bridge.Parent and bridge:GetAttribute(k) ~= v then bridge:SetAttribute(k, v) end end
@@ -7904,6 +8117,27 @@ local ok, failure = pcall(function()
         end
         return true
     end
+    local function rewardBusy()
+        if not inventoryFree() or bridge:GetAttribute("BountyClaimBusy") == true then return true end
+        local fishing = core:FindFirstChild("BonesHubFishingBridge")
+        return fishing and fishing:GetAttribute("SellAuthorized") == true
+    end
+    local function observe(model)
+        local health = HalloweenRules.Health(model)
+        combatLog.Observe(model,health,model:GetAttribute("gotAttackedBy"),HalloweenRules.Kind(model),HalloweenRules.Label(model))
+    end
+    local function watch(model)
+        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        if watched[model] == (humanoid or true) then return end
+        if deathConnections[model] then deathConnections[model]:Disconnect() end
+        watched[model] = humanoid or true observe(model)
+        local signal = humanoid and humanoid.HealthChanged or model:GetAttributeChangedSignal("Health")
+        deathConnections[model] = signal:Connect(function()
+            elevate()
+            local hp = HalloweenRules.Health(model)
+            if hp and hp <= 0 then pendingDeaths[model] = workspace:GetServerTimeNow()+0.25 else observe(model) end
+        end)
+    end
     bind(packets.SetSkill, function(reply)
         local id = HalloweenRules.Profile(reply.AuraName)
         local ending = tonumber(reply.End)
@@ -7933,6 +8167,14 @@ local ok, failure = pcall(function()
         local holder = bridge:FindFirstChild("Target")
         local target = holder and holder.Value
         local folder = workspace:FindFirstChild("NPCs")
+        if folder then for _, model in ipairs(folder:GetChildren()) do if model:IsA("Model") then watch(model) end end end
+        for model, at in pairs(pendingDeaths) do if now >= at then observe(model) pendingDeaths[model] = nil end end
+        for model, connection in pairs(deathConnections) do if not model.Parent then connection:Disconnect() deathConnections[model] = nil end end
+        combatLog.Sample(d,rewardBusy())
+        local report = combatLog.TakeReady()
+        if report then attr("CombatReport",http:JSONEncode(report)) end
+        local combatStats = combatLog.GetState()
+        attr("OwnKills",combatStats.Kills) attr("OwnOrbs",combatStats.Orbs)
         local point = target and target:FindFirstChild("HumanoidRootPart")
         local hp = target and HalloweenRules.Health(target)
         local valid = point and HalloweenRules.Attackable(target, folder)
@@ -7963,13 +8205,8 @@ local ok, failure = pcall(function()
             end
         end
         if pendingCast and #players:GetPlayers() ~= 1 then pendingCast.Solo = false end
-        if pendingCast and root and pendingCast.Target.Parent and bridge:GetAttribute("Permit") == true then
-            local followPoint=pendingCast.Target:FindFirstChild("HumanoidRootPart")
-            if followPoint and CFrame.lookAt then
-                local direction=HalloweenRules.Aim(root.Position,followPoint.Position,followPoint.AssemblyLinearVelocity or Vector3.new(0,0,0),0.15)
-                if direction then root.CFrame=CFrame.lookAt(root.Position,root.Position+direction) end
-            end
-        end
+        -- UseSkill submits one LookVector/MouseHit snapshot. Rotating afterward
+        -- cannot update that packet and used to contradict the committed aim.
         if pendingCast and pendingCast.Started and now < pendingCast.Deadline then
             local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
             if animator then
@@ -7997,10 +8234,16 @@ local ok, failure = pcall(function()
         local scores = {}
         pcall(function() scores = http:JSONDecode(bridge:GetAttribute("DamageScores") or "{}") end)
         local velocity = point and point.AssemblyLinearVelocity or Vector3.new(0,0,0)
+        if point and target == motionTarget and motionPosition and now > motionAt then
+            local measured = (point.Position-motionPosition)/(now-motionAt)
+            if Vector3.new(measured.X,0,measured.Z).Magnitude > Vector3.new(velocity.X,0,velocity.Z).Magnitude then velocity = measured end
+        else stableSince = now end
+        if Vector3.new(velocity.X,0,velocity.Z).Magnitude > 1.2 then stableSince = now end
+        motionTarget, motionPosition, motionAt = target, point and point.Position, now
         local context = { Speed = Vector3.new(velocity.X,0,velocity.Z).Magnitude, Health = humanoid and humanoid.Health / math.max(1,humanoid.MaxHealth) * 100 or 0, Pressure = tonumber(bridge:GetAttribute("CloseEnemies")) or 0,
-            Distance = point and root and (point.Position-root.Position).Magnitude or 0, WalkSpeed = humanoid and humanoid.WalkSpeed or 16, Recovering = bridge:GetAttribute("Recovering") == true }
+            StableFor = now-stableSince, Distance = point and root and (point.Position-root.Position).Magnitude or 0, WalkSpeed = humanoid and humanoid.WalkSpeed or 16, Recovering = bridge:GetAttribute("Recovering") == true }
         local desired = HalloweenRules.Next(owned, cooldowns, blocked, unavailable, now, turnStarted and current or nil, spent, scores, learned, context)
-        if not desired and #owned == 1 and next(spent) then spent = {} desired = HalloweenRules.Next(owned, cooldowns, blocked, unavailable, now, current, spent, scores, learned) end
+        if not desired and #owned == 1 and next(spent) then spent = {} desired = HalloweenRules.Next(owned, cooldowns, blocked, unavailable, now, current, spent, scores, learned, context) end
         if desired then
             local setting = tonumber(bridge:GetAttribute("EngageDistance")) or 12
             desired.Range = math.min(desired.Range, math.max(setting, desired.Preferred and desired.Preferred+5 or setting))
@@ -8028,7 +8271,13 @@ local ok, failure = pcall(function()
                 local entry = loaded and type(skills) == "table" and skills[desired.Skill]
                 if entry and not skillUI:GetDisabled(desired.Skill) then
                     local direction, aimPoint = HalloweenRules.Aim(root.Position, point.Position, velocity, desired.AimLead)
+                    local params = RaycastParams.new() params.FilterType = Enum.RaycastFilterType.Exclude params.RespectCanCollide = true
+                    params.FilterDescendantsInstances = { character, folder }
+                    local obstructed = workspace:Raycast(root.Position,aimPoint-root.Position,params)
+                    local canCast, reason = HalloweenRules.CastWindow(desired,root.Position,point.Position,velocity,now-stableSince,obstructed == nil)
+                    if not canCast then blocked[desired.Key] = now+0.6 attr("CastStatus",reason) direction = nil end
                     if direction then
+                        attr("CastStatus","Committed aim / " .. desired.Skill)
                         if CFrame.lookAt then root.CFrame = CFrame.lookAt(root.Position, Vector3.new(root.Position.X + direction.X, root.Position.Y, root.Position.Z + direction.Z)) end
                         blocked[desired.Key] = now + 12 castUntil = now + desired.Lock
                         turnStarted = true spent[desired.Key] = true
@@ -8058,6 +8307,7 @@ if not ok then attr("Error", tostring(failure)) end
 for _, b in ipairs(listeners) do
     pcall(function() local list = b.Packet.getListeners() local i = table.find(list, b.Callback) if i then table.remove(list, i) end end)
 end
+for _, connection in pairs(deathConnections) do connection:Disconnect() end
 attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
 
 ]======]
@@ -8202,17 +8452,23 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         attribute("EngageDistance", Config.HalloweenEngageDistance or 12)
     end
     function controller.SetEnabled(feature, value)
-        local key = ({ Farm = "HalloweenAutoFarm", Orbs = "HalloweenAutoOrbs", Bounty = "HalloweenAutoBounty", ESP = "HalloweenESP", Dodge = "HalloweenAutoDodge", Equip = "HalloweenAutoEquip", Rotate = "HalloweenRotateAuras" })[feature]
+        local key = ({ Farm = "HalloweenAutoFarm", Orbs = "HalloweenAutoOrbs", Bounty = "HalloweenAutoBounty", Alerts = "HalloweenCombatAlerts", ESP = "HalloweenESP", Dodge = "HalloweenAutoDodge", Equip = "HalloweenAutoEquip", Rotate = "HalloweenRotateAuras" })[feature]
         if not key then return false end
         value = value == true Config[key] = value
         if (feature == "Farm" or feature == "Orbs") and value then Config.HalloweenAutoEquip, Config.HalloweenRotateAuras = true, true end
         if feature == "Farm" or feature == "Orbs" then epoch += 1 release() nextChoice=0 target, targetRoot = nil, nil if targetValue then targetValue.Value = nil end end
         if feature == "ESP" and not value then HalloweenESP.Clear() end
         if feature == "Bounty" then bounty.Invalidate() bounty.Step() end
+        if feature == "Alerts" then reports.Reset() end
         if not syncing and toggles[feature] and type(toggles[feature].Set) == "function" then
             syncing = true pcall(toggles[feature].Set, toggles[feature], value) syncing = false
         end
         updateSettings() saveConfig() return value
+    end
+    function controller.SetWebhook(value)
+        local url = trim(value or "")
+        if url ~= "" and not isWebhook(url) then return false end
+        Config.HalloweenCombatWebhook = url reports.Reset() saveConfig() return true
     end
     function controller.SetNumber(key, value)
         local limits = { HalloweenSearchDistance = { 1000, 30, 5000 }, HalloweenESPDistance = { 5000, 100, 15000 }, HalloweenDodgeMargin = { 4, 1, 12 }, HalloweenRetreatHP = { 20, 5, 70 }, HalloweenEngageDistance = { 12, 6, 60 } }
@@ -8232,7 +8488,8 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         local count = 0 for _ in pairs(records) do count += 1 end
         local esp = HalloweenESP.GetState()
         return { Enabled = enabled(), AutoOrbs = Config.HalloweenAutoOrbs == true, ESP = Config.HalloweenESP, Dodge = Config.HalloweenAutoDodge, Status = status, Error = errorText or (bridge and bridge:GetAttribute("Error")),
-            AutoBounty = Config.HalloweenAutoBounty == true, Bounty = bounty.GetState(),
+            AutoBounty = Config.HalloweenAutoBounty == true, Bounty = bounty.GetState(), CombatAlerts = Config.HalloweenCombatAlerts == true, CombatWebhook = reports.GetState(),
+            OwnKills = bridge and bridge:GetAttribute("OwnKills") or 0, CastStatus = bridge and bridge:GetAttribute("CastStatus"),
             ESPTracked = esp.Tracked, ESPVisible = esp.Visible, PathStatus = routeReason,
             Tracked = count, Target = target and HalloweenRules.Label(target), MovementOwner = MovementCoordinator.GetState().Owner, Dodging = dodgeGoal ~= nil,
             CurrentAura = bridge and bridge:GetAttribute("CurrentAura"), NextAura = bridge and bridge:GetAttribute("NextAura"), NextSkill = bridge and bridge:GetAttribute("NextSkill"),
@@ -8252,6 +8509,11 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         toggles.Bounty = UI:AddToggle(page, "Auto Claim Bounty Hunt", Config.HalloweenAutoBounty == true, function(value) if not syncing then controller.SetEnabled("Bounty", value) end end)
         rows = UI:AddMetricRow(page, { { Label = "Bounty Hunt", Value = "Disabled" } })
         metrics["Bounty Hunt"] = rows[1]
+        toggles.Alerts = UI:AddToggle(page, "Combat Reward Webhook", Config.HalloweenCombatAlerts == true, function(value) if not syncing then controller.SetEnabled("Alerts",value) end end)
+        local webhook = UI:AddInput(page,"Combat Webhook URL","Optional - uses Discord Webhook URL when empty",controller.SetWebhook)
+        webhook:Set(Config.HalloweenCombatWebhook or "")
+        rows = UI:AddMetricRow(page, { { Label = "Your Defeats", Value = "0" }, { Label = "Combat Alerts", Value = "Disabled" } })
+        metrics["Your Defeats"], metrics["Combat Alerts"] = rows[1], rows[2]
         UI:AddDivider(page, "Combat Options")
         local targetControl = UI:AddMultiSelect(page, "Target Types (Boss First)", { "Boss", "Orb", "Minion" }, function(map)
             if syncing then return end
@@ -8276,6 +8538,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
     function controller.Destroy()
         living, epoch = false, epoch + 1 release()
         bounty.Destroy()
+        reports.Destroy()
         attribute("CombatPending", false)
         if bridge and bridge.Parent then bridge:SetAttribute("Active", false) end
         HalloweenESP.Clear()
@@ -8434,9 +8697,18 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         while living and Alive do
             local ok = pcall(bounty.Step)
             if not ok then bounty.Invalidate() end
+            attribute("BountyClaimBusy",bounty.GetState().InFlight == true)
+            local encoded = bridge and bridge:GetAttribute("CombatReport")
+            if encoded and encoded ~= lastReport then
+                lastReport = encoded
+                local decoded, report = pcall(HttpService.JSONDecode,HttpService,encoded)
+                if decoded then reports.Accept(report) end
+            end
+            reports.Step()
             task.wait(0.25)
         end
         bounty.Destroy()
+        reports.Destroy()
     end)
     trackTag("NpcTelegraph", telegraphs) trackTag("NpcMeteor", meteors) attachNPCs()
     connections[#connections + 1] = game:GetService("RunService").RenderStepped:Connect(function()
@@ -8475,6 +8747,8 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
                 local values = { ["Combat Status"] = errorText or status, Target = state.Target or "None", ["Combat Auras"] = tostring(state.OwnedCount or 0) .. " owned combat auras",
                     ["Current Aura"] = state.CurrentAura or "None", ["Next Skill"] = (state.NextAura or "Waiting") .. " / " .. (state.NextSkill or "None"),
                     ["Bounty Hunt"] = state.Bounty.Status .. " / " .. tostring(state.Bounty.Claimed) .. " claimed",
+                    ["Your Defeats"] = tostring(state.OwnKills) .. " last hits",
+                    ["Combat Alerts"] = not state.CombatAlerts and "Disabled" or state.CombatWebhook.Error or not state.CombatWebhook.Configured and "Set webhook URL" or tostring(state.CombatWebhook.Sent) .. " delivered",
                     ["Confirmed Casts"] = tostring(state.ConfirmedCasts or 0), ["Dodge Status"] = dodgeGoal and "Dodging" or Config.HalloweenAutoDodge and "Watching attack warnings" or "Disabled" }
                 for key, value in pairs(values) do local row = metrics[key] if row and row.ValueLabel and row.ValueLabel.Parent then row.ValueLabel.Text = value end end
             end
@@ -8652,7 +8926,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.32", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.33", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -8865,6 +9139,7 @@ function API.GetHalloweenState() return Halloween.GetState() end
 function API.SetHalloweenNumber(key, value) return Halloween.SetNumber(key, value) end
 function API.SelectHalloweenAuras(values) return Halloween.SelectAuras(values) end
 function API.SetHalloweenDamage(name, value) return Halloween.SetDamage(name, value) end
+function API.SetHalloweenWebhook(value) return Halloween.SetWebhook(value) end
 function API.SetAutomationEnabled(feature, value) return Automation.SetEnabled(feature, value) end
 function API.SelectAutomation(feature, values) return Automation.Select(feature, values) end
 function API.GetScriptCompatibilityState() return ScriptCompatibility.GetState() end
@@ -8987,6 +9262,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.32")
+local loader, failure = loadstring(source, "BonesHub 3.33")
 if not loader then error(failure) end
 return loader()
