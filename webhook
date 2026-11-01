@@ -7184,6 +7184,19 @@ end)()
 local HalloweenRules = (function()
     local rules = {}
     rules.Profiles = {
+        -- Skill names verified against the native RarityDB/AuraSkillClient.
+        -- Wiki damage/windup; reach is a conservative estimate, not a server hitbox.
+        PYTHIOS = { Label = "Pythios", Priority = 6, PreferredAura = true, Skills = {
+            ["Crimson Sky"] = { Range = 24, Preferred = 20, Lock = 7.2, Damage = 60, AimLead = 3.1, Windup = 3.1, AimMode = "SelfArea", MaxHeight = 6, Sustain = true },
+            Ravage = { Range = 14, Preferred = 11, Lock = 4.1, Damage = 40, Effectiveness = 0.65, AimLead = 1.5, Windup = 3.9, Width = 7, MaxHeight = 5 },
+            -- No automatic QTE result is forged: unassisted damage is 10, not 40.
+            ["Precision Strike"] = { Range = 45, Preferred = 25, Lock = 2.6, Damage = 10, AimLead = 1.8, Windup = 1.8, Width = 8, MaxHeight = 6, ManualTiming = true },
+        } },
+        CHILLSEAR = { Label = "Chillsear", Priority = 5, PreferredAura = true, Skills = {
+            Permafrost = { Range = 22, Preferred = 17, Lock = 2.7, Damage = 45, AimLead = 2.3, Windup = 2.3, AimMode = "SelfArea", MaxHeight = 6 },
+            Icicle = { Range = 26, Preferred = 20, Lock = 1.3, Damage = 17, AimLead = 0.9, Windup = 0.9, Width = 10, MaxHeight = 6 },
+            Snowflake = { Range = 32, Preferred = 23, Lock = 2.2, Damage = 28, Effectiveness = 0.7, AimLead = 1.6, Windup = 1.6, Width = 8, MaxHeight = 6 },
+        } },
         Archangel = { Label = "Archangel", Priority = 3, Skills = { ["Holy Slash"] = { Range = 45, Lock = 1.8, Damage = 32, Preferred = 20, AimLead = 0.35 } } },
         Pixelation = { Label = "Pixelation", Priority = 2, Skills = {
             ["Pixelated Edges"] = { Range = 10, Lock = 4.8, Damage = 80, Preferred = 7, AimLead = 0.15 }, ["Shoot Command"] = { Range = 45, Lock = 1.3, Damage = 25, Preferred = 24, AimLead = 0.4 }, ["Mania!"] = { Range = 24, Lock = 5.8, Damage = 5, Preferred = 17 },
@@ -7315,37 +7328,40 @@ local HalloweenRules = (function()
                     if (cooldowns[key] or 0) <= now and (blocked[key] or 0) <= now and not (spent and aura.Id == current and spent[key]) then
                         local sample = learned and learned[key]
                         local damage = sample and sample.Damage or skill.Damage or 1
-                        local effectiveness = 1
+                        local effectiveness = skill.Effectiveness or 1
                         if context then
                             if name == "Prism" then effectiveness = 0.35 end
                             if name == "Mania!" then effectiveness = 0.35 end
                             if name == "Brilliance" and ((context.Speed or 0) > (skill.MaxSpeed or 1.2) or context.Health < 75 or context.Pressure > 1 or (context.StableFor or 0) < (skill.Stable or 0.8)) then effectiveness = 0 end
                             if skill.Lock >= 4 and context.Health < 45 then effectiveness = 0 end
+                            if skill.Windup and skill.Windup >= 3 and (context.Health < 80 or context.Pressure > 1) then effectiveness = 0 end
+                            if skill.Windup and skill.Windup >= 2 and context.Health < 65 and context.Pressure > 0 then effectiveness = 0 end
                             if name == "Rush" and (context.Health < 65 or context.Pressure > 1) then effectiveness = 0 end
                             if context.Recovering and (skill.Preferred or math.min(12,skill.Range*0.65)) < 16 then effectiveness = 0 end
                             if (context.Height or 0) > (skill.MaxHeight or 9) then effectiveness = 0 end
-                            if skill.Windup and skill.Width and (context.Speed or 0)*skill.Windup > skill.Width then effectiveness = 0 end
+                            if skill.Windup and skill.Width and (context.LateralSpeed or context.Speed or 0)*skill.Windup > skill.Width then effectiveness = 0 end
                         end
                         local approach = context and math.max(0,(context.Distance or 0)-skill.Range*0.8)/math.max(8,context.WalkSpeed or 16) or 0
                         local usefulDamage = context and type(context.TargetHealth)=="number" and math.min(damage,math.max(1,context.TargetHealth)) or damage
                         if effectiveness > 0 then ready[#ready + 1] = { Aura = aura, Skill = name, Key = key, Range = skill.Range, Preferred = skill.Preferred, AimLead = skill.AimLead, Lock = skill.Lock,
                             Stable = skill.Stable, MaxSpeed = skill.MaxSpeed, Windup = skill.Windup, Width = skill.Width, MaxHeight = skill.MaxHeight, AimMode = skill.AimMode,
                             Score = context and usefulDamage * effectiveness / (skill.Lock + approach + (aura.Id == current and 0.1 or 0.65)) or damage,
+                            Tier = rules.Profiles[aura.Id].PreferredAura and not skill.ManualTiming and 1 or 0,
                             Source = sample and "Solo damage estimate" or skill.Unmeasured and "Unmeasured fallback" or "Wiki estimate" } end
                         total += damage
                     end
                 end
-                table.sort(ready, function(a,b) if a.Score ~= b.Score then return a.Score > b.Score end return a.Skill < b.Skill end)
+                table.sort(ready, function(a,b) if a.Tier ~= b.Tier then return a.Tier > b.Tier end if a.Score ~= b.Score then return a.Score > b.Score end return a.Skill < b.Skill end)
                 if ready[1] then
                     if aura.Id == current then currentReady = ready[1] end
                     local override = scores and tonumber(scores[aura.Id]) or 0
                     local score = override > 0 and override or (context and ready[1].Score or total)
-                    if not best or score > bestScore or score == bestScore and aura.Priority > best.Aura.Priority then best,bestScore=ready[1],score end
+                    if not best or ready[1].Tier > best.Tier or ready[1].Tier == best.Tier and (score > bestScore or score == bestScore and aura.Priority > best.Aura.Priority) then best,bestScore=ready[1],score end
                 end
             end
         end
         if context then
-            if currentReady and best and currentReady.Score >= best.Score * 0.8 then return currentReady end
+            if currentReady and best and currentReady.Tier == best.Tier and currentReady.Score >= best.Score * 0.8 then return currentReady end
             return best
         end
         return currentReady or best
@@ -7353,9 +7369,19 @@ local HalloweenRules = (function()
     function rules.Aim(origin, position, velocity, lead)
         local flatVelocity = Vector3.new(velocity.X, 0, velocity.Z)
         if flatVelocity.Magnitude > 24 then flatVelocity = flatVelocity.Unit * 24 end
+        local offset = Vector3.new(position.X-origin.X,0,position.Z-origin.Z)
+        if offset.Magnitude>0.01 then
+            local toward=-(offset.X*flatVelocity.X+offset.Z*flatVelocity.Z)/offset.Magnitude
+            if toward>0 then lead=math.min(lead or 0,math.max(0,(offset.Magnitude-3)/toward)) end
+        end
         local predicted = position + flatVelocity * (lead or 0)
         local direction = Vector3.new(predicted.X-origin.X,0,predicted.Z-origin.Z)
         return direction.Magnitude > 0.01 and direction.Unit or nil, predicted
+    end
+    function rules.LateralSpeed(origin, position, velocity)
+        local offset=Vector3.new(position.X-origin.X,0,position.Z-origin.Z)
+        if offset.Magnitude<=0.01 then return Vector3.new(velocity.X,0,velocity.Z).Magnitude end
+        return math.abs(offset.X*velocity.Z-offset.Z*velocity.X)/offset.Magnitude
     end
     function rules.CastWindow(skill, origin, position, velocity, stableFor, clear)
         if not clear then return false, "Attack line obstructed" end
@@ -7372,7 +7398,7 @@ local HalloweenRules = (function()
         end
         local _, predicted = rules.Aim(origin,position,velocity,lead)
         if (predicted-origin).Magnitude > skill.Range then return false, "Predicted impact out of range" end
-        if skill.Windup and skill.Width and speed * skill.Windup > skill.Width then return false, "Target may leave attack area" end
+        if skill.Windup and skill.Width and rules.LateralSpeed(origin,position,velocity) * skill.Windup > skill.Width then return false, "Target may leave attack area" end
         return true
     end
     function rules.CanSampleDamage(player, players, target)
@@ -7756,6 +7782,19 @@ if not bridge then return end
 local HalloweenRules = (function()
     local rules = {}
     rules.Profiles = {
+        -- Skill names verified against the native RarityDB/AuraSkillClient.
+        -- Wiki damage/windup; reach is a conservative estimate, not a server hitbox.
+        PYTHIOS = { Label = "Pythios", Priority = 6, PreferredAura = true, Skills = {
+            ["Crimson Sky"] = { Range = 24, Preferred = 20, Lock = 7.2, Damage = 60, AimLead = 3.1, Windup = 3.1, AimMode = "SelfArea", MaxHeight = 6, Sustain = true },
+            Ravage = { Range = 14, Preferred = 11, Lock = 4.1, Damage = 40, Effectiveness = 0.65, AimLead = 1.5, Windup = 3.9, Width = 7, MaxHeight = 5 },
+            -- No automatic QTE result is forged: unassisted damage is 10, not 40.
+            ["Precision Strike"] = { Range = 45, Preferred = 25, Lock = 2.6, Damage = 10, AimLead = 1.8, Windup = 1.8, Width = 8, MaxHeight = 6, ManualTiming = true },
+        } },
+        CHILLSEAR = { Label = "Chillsear", Priority = 5, PreferredAura = true, Skills = {
+            Permafrost = { Range = 22, Preferred = 17, Lock = 2.7, Damage = 45, AimLead = 2.3, Windup = 2.3, AimMode = "SelfArea", MaxHeight = 6 },
+            Icicle = { Range = 26, Preferred = 20, Lock = 1.3, Damage = 17, AimLead = 0.9, Windup = 0.9, Width = 10, MaxHeight = 6 },
+            Snowflake = { Range = 32, Preferred = 23, Lock = 2.2, Damage = 28, Effectiveness = 0.7, AimLead = 1.6, Windup = 1.6, Width = 8, MaxHeight = 6 },
+        } },
         Archangel = { Label = "Archangel", Priority = 3, Skills = { ["Holy Slash"] = { Range = 45, Lock = 1.8, Damage = 32, Preferred = 20, AimLead = 0.35 } } },
         Pixelation = { Label = "Pixelation", Priority = 2, Skills = {
             ["Pixelated Edges"] = { Range = 10, Lock = 4.8, Damage = 80, Preferred = 7, AimLead = 0.15 }, ["Shoot Command"] = { Range = 45, Lock = 1.3, Damage = 25, Preferred = 24, AimLead = 0.4 }, ["Mania!"] = { Range = 24, Lock = 5.8, Damage = 5, Preferred = 17 },
@@ -7887,37 +7926,40 @@ local HalloweenRules = (function()
                     if (cooldowns[key] or 0) <= now and (blocked[key] or 0) <= now and not (spent and aura.Id == current and spent[key]) then
                         local sample = learned and learned[key]
                         local damage = sample and sample.Damage or skill.Damage or 1
-                        local effectiveness = 1
+                        local effectiveness = skill.Effectiveness or 1
                         if context then
                             if name == "Prism" then effectiveness = 0.35 end
                             if name == "Mania!" then effectiveness = 0.35 end
                             if name == "Brilliance" and ((context.Speed or 0) > (skill.MaxSpeed or 1.2) or context.Health < 75 or context.Pressure > 1 or (context.StableFor or 0) < (skill.Stable or 0.8)) then effectiveness = 0 end
                             if skill.Lock >= 4 and context.Health < 45 then effectiveness = 0 end
+                            if skill.Windup and skill.Windup >= 3 and (context.Health < 80 or context.Pressure > 1) then effectiveness = 0 end
+                            if skill.Windup and skill.Windup >= 2 and context.Health < 65 and context.Pressure > 0 then effectiveness = 0 end
                             if name == "Rush" and (context.Health < 65 or context.Pressure > 1) then effectiveness = 0 end
                             if context.Recovering and (skill.Preferred or math.min(12,skill.Range*0.65)) < 16 then effectiveness = 0 end
                             if (context.Height or 0) > (skill.MaxHeight or 9) then effectiveness = 0 end
-                            if skill.Windup and skill.Width and (context.Speed or 0)*skill.Windup > skill.Width then effectiveness = 0 end
+                            if skill.Windup and skill.Width and (context.LateralSpeed or context.Speed or 0)*skill.Windup > skill.Width then effectiveness = 0 end
                         end
                         local approach = context and math.max(0,(context.Distance or 0)-skill.Range*0.8)/math.max(8,context.WalkSpeed or 16) or 0
                         local usefulDamage = context and type(context.TargetHealth)=="number" and math.min(damage,math.max(1,context.TargetHealth)) or damage
                         if effectiveness > 0 then ready[#ready + 1] = { Aura = aura, Skill = name, Key = key, Range = skill.Range, Preferred = skill.Preferred, AimLead = skill.AimLead, Lock = skill.Lock,
                             Stable = skill.Stable, MaxSpeed = skill.MaxSpeed, Windup = skill.Windup, Width = skill.Width, MaxHeight = skill.MaxHeight, AimMode = skill.AimMode,
                             Score = context and usefulDamage * effectiveness / (skill.Lock + approach + (aura.Id == current and 0.1 or 0.65)) or damage,
+                            Tier = rules.Profiles[aura.Id].PreferredAura and not skill.ManualTiming and 1 or 0,
                             Source = sample and "Solo damage estimate" or skill.Unmeasured and "Unmeasured fallback" or "Wiki estimate" } end
                         total += damage
                     end
                 end
-                table.sort(ready, function(a,b) if a.Score ~= b.Score then return a.Score > b.Score end return a.Skill < b.Skill end)
+                table.sort(ready, function(a,b) if a.Tier ~= b.Tier then return a.Tier > b.Tier end if a.Score ~= b.Score then return a.Score > b.Score end return a.Skill < b.Skill end)
                 if ready[1] then
                     if aura.Id == current then currentReady = ready[1] end
                     local override = scores and tonumber(scores[aura.Id]) or 0
                     local score = override > 0 and override or (context and ready[1].Score or total)
-                    if not best or score > bestScore or score == bestScore and aura.Priority > best.Aura.Priority then best,bestScore=ready[1],score end
+                    if not best or ready[1].Tier > best.Tier or ready[1].Tier == best.Tier and (score > bestScore or score == bestScore and aura.Priority > best.Aura.Priority) then best,bestScore=ready[1],score end
                 end
             end
         end
         if context then
-            if currentReady and best and currentReady.Score >= best.Score * 0.8 then return currentReady end
+            if currentReady and best and currentReady.Tier == best.Tier and currentReady.Score >= best.Score * 0.8 then return currentReady end
             return best
         end
         return currentReady or best
@@ -7925,9 +7967,19 @@ local HalloweenRules = (function()
     function rules.Aim(origin, position, velocity, lead)
         local flatVelocity = Vector3.new(velocity.X, 0, velocity.Z)
         if flatVelocity.Magnitude > 24 then flatVelocity = flatVelocity.Unit * 24 end
+        local offset = Vector3.new(position.X-origin.X,0,position.Z-origin.Z)
+        if offset.Magnitude>0.01 then
+            local toward=-(offset.X*flatVelocity.X+offset.Z*flatVelocity.Z)/offset.Magnitude
+            if toward>0 then lead=math.min(lead or 0,math.max(0,(offset.Magnitude-3)/toward)) end
+        end
         local predicted = position + flatVelocity * (lead or 0)
         local direction = Vector3.new(predicted.X-origin.X,0,predicted.Z-origin.Z)
         return direction.Magnitude > 0.01 and direction.Unit or nil, predicted
+    end
+    function rules.LateralSpeed(origin, position, velocity)
+        local offset=Vector3.new(position.X-origin.X,0,position.Z-origin.Z)
+        if offset.Magnitude<=0.01 then return Vector3.new(velocity.X,0,velocity.Z).Magnitude end
+        return math.abs(offset.X*velocity.Z-offset.Z*velocity.X)/offset.Magnitude
     end
     function rules.CastWindow(skill, origin, position, velocity, stableFor, clear)
         if not clear then return false, "Attack line obstructed" end
@@ -7944,7 +7996,7 @@ local HalloweenRules = (function()
         end
         local _, predicted = rules.Aim(origin,position,velocity,lead)
         if (predicted-origin).Magnitude > skill.Range then return false, "Predicted impact out of range" end
-        if skill.Windup and skill.Width and speed * skill.Windup > skill.Width then return false, "Target may leave attack area" end
+        if skill.Windup and skill.Width and rules.LateralSpeed(origin,position,velocity) * skill.Windup > skill.Width then return false, "Target may leave attack area" end
         return true
     end
     function rules.CanSampleDamage(player, players, target)
@@ -8249,6 +8301,7 @@ local ok, failure = pcall(function()
         if Vector3.new(velocity.X,0,velocity.Z).Magnitude > 1.2 then stableSince = now end
         motionTarget, motionPosition, motionAt = target, point and point.Position, now
         local context = { Speed = Vector3.new(velocity.X,0,velocity.Z).Magnitude, Health = humanoid and humanoid.Health / math.max(1,humanoid.MaxHealth) * 100 or 0, Pressure = tonumber(bridge:GetAttribute("CloseEnemies")) or 0,
+            LateralSpeed = point and root and HalloweenRules.LateralSpeed(root.Position,point.Position,velocity) or 0,
             StableFor = now-stableSince, Distance = point and root and (point.Position-root.Position).Magnitude or 0, WalkSpeed = humanoid and humanoid.WalkSpeed or 16, Recovering = bridge:GetAttribute("Recovering") == true,
             TargetHealth = hp, Height = point and root and math.abs(point.Position.Y-root.Position.Y) or 0 }
         local desired = HalloweenRules.Next(owned, cooldowns, blocked, unavailable, now, turnStarted and current or nil, spent, scores, learned, context)
@@ -8262,6 +8315,8 @@ local ok, failure = pcall(function()
         attr("AttackRange", pendingCast and pendingCast.Range or desired and desired.Range or 25)
         attr("ScoreSource", desired and desired.Source or "Cooling down")
         attr("NoReadySkills",desired==nil)
+        -- A height/aim/safety rejection still needs an approach; it is not a cooldown.
+        attr("SkillsCoolingDown",desired==nil and HalloweenRules.Next(owned,cooldowns,blocked,unavailable,now,current,nil,scores,learned)==nil)
         attr("NextAura", desired and desired.Aura.Label or "Cooling down") attr("NextSkill", desired and desired.Skill or "None")
         if pendingCast and (not humanoid or humanoid.Health <= 0 or pendingCast.Character ~= nil and pendingCast.Character ~= character) then pendingCast=nil castUntil=0 spent={} turnStarted=false end
         attr("Casting", pendingCast ~= nil)
@@ -8647,6 +8702,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         if previousHP and humanoid.Health < previousHP then recentDamage=now end
         previousHP=humanoid.Health
         local pressure, nearest, crowdWarnings = 0, math.huge, {}
+        local cooling = bridge:GetAttribute("SkillsCoolingDown") == true and bridge:GetAttribute("Casting") ~= true
         for enemy in pairs(records) do
             local enemyRoot=enemy.Parent and enemy:FindFirstChild("HumanoidRootPart")
             local enemyHP=HalloweenRules.Health(enemy)
@@ -8654,12 +8710,12 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
                 local distance=(enemyRoot.Position-root.Position).Magnitude
                 nearest=math.min(nearest,distance)
                 if distance<18 then pressure+=1 end
-                if distance<11 then crowdWarnings[#crowdWarnings+1]={Center=enemyRoot.Position,Radius=10,End=now+0.4} end
+                if distance < (cooling and 24 or 11) then crowdWarnings[#crowdWarnings+1]={Center=enemyRoot.Position,Radius=cooling and 20 or 10,End=now+0.4} end
             end
         end
         attribute("CloseEnemies",pressure)
         local safeOrb = HalloweenRules.IsOrb(target) and nearest > 45 and now-recentDamage>2
-        local retreatAt=math.max(Config.HalloweenRetreatHP,45)
+        local retreatAt=math.max(Config.HalloweenRetreatHP,HalloweenRules.Kind(target)=="Boss" and 60 or 45)
         if safeOrb then recovering=false
         elseif hpPercent <= retreatAt or hpPercent<65 and pressure>=2 then recovering=true end
         if recovering and hpPercent >= math.min(90,retreatAt+25) and now-recentDamage>2 then recovering=false end
@@ -8670,7 +8726,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         danger = math.max(danger, HalloweenRules.Danger(predicted, warnings, Config.HalloweenDodgeMargin, now))
         local retreatDistance=math.clamp((tonumber(bridge:GetAttribute("PreferredDistance")) or 16)+8,20,32)
         local contactDanger=HalloweenRules.Danger(root.Position,crowdWarnings,1,now)
-        if contactDanger>0 and (hpPercent<65 or pressure>=2 or (tonumber(bridge:GetAttribute("PreferredDistance")) or 0)>12) then
+        if contactDanger>0 and (cooling or hpPercent<65 or pressure>=2 or (tonumber(bridge:GetAttribute("PreferredDistance")) or 0)>12) then
             for _,warning in ipairs(crowdWarnings) do warnings[#warnings+1]=warning end
             danger=math.max(danger,contactDanger)
         end
@@ -8700,7 +8756,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
                 end
             end
             dodgeUntil = now + 0.3
-            if dodgeGoal then moveDirect(humanoid, root, dodgeGoal, moveGoal == nil) status = recovering and "Retreating to recover HP" or "Dodging attack warning"
+            if dodgeGoal then moveDirect(humanoid, root, dodgeGoal, moveGoal == nil) status = recovering and "Retreating to recover HP" or cooling and "Keeping distance during cooldown" or "Dodging attack warning"
             else if moveGoal then humanoid:MoveTo(root.Position) moveGoal = nil end status = "No clear dodge route" end
             return
         end
@@ -8709,6 +8765,12 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         end
         dodgeGoal = nil
         if recovering then attribute("Permit", true) status = "Recovering HP" return end
+        if cooling then
+            attribute("Permit",false) moveEpoch+=1 moving=false
+            if moveGoal then humanoid:MoveTo(root.Position) moveGoal=nil end
+            lastProgressAt=os.clock() lastPosition=root.Position
+            status="Waiting for skills at safe distance" return
+        end
         attribute("Permit", true)
         local range = tonumber(bridge:GetAttribute("AttackRange")) or 25
         local preferred = math.min(range*0.85,tonumber(bridge:GetAttribute("PreferredDistance")) or range*0.65)
@@ -9054,7 +9116,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.35", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.36", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -9390,6 +9452,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.35")
+local loader, failure = loadstring(source, "BonesHub 3.36")
 if not loader then error(failure) end
 return loader()
