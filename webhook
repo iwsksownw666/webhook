@@ -156,7 +156,7 @@ local function preloadPacketNamespaces()
 end
 task.spawn(preloadPacketNamespaces)
 local DEFAULT_CONFIG = {
-    HalloweenAutoFarm = false, HalloweenAutoOrbs = false, HalloweenESP = false, HalloweenAutoDodge = true, HalloweenAutoEquip = true, HalloweenRotateAuras = true,
+    HalloweenAutoFarm = false, HalloweenAutoOrbs = false, HalloweenAutoBounty = false, HalloweenESP = false, HalloweenAutoDodge = true, HalloweenAutoEquip = true, HalloweenRotateAuras = true,
     HalloweenAuras = { "Archangel", "Pixelation", "Starscourge_Radiant" }, HalloweenTargets = { "Boss", "Orb", "Minion" }, HalloweenDamageScores = {},
     HalloweenSearchDistance = 1000, HalloweenESPDistance = 5000, HalloweenDodgeMargin = 4, HalloweenRetreatHP = 20, HalloweenEngageDistance = 12,
     AutoMerchant = false, MerchantSelections = { Mari = {}, Jester = {}, Rin = {} }, MerchantCatalogs = { Mari = {}, Jester = {}, Rin = {} }, MerchantPurchases = {}, MerchantAmounts = { Mari = {}, Jester = {}, Rin = {} },
@@ -7480,6 +7480,130 @@ local HalloweenESP = (function()
     return esp
 end)()
 
+local HalloweenBounty = {}
+function HalloweenBounty.Create(options)
+    local self = {}
+    local clock = options.Clock or os.clock
+    local serverNow = options.ServerNow or function() return workspace:GetServerTimeNow() end
+    local spawn = options.Spawn or task.spawn
+    local cancel = options.Cancel or task.cancel
+    local slots = { "Slot1", "Slot2", "Slot3" }
+    local living, active, dirty = true, false, true
+    local status, claimed, nextFetch, nextClaim = "Disabled", 0, 0, 0
+    local definitions, hunt, pending, period = nil, nil, nil, nil
+    local acknowledged, uncertain, connections = {}, {}, {}
+    local function enabled() return living and options.Alive() and options.Enabled() end
+    local function remotes()
+        if options.Remotes then return options.Remotes() end
+        local remote = game:GetService("ReplicatedStorage"):FindFirstChild("Remote")
+        return remote and remote:FindFirstChild("Halloween26")
+    end
+    local function stopRequest(unknown)
+        local old = pending pending = nil
+        if old then
+            if unknown and old.Key then uncertain[old.Key] = true end
+            if old.Thread then pcall(cancel, old.Thread) end
+        end
+    end
+    local function request(remote, key, ...)
+        local args, operation = table.pack(...), { Key = key, Started = clock() }
+        pending = operation
+        operation.Thread = spawn(function()
+            operation.Result = table.pack(pcall(function() return remote:InvokeServer(table.unpack(args, 1, args.n)) end))
+            operation.Done = true
+        end)
+    end
+    local function parse(defs, data)
+        if type(defs) ~= "table" or type(data) ~= "table" or type(data.NextUpdateTime) ~= "number" or data.NextUpdateTime ~= data.NextUpdateTime then return end
+        local index = {}
+        for _, slot in ipairs(slots) do
+            local record = data[slot]
+            if type(record) ~= "table" or type(record.progress) ~= "number" or record.progress ~= record.progress or type(defs[slot]) ~= "table" then return end
+            index[slot] = {}
+            for _, definition in pairs(defs[slot]) do
+                if type(definition) == "table" and definition.id ~= nil and type(definition.goal) == "number" and definition.goal > 0 and definition.goal < math.huge then index[slot][definition.id] = definition end
+            end
+            if not index[slot][record.id] then return end
+        end
+        return index, data
+    end
+    function self.Invalidate() dirty = true nextFetch = math.min(nextFetch, clock() + 0.5) end
+    function self.GetState() return { Status = status, Claimed = claimed, InFlight = pending ~= nil, NextUpdateTime = hunt and hunt.NextUpdateTime } end
+    function self.Destroy()
+        living = false stopRequest(true)
+        for _, connection in ipairs(connections) do connection:Disconnect() end
+        table.clear(connections) status = "Stopped"
+    end
+    function self.Step()
+        if not living then return end
+        if not enabled() then
+            if active then stopRequest(true) end
+            active, dirty, status = false, true, "Disabled"
+            return
+        end
+        if not active then active = true nextFetch = 0 end
+        local now = clock()
+        if pending then
+            local operation = pending
+            if not operation.Done then
+                if now - operation.Started < 8 then return end
+                stopRequest(true) dirty = true nextFetch = now + 2
+                status = operation.Key and "Claim timed out; checking server state" or "Mission request timed out; retrying"
+                return
+            end
+            pending = nil
+            local result = operation.Result
+            if operation.Key then
+                if result[1] and result[2] then acknowledged[operation.Key] = true claimed += 1
+                elseif not result[1] then uncertain[operation.Key] = true end
+                dirty = true nextFetch = now + 0.5 nextClaim = now + (result[1] and result[2] and 0.5 or 15)
+            else
+                local index, data
+                if result[1] then index, data = parse(result[2], result[3]) end
+                if index then
+                    if period and data.NextUpdateTime < period then dirty = true nextFetch = now + 2 return end
+                    if period ~= data.NextUpdateTime then acknowledged, uncertain = {}, {} period = data.NextUpdateTime end
+                    definitions, hunt = index, data
+                    nextFetch = now + 15
+                else
+                    definitions, hunt = nil, nil dirty = true nextFetch = now + 15 status = "Waiting for mission data" return
+                end
+            end
+        end
+        local folder = remotes()
+        local fetch = folder and folder:FindFirstChild("GetMissionInfo")
+        local claim = folder and folder:FindFirstChild("ClaimBounty")
+        if not fetch or not claim then status = "Waiting for Bounty Hunt" return end
+        if #connections == 0 then
+            for _, name in ipairs({ "HuntProgressUpdated", "HuntUpdated" }) do
+                local event = folder:FindFirstChild(name)
+                if event then connections[#connections + 1] = event.OnClientEvent:Connect(self.Invalidate) end
+            end
+        end
+        if (dirty or not hunt or now >= nextFetch) and now >= nextFetch then
+            dirty = false status = "Checking Bounty Hunt" request(fetch) return
+        end
+        if not hunt or not definitions then return end
+        if hunt.NextUpdateTime <= serverNow() then dirty = true status = "Waiting for daily reset" return end
+        if dirty then return end -- Refresh after every claim/event before making another decision.
+        local allReady, allClaimed, blocked = true, true, false
+        for _, slot in ipairs(slots) do
+            local record = hunt[slot]
+            local ready = record.progress >= definitions[slot][record.id].goal
+            local done = record.completed == true or acknowledged[slot] == true
+            allReady, allClaimed = allReady and ready, allClaimed and done
+            if not done and uncertain[slot] then blocked = true end
+            if ready and not done and not uncertain[slot] and now >= nextClaim then status = "Claiming " .. slot request(claim, slot, slot) return end
+        end
+        if allReady and allClaimed and hunt.FinalReward == nil and not acknowledged.FinalReward then
+            if uncertain.FinalReward then blocked = true
+            elseif now >= nextClaim then status = "Claiming final reward" request(claim, "FinalReward", "FinalReward", hunt.NextUpdateTime) return end
+        end
+        status = blocked and "Unconfirmed claim; awaiting server confirmation" or (hunt.FinalReward ~= nil or acknowledged.FinalReward) and "Daily rewards claimed" or "Waiting for completed bounties"
+    end
+    return self
+end
+
 local Halloween = (function()
     local controller = {}
     local core = game:GetService("CoreGui")
@@ -7494,6 +7618,7 @@ local Halloween = (function()
     local combatHoldUntil = 0
     local unreachable, lastProgressAt, lastPosition, routeReason = {}, 0, nil, nil
     local forcePathUntil, directStalls = 0, 0
+    local bounty = HalloweenBounty.Create({ Alive = function() return living and Alive end, Enabled = function() return Config.HalloweenAutoBounty == true end })
     local ACTOR_SOURCE = [======[
 if setthreadidentity then setthreadidentity(8) end
 local rs, core = game:GetService("ReplicatedStorage"), game:GetService("CoreGui")
@@ -8075,12 +8200,13 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         attribute("EngageDistance", Config.HalloweenEngageDistance or 12)
     end
     function controller.SetEnabled(feature, value)
-        local key = ({ Farm = "HalloweenAutoFarm", Orbs = "HalloweenAutoOrbs", ESP = "HalloweenESP", Dodge = "HalloweenAutoDodge", Equip = "HalloweenAutoEquip", Rotate = "HalloweenRotateAuras" })[feature]
+        local key = ({ Farm = "HalloweenAutoFarm", Orbs = "HalloweenAutoOrbs", Bounty = "HalloweenAutoBounty", ESP = "HalloweenESP", Dodge = "HalloweenAutoDodge", Equip = "HalloweenAutoEquip", Rotate = "HalloweenRotateAuras" })[feature]
         if not key then return false end
         value = value == true Config[key] = value
         if (feature == "Farm" or feature == "Orbs") and value then Config.HalloweenAutoEquip, Config.HalloweenRotateAuras = true, true end
         if feature == "Farm" or feature == "Orbs" then epoch += 1 release() nextChoice=0 target, targetRoot = nil, nil if targetValue then targetValue.Value = nil end end
         if feature == "ESP" and not value then HalloweenESP.Clear() end
+        if feature == "Bounty" then bounty.Invalidate() bounty.Step() end
         if not syncing and toggles[feature] and type(toggles[feature].Set) == "function" then
             syncing = true pcall(toggles[feature].Set, toggles[feature], value) syncing = false
         end
@@ -8104,6 +8230,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         local count = 0 for _ in pairs(records) do count += 1 end
         local esp = HalloweenESP.GetState()
         return { Enabled = enabled(), AutoOrbs = Config.HalloweenAutoOrbs == true, ESP = Config.HalloweenESP, Dodge = Config.HalloweenAutoDodge, Status = status, Error = errorText or (bridge and bridge:GetAttribute("Error")),
+            AutoBounty = Config.HalloweenAutoBounty == true, Bounty = bounty.GetState(),
             ESPTracked = esp.Tracked, ESPVisible = esp.Visible, PathStatus = routeReason,
             Tracked = count, Target = target and HalloweenRules.Label(target), MovementOwner = MovementCoordinator.GetState().Owner, Dodging = dodgeGoal ~= nil,
             CurrentAura = bridge and bridge:GetAttribute("CurrentAura"), NextAura = bridge and bridge:GetAttribute("NextAura"), NextSkill = bridge and bridge:GetAttribute("NextSkill"),
@@ -8119,6 +8246,10 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         metrics["Combat Status"], metrics["Confirmed Casts"] = rows[1], rows[2]
         rows = UI:AddMetricRow(page, { { Label = "Target", Value = "None" }, { Label = "Current Aura", Value = "None" }, { Label = "Next Skill", Value = "None" } })
         metrics.Target, metrics["Current Aura"], metrics["Next Skill"] = rows[1], rows[2], rows[3]
+        UI:AddDivider(page, "Rewards")
+        toggles.Bounty = UI:AddToggle(page, "Auto Claim Bounty Hunt", Config.HalloweenAutoBounty == true, function(value) if not syncing then controller.SetEnabled("Bounty", value) end end)
+        rows = UI:AddMetricRow(page, { { Label = "Bounty Hunt", Value = "Disabled" } })
+        metrics["Bounty Hunt"] = rows[1]
         UI:AddDivider(page, "Combat Options")
         local targetControl = UI:AddMultiSelect(page, "Target Types (Boss First)", { "Boss", "Orb", "Minion" }, function(map)
             if syncing then return end
@@ -8142,6 +8273,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
     end
     function controller.Destroy()
         living, epoch = false, epoch + 1 release()
+        bounty.Destroy()
         attribute("CombatPending", false)
         if bridge and bridge.Parent then bridge:SetAttribute("Active", false) end
         HalloweenESP.Clear()
@@ -8296,6 +8428,14 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             end)
         end
     end
+    task.spawn(function()
+        while living and Alive do
+            local ok = pcall(bounty.Step)
+            if not ok then bounty.Invalidate() end
+            task.wait(0.25)
+        end
+        bounty.Destroy()
+    end)
     trackTag("NpcTelegraph", telegraphs) trackTag("NpcMeteor", meteors) attachNPCs()
     connections[#connections + 1] = game:GetService("RunService").RenderStepped:Connect(function()
         if not living or not Alive or os.clock() - lastDraw < 0.05 then return end
@@ -8332,6 +8472,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
                 local state = controller.GetState()
                 local values = { ["Combat Status"] = errorText or status, Target = state.Target or "None", ["Combat Auras"] = tostring(state.OwnedCount or 0) .. " owned combat auras",
                     ["Current Aura"] = state.CurrentAura or "None", ["Next Skill"] = (state.NextAura or "Waiting") .. " / " .. (state.NextSkill or "None"),
+                    ["Bounty Hunt"] = state.Bounty.Status .. " / " .. tostring(state.Bounty.Claimed) .. " claimed",
                     ["Confirmed Casts"] = tostring(state.ConfirmedCasts or 0), ["Dodge Status"] = dodgeGoal and "Dodging" or Config.HalloweenAutoDodge and "Watching attack warnings" or "Disabled" }
                 for key, value in pairs(values) do local row = metrics[key] if row and row.ValueLabel and row.ValueLabel.Parent then row.ValueLabel.Text = value end end
             end
@@ -8509,7 +8650,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.30", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.31", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -8844,6 +8985,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.30")
+local loader, failure = loadstring(source, "BonesHub 3.31")
 if not loader then error(failure) end
 return loader()
