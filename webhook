@@ -157,7 +157,7 @@ end
 task.spawn(preloadPacketNamespaces)
 local DEFAULT_CONFIG = {
     HalloweenAutoFarm = false, HalloweenAutoOrbs = false, HalloweenAutoBounty = false, HalloweenCombatAlerts = false, HalloweenCombatWebhook = "", HalloweenESP = false, HalloweenAutoDodge = true, HalloweenAutoEquip = true, HalloweenRotateAuras = true,
-    HalloweenAuras = { "Archangel", "Pixelation", "Starscourge_Radiant" }, HalloweenTargets = { "Boss", "Orb", "Minion" }, HalloweenDamageScores = {},
+    HalloweenAuras = { "PYTHIOS", "CHILLSEAR", "Archangel", "Starscourge_Radiant" }, HalloweenTargets = { "Boss", "Orb", "Minion" }, HalloweenDamageScores = {},
     HalloweenSearchDistance = 1000, HalloweenESPDistance = 5000, HalloweenDodgeMargin = 4, HalloweenRetreatHP = 20, HalloweenEngageDistance = 12,
     AutoMerchant = false, MerchantSelections = { Mari = {}, Jester = {}, Rin = {} }, MerchantCatalogs = { Mari = {}, Jester = {}, Rin = {} }, MerchantPurchases = {}, MerchantAmounts = { Mari = {}, Jester = {}, Rin = {} },
     AutoDailyQuests = false, AutoClaimDailyRewards = false, DailyObbySupports = true,
@@ -7198,12 +7198,13 @@ local HalloweenRules = (function()
             Snowflake = { Range = 32, Preferred = 23, Lock = 2.2, Damage = 28, Effectiveness = 0.7, AimLead = 1.6, Windup = 1.6, Width = 8, MaxHeight = 6 },
         } },
         Archangel = { Label = "Archangel", Priority = 3, Skills = { ["Holy Slash"] = { Range = 45, Lock = 1.8, Damage = 32, Preferred = 20, AimLead = 0.35 } } },
-        Pixelation = { Label = "Pixelation", Priority = 2, Skills = {
-            ["Pixelated Edges"] = { Range = 10, Lock = 4.8, Damage = 80, Preferred = 7, AimLead = 0.15 }, ["Shoot Command"] = { Range = 45, Lock = 1.3, Damage = 25, Preferred = 24, AimLead = 0.4 }, ["Mania!"] = { Range = 24, Lock = 5.8, Damage = 5, Preferred = 17 },
-        } },
         Starscourge_Radiant = { Label = "Starscourge : Radiant", Priority = 1, Skills = { ["Starfall : Crystal"] = { Range = 70, Lock = 2.5, Damage = 17, Preferred = 30, AimLead = 0.6 } } },
     }
     function rules.Normalize(value) return (tostring(value or ""):lower():gsub("[^%w]", "")) end
+    function rules.Excluded(name)
+        local key=rules.Normalize(name)
+        return key=="pixelation" or key=="luminosity"
+    end
     function rules.Profile(name)
         local key = rules.Normalize(name)
         for id, profile in pairs(rules.Profiles) do if key == rules.Normalize(id) then return id, profile end end
@@ -7211,10 +7212,6 @@ local HalloweenRules = (function()
     local utility = { ["Time Stop"] = true, ["Heal Pad"] = true, ["OpenSwap"] = true, ["Form Shift"] = true, x = true,
         Lightspeed = true, ["Blooming Lotus"] = true, Reverberation = true, ["Yield My Flesh..."] = true, ["Sweet Confession"] = true }
     local estimates = {
-        -- Current wiki: Brilliance 4.3s/front pillar; Witness 2.5s/radial slash;
-        -- Prism 2.3s/self-area rain; Annihilate 0.7s/front slash. Native client
-        -- visual timings corroborate the long startup. Hitbox sizes are conservative estimates.
-        Luminosity = { Brilliance = { Damage = 70, Lock = 5.2, Range = 22, Preferred = 15, AimLead = 4.3, Stable = 0.8, MaxSpeed = 1.2, Windup = 4.3, Width = 5, MaxHeight = 5 }, ["Blinding Witness"] = { Damage = 35, Lock = 3, Range = 14, Preferred = 9, AimLead = 2.5, Windup = 2.5, AimMode = "SelfArea", MaxHeight = 5 }, Prism = { Damage = 25, Lock = 2.8, Range = 18, Preferred = 11, AimLead = 2.3, Windup = 2.3, AimMode = "SelfArea", MaxHeight = 5 }, Annihilate = { Damage = 15, Lock = 1.2, Range = 9, Preferred = 6, AimLead = 0.7, Windup = 0.7, Width = 4, MaxHeight = 4 } },
         BLOODLUST = { Bloodthirst = { Damage = 35, Lock = 1.5, Range = 26, Preferred = 18 } },
         Chromatic_Genesis = { ["Divine Impact"] = { Damage = 38, Lock = 2.2, Range = 50, Preferred = 28 } },
         Frigid = { ["Frozen Spikes"] = { Damage = 15, Lock = 2, Range = 50, Preferred = 28, AimLead = 0.4 } },
@@ -7232,7 +7229,7 @@ local HalloweenRules = (function()
             for _, aura in pairs(list or {}) do
                 local name = type(aura) == "table" and aura.Name
                 local value = name and metadata[name]
-                if type(value) == "table" and type(value.AuraSkills) == "table" then
+                if not rules.Excluded(name) and type(value) == "table" and type(value.AuraSkills) == "table" then
                     local id = rules.Profile(name) or name
                     local profile = rules.Profiles[id] or { Label = name:gsub("_", " : "), Priority = 1, Skills = {} }
                     for _, skill in ipairs(value.AuraSkills) do
@@ -7285,7 +7282,7 @@ local HalloweenRules = (function()
         local function add(aura, index, special)
             if type(aura) ~= "table" then return end
             local id, profile = rules.Profile(aura.Name)
-            if not id or enabled and not table.find(enabled, id) then return end
+            if not id or rules.Excluded(id) or enabled and not table.find(enabled, id) then return end
             local equipped = data.Title ~= "" and tostring(data.EquippedAuraIndex) == tostring(index) and (data.IsEquippingSpecial == true) == special
             if seen[id] and not equipped then return end
             local entry = { Id = id, Name = aura.Name, Label = profile.Label, Index = index, Special = special, Priority = profile.Priority }
@@ -7321,7 +7318,7 @@ local HalloweenRules = (function()
     function rules.Next(owned, cooldowns, blocked, unavailable, now, current, spent, scores, learned, context)
         local best, bestScore, currentReady
         for _, aura in ipairs(owned) do
-            if (unavailable[aura.Id] or 0) <= now then
+            if not rules.Excluded(aura.Id) and (unavailable[aura.Id] or 0) <= now then
                 local ready, total = {}, 0
                 for name, skill in pairs(rules.Profiles[aura.Id].Skills) do
                     local key = aura.Id .. ":" .. name
@@ -7346,7 +7343,7 @@ local HalloweenRules = (function()
                         if effectiveness > 0 then ready[#ready + 1] = { Aura = aura, Skill = name, Key = key, Range = skill.Range, Preferred = skill.Preferred, AimLead = skill.AimLead, Lock = skill.Lock,
                             Stable = skill.Stable, MaxSpeed = skill.MaxSpeed, Windup = skill.Windup, Width = skill.Width, MaxHeight = skill.MaxHeight, AimMode = skill.AimMode,
                             Score = context and usefulDamage * effectiveness / (skill.Lock + approach + (aura.Id == current and 0.1 or 0.65)) or damage,
-                            Tier = rules.Profiles[aura.Id].PreferredAura and not skill.ManualTiming and 1 or 0,
+                            Tier = rules.Profiles[aura.Id].PreferredAura and 1 or 0,
                             Source = sample and "Solo damage estimate" or skill.Unmeasured and "Unmeasured fallback" or "Wiki estimate" } end
                         total += damage
                     end
@@ -7365,6 +7362,19 @@ local HalloweenRules = (function()
             return best
         end
         return currentReady or best
+    end
+    function rules.Turn(owned,cooldowns,blocked,unavailable,now,current,spent,scores,learned,context)
+        -- Finish this aura's ready skills before comparing another aura's DPS.
+        if current then
+            for _,aura in ipairs(owned) do
+                if aura.Id==current then
+                    local remaining=rules.Next({aura},cooldowns,blocked,unavailable,now,current,spent,scores,learned,context)
+                    if remaining then return remaining end
+                    break
+                end
+            end
+        end
+        return rules.Next(owned,cooldowns,blocked,unavailable,now,nil,spent,scores,learned,context)
     end
     function rules.Aim(origin, position, velocity, lead)
         local flatVelocity = Vector3.new(velocity.X, 0, velocity.Z)
@@ -7760,7 +7770,9 @@ local Halloween = (function()
     local unreachable, lastProgressAt, lastPosition, routeReason = setmetatable({}, {__mode="k"}), 0, nil, nil
     local observedCharacter,combatWatch
     local approachPhase,forceApproachUntil,recoveries,lastRecovery,lastStepAt=0,0,0,nil,0
-    local actorRestarts,actorStartingAt=0,0
+    local actorRestarts,actorStartingAt,pursuitRecoveries=0,0,0
+    local dodgePosition,dodgeProgressAt,dodgeFailures=nil,0,0
+    local aimRepositionAt=0
     local forcePathUntil, directStalls = 0, 0
     local bounty = HalloweenBounty.Create({ Alive = function() return living and Alive end, Enabled = function() return Config.HalloweenAutoBounty == true end })
     local reports = HalloweenReports.Create({
@@ -7796,12 +7808,13 @@ local HalloweenRules = (function()
             Snowflake = { Range = 32, Preferred = 23, Lock = 2.2, Damage = 28, Effectiveness = 0.7, AimLead = 1.6, Windup = 1.6, Width = 8, MaxHeight = 6 },
         } },
         Archangel = { Label = "Archangel", Priority = 3, Skills = { ["Holy Slash"] = { Range = 45, Lock = 1.8, Damage = 32, Preferred = 20, AimLead = 0.35 } } },
-        Pixelation = { Label = "Pixelation", Priority = 2, Skills = {
-            ["Pixelated Edges"] = { Range = 10, Lock = 4.8, Damage = 80, Preferred = 7, AimLead = 0.15 }, ["Shoot Command"] = { Range = 45, Lock = 1.3, Damage = 25, Preferred = 24, AimLead = 0.4 }, ["Mania!"] = { Range = 24, Lock = 5.8, Damage = 5, Preferred = 17 },
-        } },
         Starscourge_Radiant = { Label = "Starscourge : Radiant", Priority = 1, Skills = { ["Starfall : Crystal"] = { Range = 70, Lock = 2.5, Damage = 17, Preferred = 30, AimLead = 0.6 } } },
     }
     function rules.Normalize(value) return (tostring(value or ""):lower():gsub("[^%w]", "")) end
+    function rules.Excluded(name)
+        local key=rules.Normalize(name)
+        return key=="pixelation" or key=="luminosity"
+    end
     function rules.Profile(name)
         local key = rules.Normalize(name)
         for id, profile in pairs(rules.Profiles) do if key == rules.Normalize(id) then return id, profile end end
@@ -7809,10 +7822,6 @@ local HalloweenRules = (function()
     local utility = { ["Time Stop"] = true, ["Heal Pad"] = true, ["OpenSwap"] = true, ["Form Shift"] = true, x = true,
         Lightspeed = true, ["Blooming Lotus"] = true, Reverberation = true, ["Yield My Flesh..."] = true, ["Sweet Confession"] = true }
     local estimates = {
-        -- Current wiki: Brilliance 4.3s/front pillar; Witness 2.5s/radial slash;
-        -- Prism 2.3s/self-area rain; Annihilate 0.7s/front slash. Native client
-        -- visual timings corroborate the long startup. Hitbox sizes are conservative estimates.
-        Luminosity = { Brilliance = { Damage = 70, Lock = 5.2, Range = 22, Preferred = 15, AimLead = 4.3, Stable = 0.8, MaxSpeed = 1.2, Windup = 4.3, Width = 5, MaxHeight = 5 }, ["Blinding Witness"] = { Damage = 35, Lock = 3, Range = 14, Preferred = 9, AimLead = 2.5, Windup = 2.5, AimMode = "SelfArea", MaxHeight = 5 }, Prism = { Damage = 25, Lock = 2.8, Range = 18, Preferred = 11, AimLead = 2.3, Windup = 2.3, AimMode = "SelfArea", MaxHeight = 5 }, Annihilate = { Damage = 15, Lock = 1.2, Range = 9, Preferred = 6, AimLead = 0.7, Windup = 0.7, Width = 4, MaxHeight = 4 } },
         BLOODLUST = { Bloodthirst = { Damage = 35, Lock = 1.5, Range = 26, Preferred = 18 } },
         Chromatic_Genesis = { ["Divine Impact"] = { Damage = 38, Lock = 2.2, Range = 50, Preferred = 28 } },
         Frigid = { ["Frozen Spikes"] = { Damage = 15, Lock = 2, Range = 50, Preferred = 28, AimLead = 0.4 } },
@@ -7830,7 +7839,7 @@ local HalloweenRules = (function()
             for _, aura in pairs(list or {}) do
                 local name = type(aura) == "table" and aura.Name
                 local value = name and metadata[name]
-                if type(value) == "table" and type(value.AuraSkills) == "table" then
+                if not rules.Excluded(name) and type(value) == "table" and type(value.AuraSkills) == "table" then
                     local id = rules.Profile(name) or name
                     local profile = rules.Profiles[id] or { Label = name:gsub("_", " : "), Priority = 1, Skills = {} }
                     for _, skill in ipairs(value.AuraSkills) do
@@ -7883,7 +7892,7 @@ local HalloweenRules = (function()
         local function add(aura, index, special)
             if type(aura) ~= "table" then return end
             local id, profile = rules.Profile(aura.Name)
-            if not id or enabled and not table.find(enabled, id) then return end
+            if not id or rules.Excluded(id) or enabled and not table.find(enabled, id) then return end
             local equipped = data.Title ~= "" and tostring(data.EquippedAuraIndex) == tostring(index) and (data.IsEquippingSpecial == true) == special
             if seen[id] and not equipped then return end
             local entry = { Id = id, Name = aura.Name, Label = profile.Label, Index = index, Special = special, Priority = profile.Priority }
@@ -7919,7 +7928,7 @@ local HalloweenRules = (function()
     function rules.Next(owned, cooldowns, blocked, unavailable, now, current, spent, scores, learned, context)
         local best, bestScore, currentReady
         for _, aura in ipairs(owned) do
-            if (unavailable[aura.Id] or 0) <= now then
+            if not rules.Excluded(aura.Id) and (unavailable[aura.Id] or 0) <= now then
                 local ready, total = {}, 0
                 for name, skill in pairs(rules.Profiles[aura.Id].Skills) do
                     local key = aura.Id .. ":" .. name
@@ -7944,7 +7953,7 @@ local HalloweenRules = (function()
                         if effectiveness > 0 then ready[#ready + 1] = { Aura = aura, Skill = name, Key = key, Range = skill.Range, Preferred = skill.Preferred, AimLead = skill.AimLead, Lock = skill.Lock,
                             Stable = skill.Stable, MaxSpeed = skill.MaxSpeed, Windup = skill.Windup, Width = skill.Width, MaxHeight = skill.MaxHeight, AimMode = skill.AimMode,
                             Score = context and usefulDamage * effectiveness / (skill.Lock + approach + (aura.Id == current and 0.1 or 0.65)) or damage,
-                            Tier = rules.Profiles[aura.Id].PreferredAura and not skill.ManualTiming and 1 or 0,
+                            Tier = rules.Profiles[aura.Id].PreferredAura and 1 or 0,
                             Source = sample and "Solo damage estimate" or skill.Unmeasured and "Unmeasured fallback" or "Wiki estimate" } end
                         total += damage
                     end
@@ -7963,6 +7972,19 @@ local HalloweenRules = (function()
             return best
         end
         return currentReady or best
+    end
+    function rules.Turn(owned,cooldowns,blocked,unavailable,now,current,spent,scores,learned,context)
+        -- Finish this aura's ready skills before comparing another aura's DPS.
+        if current then
+            for _,aura in ipairs(owned) do
+                if aura.Id==current then
+                    local remaining=rules.Next({aura},cooldowns,blocked,unavailable,now,current,spent,scores,learned,context)
+                    if remaining then return remaining end
+                    break
+                end
+            end
+        end
+        return rules.Next(owned,cooldowns,blocked,unavailable,now,nil,spent,scores,learned,context)
     end
     function rules.Aim(origin, position, velocity, lead)
         local flatVelocity = Vector3.new(velocity.X, 0, velocity.Z)
@@ -8124,6 +8146,8 @@ end
 local listeners, cooldowns, blocked, unavailable = {}, {}, {}, {}
 local owned, pendingEquip, pendingCast, current = {}, nil, nil, nil
 local approachTarget
+local encounterTarget,lastCastFailure,lastTargetFailureAt=nil,nil,0
+local moduleLoads=setmetatable({}, {__mode="k"})
 local rotationAura, spent, learned, turnStarted = nil, {}, {}, false
 local requested, confirmed, nextInventory, castUntil, equipSettled = bridge:GetAttribute("RequestedCasts") or 0, bridge:GetAttribute("ConfirmedCasts") or 0, 0, 0, 0
 local frameErrors,totalErrors=0,bridge:GetAttribute("ActorErrors") or 0
@@ -8290,7 +8314,8 @@ local ok, failure = pcall(function()
             pendingCast = nil
         end
         local farm = bridge:GetAttribute("FarmEnabled") == true
-        if not farm then turnStarted = false end
+        if not farm or not valid then turnStarted = false end
+        if valid and encounterTarget~=target then encounterTarget=target turnStarted=false spent={} end
         local scores = {}
         pcall(function() scores = http:JSONDecode(bridge:GetAttribute("DamageScores") or "{}") end)
         local velocity = point and point.AssemblyLinearVelocity or Vector3.new(0,0,0)
@@ -8304,24 +8329,39 @@ local ok, failure = pcall(function()
             LateralSpeed = point and root and HalloweenRules.LateralSpeed(root.Position,point.Position,velocity) or 0,
             StableFor = now-stableSince, Distance = point and root and (point.Position-root.Position).Magnitude or 0, WalkSpeed = humanoid and humanoid.WalkSpeed or 16, Recovering = bridge:GetAttribute("Recovering") == true,
             TargetHealth = hp, Height = point and root and math.abs(point.Position.Y-root.Position.Y) or 0 }
-        local desired = HalloweenRules.Next(owned, cooldowns, blocked, unavailable, now, turnStarted and current or nil, spent, scores, learned, context)
-        if not desired and next(spent) then spent = {} desired = HalloweenRules.Next(owned, cooldowns, blocked, unavailable, now, current, spent, scores, learned, context) end
+        local desired = HalloweenRules.Turn(owned, cooldowns, blocked, unavailable, now, turnStarted and current or nil, spent, scores, learned, context)
+        -- Ready preferred skills must not lose their tier just because a previous
+        -- turn marked them spent while a fallback aura remained ready.
+        local reusable = next(spent) and HalloweenRules.Turn(owned,cooldowns,blocked,unavailable,now,turnStarted and current or nil,nil,scores,learned,context)
+        if reusable and (not desired or reusable.Tier > desired.Tier) then spent={} desired=reusable end
+        if not desired and next(spent) then spent = {} desired = HalloweenRules.Turn(owned, cooldowns, blocked, unavailable, now, turnStarted and current or nil, spent, scores, learned, context) end
+        local planContext=table.clone(context)
+        planContext.Height,planContext.Speed,planContext.LateralSpeed,planContext.StableFor=0,0,0,10
+        local readyPlan=HalloweenRules.Turn(owned,cooldowns,blocked,unavailable,now,turnStarted and current or nil,spent,scores,learned,planContext)
+        if readyPlan and (not desired or readyPlan.Tier>desired.Tier or turnStarted and readyPlan.Aura.Id==current and desired.Aura.Id~=current) then
+            local same=HalloweenRules.Next({readyPlan.Aura},cooldowns,blocked,unavailable,now,current,spent,scores,learned,context)
+            desired=same or readyPlan
+        end
+        local plan=desired or readyPlan or HalloweenRules.Next(owned,{}, {},unavailable,now,current,nil,scores,learned,planContext)
         if desired then
             local setting = tonumber(bridge:GetAttribute("EngageDistance")) or 12
             desired.Range = math.min(desired.Range, math.max(setting, desired.Preferred and desired.Preferred+5 or setting))
         end
-        attr("PreferredDistance", pendingCast and pendingCast.Preferred or desired and desired.Preferred or 12)
+        attr("PreferredDistance", pendingCast and pendingCast.Preferred or plan and plan.Preferred or 12)
         attr("DataReady", d ~= nil) attr("HasOwnedAura", #owned > 0) attr("CurrentAura", current or "None")
-        attr("AttackRange", pendingCast and pendingCast.Range or desired and desired.Range or 25)
+        attr("AttackRange", pendingCast and pendingCast.Range or plan and plan.Range or 25)
+        attr("AttackMaxHeight",plan and plan.MaxHeight or 6)
         attr("ScoreSource", desired and desired.Source or "Cooling down")
         attr("NoReadySkills",desired==nil)
         -- A height/aim/safety rejection still needs an approach; it is not a cooldown.
-        attr("SkillsCoolingDown",desired==nil and HalloweenRules.Next(owned,cooldowns,blocked,unavailable,now,current,nil,scores,learned)==nil)
+        attr("SkillsCoolingDown",readyPlan==nil)
         attr("NextAura", desired and desired.Aura.Label or "Cooling down") attr("NextSkill", desired and desired.Skill or "None")
         if pendingCast and (not humanoid or humanoid.Health <= 0 or pendingCast.Character ~= nil and pendingCast.Character ~= character) then pendingCast=nil castUntil=0 spent={} turnStarted=false end
         attr("Casting", pendingCast ~= nil)
         attr("WorkerBusyUntil",pendingCast and math.max(castUntil,pendingCast.Started and not pendingCast.Confirmed and pendingCast.Deadline or 0) or 0)
         if target~=approachTarget or not valid then attr("NeedsApproach",false) approachTarget=target end
+        if not valid or target~=lastCastFailure then attr("AimRejectedSince",nil) end
+        if valid and root and plan and math.abs(point.Position.Y-root.Position.Y)>(plan.MaxHeight or 9) then attr("NeedsApproach",true) end
         local active = d and humanoid and humanoid.Health > 0 and root and not root.Anchored and valid
             and bridge:GetAttribute("FarmEnabled") == true and bridge:GetAttribute("Permit") == true
         if active and desired and not pendingEquip and not pendingCast and now >= castUntil and now >= equipSettled and inventoryFree() then
@@ -8334,9 +8374,15 @@ local ok, failure = pcall(function()
                 else storage.Equip.send({ i = desired.Aura.Index, s = false }) end
             elseif (point.Position - root.Position).Magnitude <= desired.Range then
                 local module = player:FindFirstChild("AuraSkillClient")
-                local loaded, skills = false, nil
-                if module then loaded, skills = pcall(require, module) end
-                local entry = loaded and type(skills) == "table" and skills[desired.Skill]
+                local load=module and moduleLoads[module]
+                if module and not load then
+                    load={At=now} moduleLoads[module]=load
+                    task.spawn(function()
+                        local ok,value=pcall(require,module)
+                        load.Loaded,load.Value,load.Done=ok,value,true
+                    end)
+                end
+                local entry=load and load.Done and load.Loaded and type(load.Value)=="table" and load.Value[desired.Skill]
                 if entry and not skillUI:GetDisabled(desired.Skill) then
                     local direction, aimPoint = HalloweenRules.Aim(root.Position, point.Position, velocity, desired.AimLead)
                     local params = RaycastParams.new() params.FilterType = Enum.RaycastFilterType.Exclude params.RespectCanCollide = true
@@ -8345,9 +8391,16 @@ local ok, failure = pcall(function()
                     local obstructed = workspace:Raycast(root.Position,aimPoint-root.Position,params)
                     attr("NeedsApproach",obstructed~=nil)
                     local canCast, reason = HalloweenRules.CastWindow(desired,root.Position,point.Position,velocity,now-stableSince,obstructed == nil)
-                    if not canCast then blocked[desired.Key] = now+0.6 attr("CastStatus",reason) direction = nil end
+                    if not canCast then
+                        blocked[desired.Key] = now+0.25 attr("CastStatus",reason) direction = nil
+                        if lastCastFailure~=target then lastCastFailure=target lastTargetFailureAt=now end
+                        attr("AimRejectedSince",lastTargetFailureAt)
+                        if reason=="Attack line obstructed" or reason=="Predicted impact out of range" or reason=="Waiting for matching elevation" then attr("NeedsApproach",true) end
+                        if now-lastTargetFailureAt>=1.5 then attr("NeedsApproach",true) end
+                    end
                     if direction then
                         attr("CastStatus","Committed aim / " .. desired.Skill)
+                        lastCastFailure=nil lastTargetFailureAt=0 attr("NeedsApproach",false) attr("AimRejectedSince",nil)
                         if CFrame.lookAt then root.CFrame = CFrame.lookAt(root.Position, Vector3.new(root.Position.X + direction.X, root.Position.Y, root.Position.Z + direction.Z)) end
                         blocked[desired.Key] = now + 12 castUntil = now + desired.Lock
                         turnStarted = true spent[desired.Key] = true
@@ -8365,8 +8418,12 @@ local ok, failure = pcall(function()
                         attr("RequestedCasts", requested) attr("LastSkill", desired.Aura.Label .. " / " .. desired.Skill)
                     end
                 else
-                    blocked[desired.Key] = now + 2
-                    spent[desired.Key] = true
+                    if load and not load.Done and now-load.At<3 then
+                        attr("CastStatus","Waiting for native skill module")
+                    else
+                        blocked[desired.Key] = now + 2 spent[desired.Key] = true
+                        if load and not load.Done then unavailable[desired.Aura.Id]=now+8 attr("CastStatus","Skill module delayed; trying another aura") end
+                    end
                 end
             end
         end
@@ -8399,6 +8456,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
     end
     local function release()
         moveEpoch += 1 moving=false dodgeGoal, dodgeUntil, moveGoal = nil, 0, nil lastPosition=nil
+        dodgePosition,dodgeProgressAt,dodgeFailures=nil,0,0
         attribute("Permit", false)
         local _, humanoid, root = character()
         if lease and MovementCoordinator.IsOwner("Halloween", lease) then
@@ -8409,12 +8467,18 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
     end
     local function enabled() return Config.HalloweenAutoFarm == true or Config.HalloweenAutoOrbs == true end
     local function valid(token) return living and Alive and enabled() and token == epoch end
+    local function stopPursuit()
+        moveEpoch+=1 moving=false moveGoal=nil dodgeGoal=nil lastPosition=nil
+        dodgePosition,dodgeProgressAt,dodgeFailures=nil,0,0
+        local _,humanoid,root=character()
+        if lease and MovementCoordinator.IsOwner("Halloween",lease) and root and not root.Anchored then humanoid:MoveTo(root.Position) end
+    end
     local function add(model)
-        if model:IsA("Model") then records[model] = { Kind = HalloweenRules.Kind(model), Label = HalloweenRules.Label(model) } end
+        if model:IsA("Model") and not records[model] then records[model] = { Kind = HalloweenRules.Kind(model), Label = HalloweenRules.Label(model) } nextChoice=0 end
     end
     local function remove(model)
         records[model] = nil HalloweenESP.Remove(model)
-        if target == model then target, targetRoot = nil, nil moveEpoch += 1 moving=false attribute("Permit", false) end
+        if target == model then stopPursuit() target,targetRoot=nil,nil attribute("Permit",false) nextChoice=0 if targetValue then targetValue.Value=nil end end
     end
     local function attachNPCs()
         local folder = workspace:FindFirstChild("NPCs")
@@ -8461,10 +8525,8 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         end
         local function selected(model)
             local kind=HalloweenRules.Kind(model)
-            if Config.HalloweenAutoOrbs then
-                return HalloweenRules.IsOrb(model) or kind~="Boss" and model.HasTag and model:HasTag("orbMinion")
-            end
-            return table.find(Config.HalloweenTargets,kind)~=nil
+            return Config.HalloweenAutoFarm and table.find(Config.HalloweenTargets,kind)~=nil
+                or Config.HalloweenAutoOrbs and (HalloweenRules.IsOrb(model) or kind~="Boss" and model.HasTag and model:HasTag("orbMinion"))
         end
         local best, bestRoot, bestScore
         local pinned
@@ -8480,12 +8542,12 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             if point and (unreachable[model] or 0) <= os.clock() and HalloweenRules.Attackable(model,npcFolder) and selected(model) then
                 local distance = (point.Position - root.Position).Magnitude
                 if distance <= Config.HalloweenSearchDistance then
-                    local score = distance * (model == target and 0.8 or 1) - (record.Kind == "Boss" and 100000 or HalloweenRules.IsOrb(model) and 50000 or 0)
+                    local score = distance * (model == target and 0.8 or 1) - (HalloweenRules.IsOrb(model) and 100000 or record.Kind == "Boss" and 50000 or 0)
                     if not bestScore or score < bestScore then best, bestRoot, bestScore = model, point, score end
                 end
             end
         end
-        if pinned and (target==best or not best or HalloweenRules.Kind(target)=="Boss" or HalloweenRules.Kind(best)~="Boss" and not HalloweenRules.IsOrb(best)) then return target, pinned end
+        if pinned and (target==best or not best or HalloweenRules.IsOrb(target) or not HalloweenRules.IsOrb(best) and (HalloweenRules.Kind(target)=="Boss" or HalloweenRules.Kind(best)~="Boss")) then return target, pinned end
         return best, bestRoot
     end
     local function groundGoal(point, model, root)
@@ -8508,7 +8570,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
     end
     local function chaseGoal(model, root, point, range)
         local offset = root.Position - point.Position offset = Vector3.new(offset.X, 0, offset.Z)
-        if offset.Magnitude < 0.1 then return end
+        if offset.Magnitude < 0.1 then offset=Vector3.new(1,0,0) end
         local preferred=bridge and tonumber(bridge:GetAttribute("PreferredDistance")) or range*0.5
         local distance=math.clamp(preferred, 6, math.max(6,range*0.8))
         local params = RaycastParams.new() params.FilterType, params.RespectCanCollide = Enum.RaycastFilterType.Exclude, true
@@ -8523,7 +8585,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             local hit=workspace:Raycast(candidate+Vector3.new(0,10,0),Vector3.new(0,-60,0),params)
             if hit and hit.Normal.Y>=0.65 then
                 local standing=hit.Position+Vector3.new(0,3,0)
-                if math.abs(standing.Y-point.Position.Y)<=8 and not workspace:Raycast(standing,point.Position-standing,params) then
+                if math.abs(standing.Y-point.Position.Y)<=(bridge and bridge:GetAttribute("AttackMaxHeight") or 6) and not workspace:Raycast(standing,point.Position-standing,params) then
                     fallback=fallback or hit.Position
                     local direct=groundGoal(candidate,model,root)
                     if direct and (direct-root.Position).Magnitude<=60 then
@@ -8584,7 +8646,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             AutoBounty = Config.HalloweenAutoBounty == true, Bounty = bounty.GetState(), CombatAlerts = Config.HalloweenCombatAlerts == true, CombatWebhook = reports.GetState(),
             OwnKills = bridge and bridge:GetAttribute("OwnKills") or 0, CastStatus = bridge and bridge:GetAttribute("CastStatus"),
             ESPTracked = esp.Tracked, ESPVisible = esp.Visible, PathStatus = routeReason,
-            Recoveries=recoveries, LastRecovery=lastRecovery, ActorRestarts=actorRestarts, ActorErrors=bridge and bridge:GetAttribute("ActorErrors") or 0,
+            Recoveries=recoveries, PursuitRecoveries=pursuitRecoveries, LastRecovery=lastRecovery, ActorRestarts=actorRestarts, ActorErrors=bridge and bridge:GetAttribute("ActorErrors") or 0,
             Tracked = count, Target = target and HalloweenRules.Label(target), MovementOwner = MovementCoordinator.GetState().Owner, Dodging = dodgeGoal ~= nil,
             CurrentAura = bridge and bridge:GetAttribute("CurrentAura"), NextAura = bridge and bridge:GetAttribute("NextAura"), NextSkill = bridge and bridge:GetAttribute("NextSkill"),
             OwnedAuras = bridge and bridge:GetAttribute("OwnedAuras"), OwnedCount = bridge and bridge:GetAttribute("OwnedCount"), RequestedCasts = bridge and bridge:GetAttribute("RequestedCasts"), ConfirmedCasts = bridge and bridge:GetAttribute("ConfirmedCasts"),
@@ -8592,7 +8654,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
     end
     function controller.Mount(page)
         metrics, toggles = {}, {}
-        UI:AddSectionHeader(page, "Combat", "Use skills by reach and estimated damage per second; kite when surrounded")
+        UI:AddSectionHeader(page, "Combat", "Pythios & Chillsear first; finish ready skills before switching")
         local definitions = { { "Farm", "Start Combat", "HalloweenAutoFarm" }, { "Orbs", "Auto Farm Orbs", "HalloweenAutoOrbs" }, { "ESP", "Monster ESP", "HalloweenESP" }, { "Dodge", "Auto Dodge Attacks", "HalloweenAutoDodge" } }
         for _, entry in ipairs(definitions) do toggles[entry[1]] = UI:AddToggle(page, entry[2], Config[entry[3]], function(value) if not syncing then controller.SetEnabled(entry[1], value) end end) end
         local rows = UI:AddMetricRow(page, { { Label = "Combat Status", Value = "Disabled" }, { Label = "Confirmed Casts", Value = "0" } })
@@ -8609,7 +8671,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         rows = UI:AddMetricRow(page, { { Label = "Your Defeats", Value = "0" }, { Label = "Combat Alerts", Value = "Disabled" } })
         metrics["Your Defeats"], metrics["Combat Alerts"] = rows[1], rows[2]
         UI:AddDivider(page, "Combat Options")
-        local targetControl = UI:AddMultiSelect(page, "Target Types (Boss First)", { "Boss", "Orb", "Minion" }, function(map)
+        local targetControl = UI:AddMultiSelect(page, "Target Types", { "Boss", "Orb", "Minion" }, function(map)
             if syncing then return end
             local selected = {} for _, kind in ipairs({ "Boss", "Orb", "Minion" }) do if map[kind] then selected[#selected + 1] = kind end end
             Config.HalloweenTargets = selected saveConfig()
@@ -8650,11 +8712,14 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             target,targetRoot=nil,nil nextChoice=0
         end
         if os.clock() >= nextChoice then
-            nextChoice = os.clock() + 0.35 attachNPCs()
+            nextChoice = os.clock() + 0.15 attachNPCs()
             local _, _, root = character()
             if root and enabled() then
                 local chosen, point = choose(root)
-                if target ~= chosen then moveEpoch += 1 moving=false lastPosition=nil combatWatch=nil approachPhase,forceApproachUntil=0,0 end target, targetRoot = chosen, point
+                if target ~= chosen then
+                    stopPursuit() combatWatch=nil nextChase=0
+                    approachPhase,forceApproachUntil,directStalls,forcePathUntil=0,0,0,0
+                end target, targetRoot = chosen, point
             else target, targetRoot = nil, nil end
             if targetValue then targetValue.Value = target end
         end
@@ -8686,7 +8751,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         end
         local health = HalloweenRules.Health(target)
         if health and health <= 0 then
-            attribute("Permit",false) moveEpoch+=1 moving=false
+            attribute("Permit",false) stopPursuit()
             target,targetRoot=nil,nil nextChoice=0
             if not pending then release() end
             return
@@ -8724,6 +8789,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         local danger = HalloweenRules.Danger(root.Position, warnings, Config.HalloweenDodgeMargin, now)
         local predicted = root.Position + root.AssemblyLinearVelocity * 0.25
         danger = math.max(danger, HalloweenRules.Danger(predicted, warnings, Config.HalloweenDodgeMargin, now))
+        local telegraphDanger=danger
         local retreatDistance=math.clamp((tonumber(bridge:GetAttribute("PreferredDistance")) or 16)+8,20,32)
         local contactDanger=HalloweenRules.Danger(root.Position,crowdWarnings,1,now)
         if contactDanger>0 and (cooling or hpPercent<65 or pressure>=2 or (tonumber(bridge:GetAttribute("PreferredDistance")) or 0)>12) then
@@ -8737,8 +8803,18 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         end
         if danger > 0 or recovering then
             moveEpoch += 1 moving=false attribute("Permit", danger == 0 and hpPercent>25)
+            if not dodgePosition or Vector3.new(root.Position.X-dodgePosition.X,0,root.Position.Z-dodgePosition.Z).Magnitude>0.7 then
+                dodgePosition,dodgeProgressAt=root.Position,os.clock()
+            elseif os.clock()-dodgeProgressAt>1.5 then
+                dodgeGoal=nil dodgeProgressAt=os.clock() dodgeFailures+=1 pursuitRecoveries+=1
+                approachPhase=(approachPhase+1)%8 lastRecovery="Escape stalled; choosing another direction"
+            end
             if not dodgeGoal or now - dodgeStarted > 2 or (dodgeGoal - root.Position).Magnitude < 2 or HalloweenRules.Danger(dodgeGoal, warnings, Config.HalloweenDodgeMargin, now) > 0 then
-                dodgeGoal = HalloweenRules.Escape(root.Position, targetRoot.Position, warnings, Config.HalloweenDodgeMargin + 1, now, function(point) return groundGoal(point, model, root) end)
+                local rejected=dodgeFailures>0 and moveGoal
+                dodgeGoal = HalloweenRules.Escape(root.Position, targetRoot.Position, warnings, Config.HalloweenDodgeMargin + 1, now, function(point)
+                    if rejected and (point-rejected).Magnitude<6 then return nil end
+                    return groundGoal(point, model, root)
+                end)
                 dodgeStarted = now
                 if recovering then
                     local away = Vector3.new(0,0,0)
@@ -8751,11 +8827,14 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
                     if away.Magnitude<0.01 then away=root.Position-targetRoot.Position away=Vector3.new(away.X,0,away.Z) end
                     if away.Magnitude > 0.1 then
                         local retreat = groundGoal(root.Position + away.Unit * math.min(18,retreatDistance), model, root)
-                        if retreat and HalloweenRules.Danger(retreat, warnings, Config.HalloweenDodgeMargin, now) == 0 then dodgeGoal = retreat end
+                        if retreat and (not rejected or (retreat-rejected).Magnitude>=6) and HalloweenRules.Danger(retreat, warnings, Config.HalloweenDodgeMargin, now) == 0 then dodgeGoal = retreat end
                     end
                 end
             end
             dodgeUntil = now + 0.3
+            -- Contact avoidance alone must not permanently suppress the quick
+            -- ready attack when every escape direction is blocked.
+            if not dodgeGoal and telegraphDanger==0 and hpPercent>45 and not cooling then attribute("Permit",true) end
             if dodgeGoal then moveDirect(humanoid, root, dodgeGoal, moveGoal == nil) status = recovering and "Retreating to recover HP" or cooling and "Keeping distance during cooldown" or "Dodging attack warning"
             else if moveGoal then humanoid:MoveTo(root.Position) moveGoal = nil end status = "No clear dodge route" end
             return
@@ -8765,16 +8844,23 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         end
         dodgeGoal = nil
         if recovering then attribute("Permit", true) status = "Recovering HP" return end
-        if cooling then
+        local range = tonumber(bridge:GetAttribute("AttackRange")) or 25
+        local preferred = math.min(range*0.85,tonumber(bridge:GetAttribute("PreferredDistance")) or range*0.65)
+        local distance = (targetRoot.Position - root.Position).Magnitude
+        if cooling and distance <= preferred+2 and bridge:GetAttribute("NeedsApproach")~=true then
             attribute("Permit",false) moveEpoch+=1 moving=false
             if moveGoal then humanoid:MoveTo(root.Position) moveGoal=nil end
             lastProgressAt=os.clock() lastPosition=root.Position
             status="Waiting for skills at safe distance" return
         end
-        attribute("Permit", true)
-        local range = tonumber(bridge:GetAttribute("AttackRange")) or 25
-        local preferred = math.min(range*0.85,tonumber(bridge:GetAttribute("PreferredDistance")) or range*0.65)
-        local distance = (targetRoot.Position - root.Position).Magnitude
+        attribute("Permit", not cooling)
+        local rejectedSince=tonumber(bridge:GetAttribute("AimRejectedSince"))
+        if rejectedSince and now-rejectedSince>1.5 and os.clock()>=aimRepositionAt and bridge:GetAttribute("Casting")~=true then
+            moveEpoch+=1 moving=false moveGoal=nil nextChase=0
+            approachPhase=(approachPhase+1)%8 forceApproachUntil=os.clock()+2
+            aimRepositionAt=os.clock()+2 lastPosition,lastProgressAt=root.Position,os.clock()
+            routeReason="Attack window blocked; changing approach angle"
+        end
         if moving and pathTargetPosition and (targetRoot.Position-pathTargetPosition).Magnitude>10 then
             moveEpoch+=1 moving=false nextChase=os.clock()+0.2
             humanoid:MoveTo(root.Position) moveGoal=nil
@@ -8818,7 +8904,17 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             if moving or moveGoal then moveEpoch += 1 moving=false moveGoal=nil humanoid:MoveTo(root.Position) end
             lastProgressAt=os.clock() moveGoal=nil
             status = "Attacking " .. HalloweenRules.Label(target)
-        elseif not moving and os.clock()-lastProgressAt > 2 then
+        elseif moving and os.clock()-lastProgressAt > ((Navigation.GetState and Navigation.GetState().Status=="Computing route") and 7.5 or 4.5) then
+            moveEpoch+=1 moving=false moveGoal=nil nextChase=os.clock()+0.1
+            approachPhase=(approachPhase+1)%8 forcePathUntil=os.clock()+12
+            lastPosition,lastProgressAt=root.Position,os.clock()
+            pursuitRecoveries+=1 directStalls+=1
+            lastRecovery="Pursuit stalled; changing approach route" routeReason=lastRecovery
+            humanoid:MoveTo(root.Position) status="Recovering stalled pursuit"
+            if directStalls>=3 then
+                unreachable[target]=os.clock()+3 target,targetRoot=nil,nil nextChoice=0 directStalls=0 attribute("Permit",false)
+            end
+        elseif not moving and os.clock()-lastProgressAt > 1.5 then
             moveEpoch += 1 moving=false nextChase=os.clock()+0.4
             humanoid:MoveTo(root.Position) moveGoal=nil
             directStalls += 1 forcePathUntil=os.clock()+12
@@ -8830,6 +8926,9 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             end
         elseif not moving and os.clock() >= nextChase then
             local goal,direct = chaseGoal(model,root,targetRoot,range)
+            if goal and bridge:GetAttribute("NeedsApproach")==true and Vector3.new(goal.X-root.Position.X,0,goal.Z-root.Position.Z).Magnitude<3.5 then
+                approachPhase=(approachPhase+1)%8 goal,direct=chaseGoal(model,root,targetRoot,range)
+            end
             if not goal then unreachable[target]=os.clock()+3 target,targetRoot=nil,nil attribute("Permit",false) status="Finding reachable ground" return end
             if HalloweenRules.Danger(goal, warnings, Config.HalloweenDodgeMargin, now) > 0 then attribute("Permit", false) status = "Waiting for attack area to clear" return end
             if direct and os.clock() >= forcePathUntil then
@@ -9116,7 +9215,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.36", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.37", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -9452,6 +9551,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.36")
+local loader, failure = loadstring(source, "BonesHub 3.37")
 if not loader then error(failure) end
 return loader()
