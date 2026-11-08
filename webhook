@@ -7654,7 +7654,7 @@ function HalloweenBounty.Create(options)
         end
         return index, data
     end
-    function self.Invalidate() dirty = true nextFetch = math.min(nextFetch, clock() + 0.5) end
+    function self.Invalidate() dirty = true nextFetch = math.min(nextFetch, clock() + 1.5) end
     function self.GetState() return { Status = status, Claimed = claimed, InFlight = pending ~= nil, NextUpdateTime = hunt and hunt.NextUpdateTime } end
     function self.Destroy()
         living = false stopRequest(true)
@@ -7707,16 +7707,24 @@ function HalloweenBounty.Create(options)
                 if event then connections[#connections + 1] = event.OnClientEvent:Connect(self.Invalidate) end
             end
         end
-        if (dirty or not hunt or now >= nextFetch) and now >= nextFetch then
+        if (not hunt or not definitions) and now >= nextFetch then
             dirty = false status = "Checking Bounty Hunt" request(fetch) return
         end
         if not hunt or not definitions then return end
-        if hunt.NextUpdateTime <= serverNow() then dirty = true status = "Waiting for daily reset" return end
-        if dirty then return end
+        if hunt.NextUpdateTime <= serverNow() then
+            dirty = true
+            if now >= nextFetch then status = "Waiting for daily reset" request(fetch) return end
+            status = "Waiting for daily reset" return
+        end
         local allReady, allClaimed, blocked = true, true, false
         for _, slot in ipairs(slots) do
             local record = hunt[slot]
-            local ready = record.progress >= definitions[slot][record.id].goal
+            local definition = definitions[slot][record.id]
+            local ready = record.progress >= definition.goal
+            if not ready and record.completed ~= true then
+                acknowledged[slot] = nil
+                uncertain[slot] = nil
+            end
             local done = record.completed == true or acknowledged[slot] == true
             allReady, allClaimed = allReady and ready, allClaimed and done
             if not done and uncertain[slot] then blocked = true end
@@ -7727,6 +7735,7 @@ function HalloweenBounty.Create(options)
             elseif now >= nextClaim then status = "Claiming final reward" request(claim, "FinalReward", "FinalReward", hunt.NextUpdateTime) return end
         end
         status = blocked and "Unconfirmed claim; awaiting server confirmation" or (hunt.FinalReward ~= nil or acknowledged.FinalReward) and "Daily rewards claimed" or "Waiting for completed bounties"
+        if dirty and now >= nextFetch then dirty = false status = status request(fetch) end
     end
     return self
 end
@@ -9452,7 +9461,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.49", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.50", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -9788,6 +9797,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.49")
+local loader, failure = loadstring(source, "BonesHub 3.50")
 if not loader then error(failure) end
 return loader()
