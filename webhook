@@ -168,7 +168,7 @@ local DEFAULT_CONFIG = {
     AutoWeatherControllers = false,
     AutoEden = false,
     AutoMemoryParty = false, MemoryPartyItems = {}, MemoryPartyWebhook = "", MemoryPartyWebhooks = true,
-    Webhook = "", PSLink = "", AntiAfk = true, BiomeScanInterval = 0.5, UIMode = "Original", InterfaceMotion = true, InterfaceStyleVersion = 3,
+    Webhook = "", SessionDigest = false, PSLink = "", AntiAfk = true, BiomeScanInterval = 0.5, UIMode = "Original", InterfaceMotion = true, InterfaceStyleVersion = 3,
     AuraEnabled = false, AuraMinimum = 1000000, AuraWebhook = "", AuraPing = false,
     PingBiomes = {
         HEAVEN = false, NULL = false, HELL = false, STARFALL = false, WINDY = false,
@@ -264,6 +264,71 @@ local function footer(label)
     return { text = label or string.format("bones hub by Ethereal - v3.8 | %dms", pingMs()) }
 end
 
+local SessionFeed = (function()
+    local feed = {}
+    local events, counters, lastText = {}, {}, {}
+    local startedAt = os.clock()
+    local limit = 400
+    local rules = {
+        { Key = "delivery", Match = "webhook delivered" },
+        { Key = "delivery", Match = "webhook failed" },
+        { Key = "biome", Match = "biome" },
+        { Key = "purchase", Match = "purchased" },
+        { Key = "merchant", Match = "merchant" },
+        { Key = "quest", Match = "quest" },
+        { Key = "aura", Match = "aura" },
+        { Key = "fish", Match = "fish" },
+        { Key = "combat", Match = "combat" },
+        { Key = "recovery", Match = "recover" },
+        { Key = "reward", Match = "reward" },
+    }
+    local function classify(text)
+        local lower = text:lower()
+        for _, rule in ipairs(rules) do
+            if lower:find(rule.Match, 1, true) then return rule.Key end
+        end
+        return "misc"
+    end
+    function feed.Push(level, message)
+        local text = tostring(message or "")
+        if text == "" then return end
+        local now = os.clock()
+        if lastText[text] and now - lastText[text] < 3 then return end
+        lastText[text] = now
+        local kind = classify(text)
+        counters[kind] = (counters[kind] or 0) + 1
+        counters.total = (counters.total or 0) + 1
+        if level == "ERROR" or level == "WARN" then counters.problems = (counters.problems or 0) + 1 end
+        table.insert(events, 1, { At = now, Kind = kind, Level = level, Text = text:sub(1, 160) })
+        while #events > limit do table.remove(events) end
+    end
+    function feed.Count(key) return counters[key] or 0 end
+    function feed.Uptime() return os.clock() - startedAt end
+    function feed.Stats() return counters end
+    function feed.Recent(count)
+        local out = {}
+        for index = 1, math.min(count or 8, #events) do out[#out + 1] = events[index] end
+        return out
+    end
+    function feed.Digest()
+        local minutes = math.floor(feed.Uptime() / 60)
+        local lines = {
+            "**Session:** " .. tostring(math.floor(minutes / 60)) .. "h " .. tostring(minutes % 60) .. "m",
+            "**Events:** " .. tostring(counters.total or 0) .. "  **Problems:** " .. tostring(counters.problems or 0),
+            "**Biomes:** " .. tostring(counters.biome or 0) .. "  **Merchants:** " .. tostring(counters.merchant or 0) .. "  **Purchases:** " .. tostring(counters.purchase or 0),
+            "**Quests:** " .. tostring(counters.quest or 0) .. "  **Auras:** " .. tostring(counters.aura or 0) .. "  **Fish:** " .. tostring(counters.fish or 0),
+            "**Combat:** " .. tostring(counters.combat or 0) .. "  **Recoveries:** " .. tostring(counters.recovery or 0),
+        }
+        local recent = feed.Recent(5)
+        if #recent > 0 then
+            lines[#lines + 1] = ""
+            for _, entry in ipairs(recent) do lines[#lines + 1] = "• " .. entry.Text end
+        end
+        return table.concat(lines, "\n")
+    end
+    return feed
+end)()
+
 local function log(message, level)
     local kind = level or "INFO"
     local line = string.format("[%s] %s", nowClock(), tostring(message))
@@ -272,6 +337,7 @@ local function log(message, level)
     if console and type(console.Log) == "function" then
         pcall(function() console:Log(line, kind) end)
     end
+    pcall(SessionFeed.Push, kind, tostring(message))
 end
 
 local function saveConfig()
@@ -417,6 +483,20 @@ local function sendStopped(elapsed)
         .. "\n**Merchant Count:** " .. tostring(State.SessionMerchants)
     return sendCard("macro-stopped", body, 0xFF0000, false)
 end
+local function sendDigest()
+    return sendCard("session-digest", "# Session Digest\n" .. SessionFeed.Digest(), 0x5865F2, false)
+end
+task.spawn(function()
+    local since = 0
+    while Alive do
+        task.wait(60)
+        if Config.SessionDigest == true and trim(Config.Webhook or "") ~= "" and SessionFeed.Uptime() - since >= 1800 then
+            since = SessionFeed.Uptime()
+            pcall(sendDigest)
+        end
+    end
+end)
+
 local function sendWebhookTest()
     return sendCard("webhook-test", "# Webhook Working", 0x00FF88, false, nil, "bones hub by Ethereal - v3.8 | Webhook Test")
 end
@@ -699,6 +779,16 @@ local function updateStatus()
         if Controls.LastBiome and Controls.LastBiome.ValueLabel then Controls.LastBiome.ValueLabel.Text = tostring(State.LastBiome) end
         if Controls.SessionBiomes and Controls.SessionBiomes.ValueLabel then Controls.SessionBiomes.ValueLabel.Text = tostring(State.SessionBiomes) end
         if Controls.SessionMerchants and Controls.SessionMerchants.ValueLabel then Controls.SessionMerchants.ValueLabel.Text = tostring(State.SessionMerchants) end
+        if Controls.Insights then
+            local stats = SessionFeed.Stats()
+            local function cell(index, value)
+                local row = Controls.Insights[index]
+                if row and row.ValueLabel then row.ValueLabel.Text = tostring(value) end
+            end
+            cell(1, stats.total or 0)
+            cell(2, stats.recovery or 0)
+            cell(3, stats.problems or 0)
+        end
         if Controls.Alerts and Controls.Alerts.ValueLabel then Controls.Alerts.ValueLabel.Text = tostring(State.AlertsSent) end
         if Controls.MainWorldWeather and Controls.MainWorldWeather.ValueLabel then Controls.MainWorldWeather.ValueLabel.Text = observed or "Unavailable" end
         if Controls.WeatherSource and Controls.WeatherSource.ValueLabel then Controls.WeatherSource.ValueLabel.Text = WeatherSource end
@@ -9676,7 +9766,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.54", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.55", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -9746,7 +9836,11 @@ end)
 Controls.Webhook:Set(Config.Webhook)
 UI:AddButtonRow(7, {
     { Text = "Test Webhook", Style = "primary", Width = 150, Callback = debounced(sendWebhookTest, 2) },
+    { Text = "Send Digest", Style = "ghost", Width = 150, Callback = debounced(function() pcall(sendDigest) end, 2) },
 })
+UI:AddToggle(7, "Session Digest", Config.SessionDigest == true, function(value)
+    Config.SessionDigest = value == true saveConfig()
+end, "Posts a session summary to the webhook every 30 minutes")
 AuraNotifications.Mount(6)
 UI:AddDivider(7, "Session")
 Controls.AntiAfk = UI:AddToggle(7, "Anti-AFK", Config.AntiAfk, function(value)
@@ -9785,6 +9879,13 @@ local sessionMetrics = UI:AddMetricRow(8, {
     { Label = "Alerts Sent", Value = "0", Unit = "this session" },
 })
 Controls.SessionBiomes, Controls.SessionMerchants, Controls.Alerts = sessionMetrics[1], sessionMetrics[2], sessionMetrics[3]
+UI:AddDivider(8, "Session Insights")
+local insightMetrics = UI:AddMetricRow(8, {
+    { Label = "Activity Events", Value = "0", Unit = "this session" },
+    { Label = "Recoveries", Value = "0", Unit = "auto handled" },
+    { Label = "Problems", Value = "0", Unit = "warn / error" },
+})
+Controls.Insights = insightMetrics
 UI:AddDivider(8, "Event Log")
 Controls.LogConsole = UI:AddLogConsole(8, 200)
 
@@ -9904,6 +10005,8 @@ function API.SetAutomationEnabled(feature, value) return Automation.SetEnabled(f
 function API.SelectAutomation(feature, values) return Automation.Select(feature, values) end
 function API.GetScriptCompatibilityState() return ScriptCompatibility.GetState() end
 function API.GetNavigationState() return Navigation.GetState() end
+function API.GetSessionFeed() return { Stats = SessionFeed.Stats(), Uptime = SessionFeed.Uptime(), Recent = SessionFeed.Recent(12), Digest = SessionFeed.Digest() } end
+function API.SendSessionDigest() return sendDigest() end
 function API.SetAutoReexecute(value) return Reexecution.SetEnabled(value) end
 function API.GetReexecutionState() return Reexecution.GetState() end
 function API.GetAutomationState() return Automation.GetState() end
@@ -10022,6 +10125,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.54")
+local loader, failure = loadstring(source, "BonesHub 3.55")
 if not loader then error(failure) end
 return loader()
