@@ -156,7 +156,7 @@ local function preloadPacketNamespaces()
 end
 task.spawn(preloadPacketNamespaces)
 local DEFAULT_CONFIG = {
-    HalloweenAutoFarm = false, HalloweenAutoOrbs = false, HalloweenAutoBounty = false, HalloweenCombatAlerts = false, HalloweenCombatWebhook = "", HalloweenESP = false, HalloweenAutoDodge = true, HalloweenAutoEquip = true, HalloweenRotateAuras = true,
+    HalloweenAutoFarm = false, HalloweenAutoOrbs = false, HalloweenAutoBounty = false, HalloweenCombatAlerts = false, HalloweenCombatWebhook = "", HalloweenESP = false, HalloweenCombatHUD = true, HalloweenAutoDodge = true, HalloweenAutoEquip = true, HalloweenRotateAuras = true,
     HalloweenAuras = { "PYTHIOS", "CHILLSEAR", "Archangel", "Starscourge_Radiant" }, HalloweenTargets = { "Boss", "Orb", "Minion" }, HalloweenDamageScores = {},
     HalloweenSearchDistance = 1000, HalloweenESPDistance = 5000, HalloweenDodgeMargin = 4, HalloweenRetreatHP = 20, HalloweenEngageDistance = 12,
     AutoMerchant = false, MerchantSelections = { Mari = {}, Jester = {}, Rin = {} }, MerchantCatalogs = { Mari = {}, Jester = {}, Rin = {} }, MerchantPurchases = {}, MerchantAmounts = { Mari = {}, Jester = {}, Rin = {} },
@@ -7653,6 +7653,112 @@ local HalloweenESP = (function()
     return esp
 end)()
 
+local HalloweenHUD = (function()
+    local hud = {}
+    local available = type(Drawing) == "table" and type(Drawing.new) == "function"
+    local ui, floaters, window = nil, {}, {}
+    local lastTarget, lastHealth, totalDamage = nil, nil, 0
+    local function build()
+        ui = {
+            panel = Drawing.new("Square"),
+            border = Drawing.new("Square"),
+            title = Drawing.new("Text"),
+            barBack = Drawing.new("Square"),
+            barFill = Drawing.new("Square"),
+            value = Drawing.new("Text"),
+            stats = Drawing.new("Text"),
+        }
+        ui.panel.Filled, ui.panel.Color, ui.panel.Transparency = true, Color3.fromRGB(12, 16, 22), 0.22
+        ui.border.Filled, ui.border.Thickness, ui.border.Color = false, 1, Color3.fromRGB(88, 108, 132)
+        ui.title.Size, ui.title.Font, ui.title.Outline = 14, 2, true
+        ui.barBack.Filled, ui.barBack.Color, ui.barBack.Transparency = true, Color3.fromRGB(34, 40, 50), 0.25
+        ui.barFill.Filled = true
+        ui.value.Size, ui.value.Font, ui.value.Outline = 12, 2, true
+        ui.value.Color = Color3.fromRGB(208, 224, 240)
+        ui.stats.Size, ui.stats.Font, ui.stats.Outline = 11, 2, true
+        ui.stats.Color = Color3.fromRGB(168, 188, 208)
+    end
+    function hud.Update(target, root, kills, orbs)
+        if not available or Config.HalloweenCombatHUD ~= true then hud.Clear() return end
+        if not ui then build() end
+        local camera = workspace.CurrentCamera
+        if not camera then hud.Clear() return end
+        local viewport = camera.ViewportSize
+        local width, height, top = 300, 58, 74
+        local left = math.floor(viewport.X / 2 - width / 2)
+        local humanoid = target and target:FindFirstChildOfClass("Humanoid")
+        local hp, maxHp = humanoid and humanoid.Health, humanoid and humanoid.MaxHealth
+        local now = os.clock()
+        if target ~= lastTarget then lastTarget, lastHealth = target, hp end
+        if target and hp and lastHealth and hp < lastHealth - 0.05 then
+            local damage = lastHealth - hp
+            totalDamage += damage
+            window[#window + 1] = { At = now, Value = damage }
+            local point = target:FindFirstChild("HumanoidRootPart")
+            if point then
+                local screen = camera:WorldToViewportPoint(point.Position + Vector3.new(0, 2.6, 0))
+                if screen.Z > 0 then
+                    local text = Drawing.new("Text")
+                    text.Text = "-" .. tostring(math.floor(damage))
+                    text.Size, text.Font, text.Center, text.Outline = damage >= 45 and 19 or 14, 2, true, true
+                    text.Color = damage >= 60 and Color3.fromRGB(255, 96, 96) or damage >= 35 and Color3.fromRGB(255, 205, 90) or Color3.fromRGB(240, 245, 250)
+                    local offset = (math.random() * 36) - 18
+                    text.Position = Vector2.new(screen.X + offset, screen.Y)
+                    floaters[#floaters + 1] = { Object = text, At = now, X = screen.X + offset, Y = screen.Y }
+                end
+            end
+        end
+        if hp then lastHealth = hp end
+        local index = #floaters
+        while index >= 1 do
+            local entry = floaters[index]
+            local age = now - entry.At
+            if age > 0.9 then
+                pcall(function() entry.Object:Remove() end)
+                table.remove(floaters, index)
+            else
+                entry.Object.Position = Vector2.new(entry.X, entry.Y - age * 46)
+                entry.Object.Transparency = math.clamp(1 - age / 0.9, 0, 1)
+            end
+            index -= 1
+        end
+        while window[1] and now - window[1].At > 12 do table.remove(window, 1) end
+        local sum, oldest = 0, now
+        for _, entry in ipairs(window) do sum += entry.Value if entry.At < oldest then oldest = entry.At end end
+        local dps = math.floor(sum / math.max(1, now - oldest))
+        local ratio = hp and maxHp and maxHp > 0 and math.clamp(hp / maxHp, 0, 1) or 0
+        local barWidth = width - 24
+        ui.panel.Position, ui.panel.Size = Vector2.new(left, top), Vector2.new(width, height)
+        ui.border.Position, ui.border.Size = ui.panel.Position, ui.panel.Size
+        ui.title.Text = target and tostring(target.Name) or "No target"
+        ui.title.Color = target and Color3.fromRGB(255, 214, 64) or Color3.fromRGB(148, 164, 180)
+        ui.title.Position = Vector2.new(left + 12, top + 6)
+        ui.barBack.Position, ui.barBack.Size = Vector2.new(left + 12, top + 30), Vector2.new(barWidth, 9)
+        ui.barFill.Position, ui.barFill.Size = Vector2.new(left + 12, top + 30), Vector2.new(math.max(0, barWidth * ratio), 9)
+        ui.barFill.Color = ratio > 0.6 and Color3.fromRGB(120, 225, 140) or ratio > 0.3 and Color3.fromRGB(250, 200, 90) or Color3.fromRGB(240, 100, 100)
+        ui.value.Text = hp and string.format("%d%%  %d/%d", math.floor(ratio * 100), math.floor(hp), math.floor(maxHp or 0)) or "HP unknown"
+        ui.value.Position = Vector2.new(left + width - 14 - (#ui.value.Text * 6), top + 6)
+        ui.stats.Text = string.format("DPS %d   kills %d   orbs %d   dmg %d", dps, tonumber(kills) or 0, tonumber(orbs) or 0, math.floor(totalDamage))
+        ui.stats.Position = Vector2.new(left + 12, top + 41)
+        for _, object in pairs(ui) do object.Visible = true end
+        ui.barBack.Visible, ui.barFill.Visible = hp ~= nil, hp ~= nil
+    end
+    function hud.Clear()
+        if ui then for _, object in pairs(ui) do pcall(function() object.Visible = false end) end end
+        for _, entry in ipairs(floaters) do pcall(function() entry.Object:Remove() end) end
+        table.clear(floaters)
+    end
+    function hud.Destroy()
+        hud.Clear()
+        if ui then for _, object in pairs(ui) do pcall(function() object:Remove() end) end end
+        ui = nil
+        lastTarget, lastHealth, totalDamage = nil, nil, 0
+        table.clear(window)
+    end
+    function hud.Status() return available and "HUD ready" or "Drawing unavailable" end
+    return hud
+end)()
+
 local HalloweenBounty = {}
 function HalloweenBounty.Create(options)
     local self = {}
@@ -8896,12 +9002,13 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         attribute("EngageDistance", Config.HalloweenEngageDistance or 12)
     end
     function controller.SetEnabled(feature, value)
-        local key = ({ Farm = "HalloweenAutoFarm", Orbs = "HalloweenAutoOrbs", Bounty = "HalloweenAutoBounty", Alerts = "HalloweenCombatAlerts", ESP = "HalloweenESP", Dodge = "HalloweenAutoDodge", Equip = "HalloweenAutoEquip", Rotate = "HalloweenRotateAuras" })[feature]
+        local key = ({ Farm = "HalloweenAutoFarm", Orbs = "HalloweenAutoOrbs", Bounty = "HalloweenAutoBounty", Alerts = "HalloweenCombatAlerts", ESP = "HalloweenESP", HUD = "HalloweenCombatHUD", Dodge = "HalloweenAutoDodge", Equip = "HalloweenAutoEquip", Rotate = "HalloweenRotateAuras" })[feature]
         if not key then return false end
         value = value == true Config[key] = value
         if (feature == "Farm" or feature == "Orbs") and value then Config.HalloweenAutoEquip, Config.HalloweenRotateAuras = true, true end
         if feature == "Farm" or feature == "Orbs" then epoch += 1 release() nextChoice=0 target, targetRoot = nil, nil if targetValue then targetValue.Value = nil end end
         if feature == "ESP" and not value then HalloweenESP.Clear() end
+        if feature == "HUD" and not value then HalloweenHUD.Clear() end
         if feature == "Bounty" then bounty.Invalidate() bounty.Step() end
         if feature == "Alerts" then reports.Reset() end
         if not syncing and toggles[feature] and type(toggles[feature].Set) == "function" then
@@ -8944,7 +9051,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
     function controller.Mount(page)
         metrics, toggles = {}, {}
         UI:AddSectionHeader(page, "Combat", "Pythios & Chillsear first; finish ready skills before switching")
-        local definitions = { { "Farm", "Start Combat", "HalloweenAutoFarm" }, { "Orbs", "Auto Farm Orbs", "HalloweenAutoOrbs" }, { "ESP", "Monster ESP", "HalloweenESP" }, { "Dodge", "Auto Dodge Attacks", "HalloweenAutoDodge" } }
+        local definitions = { { "Farm", "Start Combat", "HalloweenAutoFarm" }, { "Orbs", "Auto Farm Orbs", "HalloweenAutoOrbs" }, { "ESP", "Monster ESP", "HalloweenESP" }, { "HUD", "Combat HUD", "HalloweenCombatHUD" }, { "Dodge", "Auto Dodge Attacks", "HalloweenAutoDodge" } }
         for _, entry in ipairs(definitions) do toggles[entry[1]] = UI:AddToggle(page, entry[2], Config[entry[3]], function(value) if not syncing then controller.SetEnabled(entry[1], value) end end) end
         local rows = UI:AddMetricRow(page, { { Label = "Combat Status", Value = "Disabled" }, { Label = "Confirmed Casts", Value = "0" } })
         metrics["Combat Status"], metrics["Confirmed Casts"] = rows[1], rows[2]
@@ -8987,6 +9094,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         attribute("CombatPending", false)
         if bridge and bridge.Parent then bridge:SetAttribute("Active", false) end
         HalloweenESP.Clear()
+        HalloweenHUD.Destroy()
         if npcAdded then npcAdded:Disconnect() end if npcRemoved then npcRemoved:Disconnect() end
         for _, connection in ipairs(connections) do connection:Disconnect() end
     end
@@ -9328,6 +9436,8 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         local _, _, root = character()
         local ok, failure = pcall(HalloweenESP.Update, records, root and root.Position)
         if not ok then errorText = tostring(failure) end
+        local hudOk, hudFailure = pcall(HalloweenHUD.Update, target, targetRoot, bridge and bridge:GetAttribute("OwnKills"), bridge and bridge:GetAttribute("OwnOrbs"))
+        attribute("HUDStatus", hudOk and HalloweenHUD.Status() or tostring(hudFailure))
     end)
     task.spawn(function()
         local old = core:FindFirstChild("BonesHubHalloweenBridge")
@@ -9566,7 +9676,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.53", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.54", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -9912,6 +10022,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.53")
+local loader, failure = loadstring(source, "BonesHub 3.54")
 if not loader then error(failure) end
 return loader()
