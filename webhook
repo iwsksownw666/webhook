@@ -86,7 +86,7 @@ local ScriptCompatibility = (function()
                 watch(object)
             end
         end
-        -- Connect before scanning so a UI added during startup is not missed.
+
         connections[#connections+1]=LocalPlayer.ChildAdded:Connect(function(child)
             if child:IsA("PlayerGui") then bind(child) end
         end)
@@ -1335,7 +1335,7 @@ local Navigation = (function()
         forward = forward.Unit
         local side = Vector3.new(-forward.Z,0,forward.X)
         local best, bestScore
-        -- Check both sides and the space behind us; do not choose an unchecked diagonal.
+
         local checked = 0
         for _, distance in ipairs({ 4, 7 }) do
             for _, angle in ipairs({ 90, -90, 135, -135, 180, 45, -45 }) do
@@ -1371,7 +1371,7 @@ local Navigation = (function()
         command(humanoid,root.Position)
         return flat(root.Position-start).Magnitude > 1
     end
-    -- Non-yielding: shared by path following and combat's direct ground movement.
+
     function controller.TryStep(model, humanoid, root, destination)
         if root.Anchored or humanoid.Health <= 0 or humanoid.FloorMaterial == Enum.Material.Air then return false end
         if stepHumanoid == humanoid and os.clock() - stepAt < 0.8 then return false end
@@ -1432,8 +1432,7 @@ local Navigation = (function()
             if blocked and blocked(type(waypoint) == "table" and waypoint.PathIndex or index) then return false, "Path obstructed" end
             local position = waypoint.Position
             local offset = flat(position - root.Position)
-            -- Navmesh height can sit above the actual collision floor (notably
-            -- the shop ledge). Resolve once, rather than trying to climb air.
+
             if not (type(waypoint)=="table" and waypoint.Bridge) then
                 if surfaces[index]==nil then
                     local floor=workspace:Raycast(position+Vector3.new(0,1.5,0),Vector3.new(0,-7,0),ray)
@@ -1470,8 +1469,7 @@ local Navigation = (function()
                     sentIndex,sentAt=index,os.clock()
                 end
             end
-            -- Keep moving through a jump link in the air; waiting to land at
-            -- the lip before advancing can strand the character below it.
+
             if jump and jumped and not final and os.clock()-jumpAt>=0.1
                 and (humanoid.FloorMaterial == Enum.Material.Air or offset.Magnitude<=1.1) then
                 index+=1 jumped,recovered=false,false bestDistance,progressAt=math.huge,os.clock()
@@ -1489,8 +1487,7 @@ local Navigation = (function()
                 end
                 if not clearValue then
                     canAdvance = offset.Magnitude <= 0.65
-                    -- MoveTo stops about one stud short. Drive through a guarded
-                    -- corner only along a checked incoming corridor, then turn.
+
                     if not canAdvance and index>1 and offset.Magnitude<=1.6 then
                         local incoming=flat(position-points[index-1].Position)
                         if incoming.Magnitude>0.1 then
@@ -1620,7 +1617,7 @@ local Navigation = (function()
             local reached,reason=pathWalk(entry,function()
                 return valid() and LocalPlayer.Character==model and humanoid.Health>0 and (root.Position-entry).Magnitude<1000
             end,2)
-            -- A touch can transfer the character before the approach returns.
+
             if not valid() or LocalPlayer.Character~=model or humanoid.Health<=0 then return false,"Stopped or character changed" end
             if (root.Position-exit).Magnitude>300 then
                 if not reached then return false,reason end
@@ -1883,8 +1880,7 @@ local Potion = (function()
                 return false, "Stella shortcut is locked"
             end
         end
-        -- Shared navigation recognizes a native portal transfer even when the
-        -- entry waypoint stops early. Do not run a second portal state machine.
+
         return walkPortal(destination, token, reach)
     end
 
@@ -3328,7 +3324,6 @@ do
     end)
 end
 
-
 local EdenAutomation = (function()
 local SETTINGS = {
     Enabled = Config.AutoEden == true,
@@ -4489,7 +4484,7 @@ end)()
         if combatPending() then
             attribute("YieldAfterCatch", true)
             if current.Fishing or current.SalePending or selling then
-                -- Finish the owned catch; never send quit merely because a monster spawned.
+
                 pause(false)
             else releaseMovement() end
             return
@@ -4671,7 +4666,7 @@ local function data()
         end
     end
 end
--- Read-only telemetry must survive a yielding operation or packet callback.
+
 local telemetryRunning = true
 task.spawn(function()
     while telemetryRunning and bridge.Parent and (alive() or ownedFishing) do
@@ -4776,7 +4771,7 @@ local nativeCleanup = {}
 local function finishNative()
     local ok, failure = true, nil
     if nativeCleanup.Finish then ok, failure = pcall(nativeCleanup.Finish) end
-    -- Native callbacks may lower thread identity, including on an error path.
+
     if setthreadidentity then setthreadidentity(8) end
     if not ok and bridge.Parent then bridge:SetAttribute("CleanupError", tostring(failure)) end
 end
@@ -5327,7 +5322,7 @@ local ok, err = pcall(function()
         local nativeTableCache, nativeTableSignal
     if debug and type(debug.getupvalues) == "function" then
         local success, values = pcall(debug.getupvalues, craftingData.getTable)
-        -- CraftingData.getTable: u3 (catalog cache), u6 (completion signal), GetRecipeData.
+
         if success and type(values[1]) == "table" and type(values[2]) == "table"
             and type(values[2].Fire) == "function" then
             nativeTableCache, nativeTableSignal = values[1], values[2]
@@ -5339,7 +5334,7 @@ local ok, err = pcall(function()
         if prior ~= "__inflight__" and (prior == nil or validShop(prior)) then return end
         local recovered = cloneCatalog(shop)
         nativeTableCache[namespace] = recovered
-        -- Resume native UI continuations at their normal identity.
+
         local identity = getthreadidentity and getthreadidentity()
         if setthreadidentity then setthreadidentity(2) end
         local success, reason = pcall(nativeTableSignal.Fire, nativeTableSignal, namespace, recovered)
@@ -5353,7 +5348,7 @@ local ok, err = pcall(function()
         if not failed and nativeUI.currentList and type(nativeUI.currentList.recipeButtons) == "table" then return false end
         if not debug or type(debug.getupvalues) ~= "function" or type(debug.setupvalue) ~= "function" then return false end
         local values = debug.getupvalues(originalOpen)
-        -- CraftingUIBeta.open sets its first upvalue (u2) before constructing RecipeLists.
+
         if type(values[1]) ~= "boolean" then return false end
         debug.setupvalue(originalOpen, 1, false)
         nativeUI.isOpened, nativeUI.enabled = false, false
@@ -5425,7 +5420,7 @@ local ok, err = pcall(function()
             if nativeUI.isOpened then attribute("JakeRecovery", "Workshop already open") return end
             rs:SetAttribute("CraftingUI", true)
             local identity = getthreadidentity and getthreadidentity()
-            -- A native UI transition may finish even when the hub is unloaded.
+
             workers[coroutine.running()] = nil
             if setthreadidentity then setthreadidentity(2) end
             local success, result = pcall(nativeUI.open, cloneCatalog(shop))
@@ -5445,7 +5440,7 @@ local ok, err = pcall(function()
         attribute("CatalogRequests", (bridge:GetAttribute("CatalogRequests") or 0) + 1)
         spawnWorker(function()
             local success, shop = pcall(function()
-                -- Background discovery must not leave a sentinel in the native UI cache.
+
                 return crafting.GetRecipeData:InvokeServer("getShopInfo", namespace)
             end)
             if alive() and success and validShop(shop) then
@@ -7184,12 +7179,11 @@ end)()
 local HalloweenRules = (function()
     local rules = {}
     rules.Profiles = {
-        -- Skill names verified against the native RarityDB/AuraSkillClient.
-        -- Wiki damage/windup; reach is a conservative estimate, not a server hitbox.
+
         PYTHIOS = { Label = "Pythios", Priority = 6, PreferredAura = true, Skills = {
             ["Crimson Sky"] = { Range = 24, Preferred = 20, Lock = 7.2, Damage = 60, AimLead = 3.1, Windup = 3.1, AimMode = "SelfArea", MaxHeight = 6, Sustain = true, ImpactEnd = 7.1 },
             Ravage = { Range = 14, Preferred = 11, Lock = 4.1, Damage = 40, Effectiveness = 0.65, AimLead = 3.9, Windup = 3.9, Width = 7, MaxHeight = 5 },
-            -- No automatic QTE result is forged: unassisted damage is 10, not 40.
+
             ["Precision Strike"] = { Range = 45, Preferred = 25, Lock = 2.6, Damage = 10, AimLead = 1.8, Windup = 1.8, Width = 8, MaxHeight = 6, ManualTiming = true },
         } },
         CHILLSEAR = { Label = "Chillsear", Priority = 5, PreferredAura = true, Skills = {
@@ -7336,7 +7330,12 @@ local HalloweenRules = (function()
                             if name == "Rush" and (context.Health < 65 or context.Pressure > 1) then effectiveness = 0 end
                             if context.Recovering and (skill.Preferred or math.min(12,skill.Range*0.65)) < 16 then effectiveness = 0 end
                             if (context.Height or 0) > (skill.MaxHeight or 9) then effectiveness = 0 end
-                            if skill.Windup and skill.Width and (context.LateralSpeed or context.Speed or 0)*skill.Windup > skill.Width then effectiveness = 0 end
+                            if skill.Windup and skill.Width and (context.LateralSpeed or context.Speed or 0)*skill.Windup > skill.Width*0.65 then effectiveness = 0 end
+
+                            if context.Origin and context.Position and context.Velocity then
+                                local possible=rules.CastWindow(skill,context.Origin,context.Position,context.Velocity,context.StableFor or 0,true,context.Motion)
+                                if not possible then effectiveness=effectiveness*0.25 end
+                            end
                         end
                         local approach = context and math.max(0,(context.Distance or 0)-skill.Range*0.8)/math.max(8,context.WalkSpeed or 16) or 0
                         local usefulDamage = context and type(context.TargetHealth)=="number" and math.min(damage,math.max(1,context.TargetHealth)) or damage
@@ -7364,7 +7363,7 @@ local HalloweenRules = (function()
         return currentReady or best
     end
     function rules.Turn(owned,cooldowns,blocked,unavailable,now,current,spent,scores,learned,context)
-        -- Finish this aura's ready skills before comparing another aura's DPS.
+
         if current then
             for _,aura in ipairs(owned) do
                 if aura.Id==current then
@@ -7389,8 +7388,8 @@ local HalloweenRules = (function()
         return direction.Magnitude > 0.01 and direction.Unit or nil, predicted
     end
     function rules.Shot(skill, origin, position, velocity)
-        -- Self-centred effects are fixed at the cast origin, never at MouseHit.
-        return rules.Aim(origin,position,velocity,skill.AimMode=="SelfArea" and 0 or skill.AimLead)
+
+        return rules.Aim(origin,position,velocity,skill.AimMode=="SelfArea" and 0 or ((skill.AimLead or 0)+(skill.LeadTrim or 0)))
     end
     function rules.Motion(raw, previousPosition, position, dt, previousVelocity)
         local value=Vector3.new(raw.X,0,raw.Z)
@@ -7398,13 +7397,16 @@ local HalloweenRules = (function()
         if coherent then
             local delta=(position-previousPosition)/dt
             local measured=Vector3.new(delta.X,0,delta.Z)
-            -- NPC interpolation often exposes zero AssemblyLinearVelocity. Prefer
-            -- measured displacement, rather than whichever reading is larger.
+
             if measured.Magnitude>40 or math.abs(delta.Y)>40 then coherent=false
             else value=measured end
         end
         if value.Magnitude>24 then value=value.Unit*24 end
         local change=coherent and previousVelocity and (value-previousVelocity).Magnitude or 0
+
+        if coherent and previousVelocity and change<8 then
+            value=previousVelocity:Lerp(value,math.clamp(dt*10,0.35,0.85))
+        end
         return value,change,coherent
     end
     function rules.LateralSpeed(origin, position, velocity)
@@ -7418,19 +7420,24 @@ local HalloweenRules = (function()
         local speed = Vector3.new(velocity.X,0,velocity.Z).Magnitude
         if skill.MaxSpeed and speed > skill.MaxSpeed or skill.Stable and stableFor < skill.Stable then return false, "Waiting for stable target" end
         if motion then
-            if not motion.Coherent or motion.Age<0.15 then return false,"Sampling target movement" end
+            if not motion.Coherent then return false,"Sampling target movement" end
             local uncertainty=(motion.Change or 0)*math.min(skill.Windup or skill.AimLead or 0.4,2)
-            if uncertainty>math.max(3,(skill.Width or skill.Range*0.35)*0.5) then return false,"Target changed direction" end
+            if uncertainty>math.max(4,(skill.Width or skill.Range*0.35)*0.9) then return false,"Target changed direction" end
         end
         local _,predicted=rules.Shot(skill,origin,position,velocity)
-        local range=math.max(1,skill.Range-1)
+        local range=math.max(1,skill.Range-math.max(2,skill.Range*0.12))
         if (position-origin).Magnitude>range or (predicted-origin).Magnitude>range then return false,"Predicted impact out of range" end
         if skill.AimMode=="SelfArea" then
-            -- Check the fixed area throughout its damage window. For closing
-            -- enemies Aim clamps before crossing the player; fleeing/crossing
-            -- enemies must remain inside, not merely inside at button press.
+
             for _,t in ipairs({skill.Windup or skill.AimLead or 0,skill.ImpactEnd or skill.Windup or 0}) do
-                local _,impact=rules.Aim(origin,position,velocity,t)
+                local offset=Vector3.new(position.X-origin.X,0,position.Z-origin.Z)
+                local flat=Vector3.new(velocity.X,0,velocity.Z)
+                local toward=offset.Magnitude>0.01 and -offset.Unit:Dot(flat) or 0
+
+                local radial=offset.Magnitude>0.01 and offset.Unit*flat:Dot(offset.Unit) or Vector3.zero
+                local lateral=flat-radial
+                local travel=toward>0 and math.min(t,math.max(0,(offset.Magnitude-4)/toward)) or t
+                local impact=position+radial*travel+lateral*t
                 if (impact-origin).Magnitude>range then return false,"Target leaving fixed attack area" end
             end
         end
@@ -7440,6 +7447,13 @@ local HalloweenRules = (function()
     function rules.CanSampleDamage(player, players, target)
         if #players:GetPlayers() ~= 1 or not target or target:GetAttribute("gotAttackedBy") ~= player.UserId then return false end
         return true
+    end
+    function rules.Orbit(origin,point,radius,flip)
+        local away=Vector3.new(origin.X-point.X,0,origin.Z-point.Z)
+        if away.Magnitude<0.1 then away=Vector3.new(1,0,0) end
+        local unit=away.Unit
+        local tangent=Vector3.new(-unit.Z,0,unit.X)*(flip or 1)
+        return point+unit*radius+tangent*math.min(5,radius*0.5), tangent, unit
     end
     function rules.Danger(point, hazards, margin, now)
         local danger = 0
@@ -7670,7 +7684,7 @@ function HalloweenBounty.Create(options)
         end
         if not hunt or not definitions then return end
         if hunt.NextUpdateTime <= serverNow() then dirty = true status = "Waiting for daily reset" return end
-        if dirty then return end -- Refresh after every claim/event before making another decision.
+        if dirty then return end
         local allReady, allClaimed, blocked = true, true, false
         for _, slot in ipairs(slots) do
             local record = hunt[slot]
@@ -7798,6 +7812,7 @@ local Halloween = (function()
     local approachPhase,forceApproachUntil,recoveries,lastRecovery,lastStepAt=0,0,0,nil,0
     local actorRestarts,actorStartingAt,pursuitRecoveries=0,0,0
     local dodgePosition,dodgeProgressAt,dodgeFailures=nil,0,0
+    local lastRequestedCount,lastCastAt=0,0
     local aimRepositionAt=0
     local forcePathUntil, directStalls = 0, 0
     local bounty = HalloweenBounty.Create({ Alive = function() return living and Alive end, Enabled = function() return Config.HalloweenAutoBounty == true end })
@@ -7820,12 +7835,11 @@ if not bridge then return end
 local HalloweenRules = (function()
     local rules = {}
     rules.Profiles = {
-        -- Skill names verified against the native RarityDB/AuraSkillClient.
-        -- Wiki damage/windup; reach is a conservative estimate, not a server hitbox.
+
         PYTHIOS = { Label = "Pythios", Priority = 6, PreferredAura = true, Skills = {
             ["Crimson Sky"] = { Range = 24, Preferred = 20, Lock = 7.2, Damage = 60, AimLead = 3.1, Windup = 3.1, AimMode = "SelfArea", MaxHeight = 6, Sustain = true, ImpactEnd = 7.1 },
             Ravage = { Range = 14, Preferred = 11, Lock = 4.1, Damage = 40, Effectiveness = 0.65, AimLead = 3.9, Windup = 3.9, Width = 7, MaxHeight = 5 },
-            -- No automatic QTE result is forged: unassisted damage is 10, not 40.
+
             ["Precision Strike"] = { Range = 45, Preferred = 25, Lock = 2.6, Damage = 10, AimLead = 1.8, Windup = 1.8, Width = 8, MaxHeight = 6, ManualTiming = true },
         } },
         CHILLSEAR = { Label = "Chillsear", Priority = 5, PreferredAura = true, Skills = {
@@ -7972,7 +7986,12 @@ local HalloweenRules = (function()
                             if name == "Rush" and (context.Health < 65 or context.Pressure > 1) then effectiveness = 0 end
                             if context.Recovering and (skill.Preferred or math.min(12,skill.Range*0.65)) < 16 then effectiveness = 0 end
                             if (context.Height or 0) > (skill.MaxHeight or 9) then effectiveness = 0 end
-                            if skill.Windup and skill.Width and (context.LateralSpeed or context.Speed or 0)*skill.Windup > skill.Width then effectiveness = 0 end
+                            if skill.Windup and skill.Width and (context.LateralSpeed or context.Speed or 0)*skill.Windup > skill.Width*0.65 then effectiveness = 0 end
+
+                            if context.Origin and context.Position and context.Velocity then
+                                local possible=rules.CastWindow(skill,context.Origin,context.Position,context.Velocity,context.StableFor or 0,true,context.Motion)
+                                if not possible then effectiveness=effectiveness*0.25 end
+                            end
                         end
                         local approach = context and math.max(0,(context.Distance or 0)-skill.Range*0.8)/math.max(8,context.WalkSpeed or 16) or 0
                         local usefulDamage = context and type(context.TargetHealth)=="number" and math.min(damage,math.max(1,context.TargetHealth)) or damage
@@ -8000,7 +8019,7 @@ local HalloweenRules = (function()
         return currentReady or best
     end
     function rules.Turn(owned,cooldowns,blocked,unavailable,now,current,spent,scores,learned,context)
-        -- Finish this aura's ready skills before comparing another aura's DPS.
+
         if current then
             for _,aura in ipairs(owned) do
                 if aura.Id==current then
@@ -8025,8 +8044,8 @@ local HalloweenRules = (function()
         return direction.Magnitude > 0.01 and direction.Unit or nil, predicted
     end
     function rules.Shot(skill, origin, position, velocity)
-        -- Self-centred effects are fixed at the cast origin, never at MouseHit.
-        return rules.Aim(origin,position,velocity,skill.AimMode=="SelfArea" and 0 or skill.AimLead)
+
+        return rules.Aim(origin,position,velocity,skill.AimMode=="SelfArea" and 0 or ((skill.AimLead or 0)+(skill.LeadTrim or 0)))
     end
     function rules.Motion(raw, previousPosition, position, dt, previousVelocity)
         local value=Vector3.new(raw.X,0,raw.Z)
@@ -8034,13 +8053,16 @@ local HalloweenRules = (function()
         if coherent then
             local delta=(position-previousPosition)/dt
             local measured=Vector3.new(delta.X,0,delta.Z)
-            -- NPC interpolation often exposes zero AssemblyLinearVelocity. Prefer
-            -- measured displacement, rather than whichever reading is larger.
+
             if measured.Magnitude>40 or math.abs(delta.Y)>40 then coherent=false
             else value=measured end
         end
         if value.Magnitude>24 then value=value.Unit*24 end
         local change=coherent and previousVelocity and (value-previousVelocity).Magnitude or 0
+
+        if coherent and previousVelocity and change<8 then
+            value=previousVelocity:Lerp(value,math.clamp(dt*10,0.35,0.85))
+        end
         return value,change,coherent
     end
     function rules.LateralSpeed(origin, position, velocity)
@@ -8054,19 +8076,24 @@ local HalloweenRules = (function()
         local speed = Vector3.new(velocity.X,0,velocity.Z).Magnitude
         if skill.MaxSpeed and speed > skill.MaxSpeed or skill.Stable and stableFor < skill.Stable then return false, "Waiting for stable target" end
         if motion then
-            if not motion.Coherent or motion.Age<0.15 then return false,"Sampling target movement" end
+            if not motion.Coherent then return false,"Sampling target movement" end
             local uncertainty=(motion.Change or 0)*math.min(skill.Windup or skill.AimLead or 0.4,2)
-            if uncertainty>math.max(3,(skill.Width or skill.Range*0.35)*0.5) then return false,"Target changed direction" end
+            if uncertainty>math.max(4,(skill.Width or skill.Range*0.35)*0.9) then return false,"Target changed direction" end
         end
         local _,predicted=rules.Shot(skill,origin,position,velocity)
-        local range=math.max(1,skill.Range-1)
+        local range=math.max(1,skill.Range-math.max(2,skill.Range*0.12))
         if (position-origin).Magnitude>range or (predicted-origin).Magnitude>range then return false,"Predicted impact out of range" end
         if skill.AimMode=="SelfArea" then
-            -- Check the fixed area throughout its damage window. For closing
-            -- enemies Aim clamps before crossing the player; fleeing/crossing
-            -- enemies must remain inside, not merely inside at button press.
+
             for _,t in ipairs({skill.Windup or skill.AimLead or 0,skill.ImpactEnd or skill.Windup or 0}) do
-                local _,impact=rules.Aim(origin,position,velocity,t)
+                local offset=Vector3.new(position.X-origin.X,0,position.Z-origin.Z)
+                local flat=Vector3.new(velocity.X,0,velocity.Z)
+                local toward=offset.Magnitude>0.01 and -offset.Unit:Dot(flat) or 0
+
+                local radial=offset.Magnitude>0.01 and offset.Unit*flat:Dot(offset.Unit) or Vector3.zero
+                local lateral=flat-radial
+                local travel=toward>0 and math.min(t,math.max(0,(offset.Magnitude-4)/toward)) or t
+                local impact=position+radial*travel+lateral*t
                 if (impact-origin).Magnitude>range then return false,"Target leaving fixed attack area" end
             end
         end
@@ -8076,6 +8103,13 @@ local HalloweenRules = (function()
     function rules.CanSampleDamage(player, players, target)
         if #players:GetPlayers() ~= 1 or not target or target:GetAttribute("gotAttackedBy") ~= player.UserId then return false end
         return true
+    end
+    function rules.Orbit(origin,point,radius,flip)
+        local away=Vector3.new(origin.X-point.X,0,origin.Z-point.Z)
+        if away.Magnitude<0.1 then away=Vector3.new(1,0,0) end
+        local unit=away.Unit
+        local tangent=Vector3.new(-unit.Z,0,unit.X)*(flip or 1)
+        return point+unit*radius+tangent*math.min(5,radius*0.5), tangent, unit
     end
     function rules.Danger(point, hazards, margin, now)
         local danger = 0
@@ -8150,8 +8184,7 @@ function HalloweenCombatLog.Create(userId, clock, seed)
         local before = prior.HP prior.HP = hp
         if prior.Counted or before <= 0 or hp > 0 then return end
         prior.Counted = true
-        -- This replicated field identifies the latest damage owner. Do not credit
-        -- disappearance, an earlier hit, or another player's final hit.
+
         if userId == nil or attacker == nil or tostring(attacker) ~= tostring(userId) then return end
         if kind == "Orb" then orbs += 1 totalOrbs += 1 else kills += 1 total += 1 end
         local name = tostring(label or kind):sub(1,120)
@@ -8202,6 +8235,9 @@ local approachTarget
 local encounterTarget,lastCastFailure,lastTargetFailureAt=nil,nil,0
 local moduleLoads=setmetatable({}, {__mode="k"})
 local rotationAura, spent, learned, turnStarted = nil, {}, {}, false
+local noDamageStreak=setmetatable({}, {__mode="k"})
+local observedHits,observedNoDamage=0,0
+local skillStats,leadArm,rangeTrim={},{},{}
 local requested, confirmed, nextInventory, castUntil, equipSettled = bridge:GetAttribute("RequestedCasts") or 0, bridge:GetAttribute("ConfirmedCasts") or 0, 0, 0, 0
 local frameErrors,totalErrors=0,bridge:GetAttribute("ActorErrors") or 0
 local motionTarget, motionPosition, motionAt, stableSince = nil, nil, 0, 0
@@ -8349,8 +8385,7 @@ local ok, failure = pcall(function()
             end
         end
         if pendingCast and #players:GetPlayers() ~= 1 then pendingCast.Solo = false end
-        -- UseSkill submits one LookVector/MouseHit snapshot. Rotating afterward
-        -- cannot update that packet and used to contradict the committed aim.
+
         if pendingCast and pendingCast.Started and now < pendingCast.Deadline then
             local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
             if animator then
@@ -8370,6 +8405,41 @@ local ok, failure = pcall(function()
                 learned[pendingCast.Key] = { Damage = prior and prior.Damage * 0.5 + damage * 0.5 or damage }
                 attr("DamageObservation", "Solo estimate: " .. pendingCast.Skill .. " / " .. tostring(math.floor(damage)))
             else attr("DamageObservation", "Own damage unverified") end
+            local castKey = pendingCast.Key
+            local stats = skillStats[castKey] or { Attempts = 0, Hits = 0, Misses = 0 }
+            skillStats[castKey] = stats
+            stats.Attempts += 1
+            if pendingCast.Confirmed and pendingCast.Before and after then
+                if after < pendingCast.Before then
+                    stats.Hits += 1 observedHits += 1
+                    leadArm[castKey] = 1
+                    rangeTrim[castKey] = math.min(1, (rangeTrim[castKey] or 1) + 0.05)
+                    local streak = noDamageStreak[pendingCast.Target]
+                    if streak then streak[castKey] = nil end
+                elseif after == pendingCast.Before and after > 0 then
+                    stats.Misses += 1 observedNoDamage += 1
+                    leadArm[castKey] = ((leadArm[castKey] or 1) % 3) + 1
+                    rangeTrim[castKey] = math.max(0.55, (rangeTrim[castKey] or 1) * 0.9)
+                    local streak = noDamageStreak[pendingCast.Target] or {}
+                    noDamageStreak[pendingCast.Target] = streak
+                    streak[castKey] = (streak[castKey] or 0) + 1
+                    if stats.Misses >= 4 and stats.Hits == 0 then
+                        blocked[castKey] = now + 20
+                        attr("CastStatus", "Skill keeps missing; skipped for 20s")
+                    elseif streak[castKey] >= 2 then
+                        blocked[castKey] = now + 6
+                        attr("NeedsApproach", true) attr("AimRejectedSince", now - 2)
+                    end
+                end
+                attr("ObservedDamageCasts", observedHits) attr("ObservedZeroDamageCasts", observedNoDamage)
+                local dead, accuracy = {}, {}
+                for skillKey, entry in pairs(skillStats) do
+                    if entry.Attempts >= 2 and entry.Hits == 0 then dead[#dead + 1] = skillKey end
+                    if entry.Attempts >= 2 then accuracy[#accuracy + 1] = skillKey .. " " .. tostring(entry.Hits) .. "/" .. tostring(entry.Attempts) end
+                end
+                attr("SkillsNeverLand", table.concat(dead, ", "))
+                attr("SkillAccuracy", table.concat(accuracy, ", "))
+            end
             if not pendingCast.Confirmed then blocked[pendingCast.Key] = now + 8 attr("CastStatus", "No confirmation; trying next skill") end
             pendingCast = nil restoreRotation()
         end
@@ -8383,26 +8453,36 @@ local ok, failure = pcall(function()
         if not sameMotion or not coherent then stableSince=now motionSince=now end
         if velocity.Magnitude>1.2 then stableSince=now end
         local motion={Coherent=coherent,Age=now-motionSince,Change=change}
+        attr("TargetMotionCoherent",coherent)
+        attr("TargetSpeed",velocity.Magnitude)
         motionTarget,motionPosition,motionAt,motionVelocity=target,point and point.Position,now,velocity
         local context = { Speed = Vector3.new(velocity.X,0,velocity.Z).Magnitude, Health = humanoid and humanoid.Health / math.max(1,humanoid.MaxHealth) * 100 or 0, Pressure = tonumber(bridge:GetAttribute("CloseEnemies")) or 0,
             LateralSpeed = point and root and HalloweenRules.LateralSpeed(root.Position,point.Position,velocity) or 0,
             StableFor = now-stableSince, Distance = point and root and (point.Position-root.Position).Magnitude or 0, WalkSpeed = humanoid and humanoid.WalkSpeed or 16, Recovering = bridge:GetAttribute("Recovering") == true,
-            TargetHealth = hp, Height = point and root and math.abs(point.Position.Y-root.Position.Y) or 0 }
-        local desired = HalloweenRules.Turn(owned, cooldowns, blocked, unavailable, now, turnStarted and current or nil, spent, scores, learned, context)
-        -- Ready preferred skills must not lose their tier just because a previous
-        -- turn marked them spent while a fallback aura remained ready.
-        local reusable = next(spent) and HalloweenRules.Turn(owned,cooldowns,blocked,unavailable,now,turnStarted and current or nil,nil,scores,learned,context)
-        if reusable and (not desired or reusable.Tier > desired.Tier) then spent={} desired=reusable end
-        if not desired and next(spent) then spent = {} desired = HalloweenRules.Turn(owned, cooldowns, blocked, unavailable, now, turnStarted and current or nil, spent, scores, learned, context) end
+            TargetHealth = hp, Height = point and root and math.abs(point.Position.Y-root.Position.Y) or 0,
+            Origin=root and root.Position,Position=point and point.Position,Velocity=velocity,Motion=motion }
+        local currentAura
+        for _, aura in ipairs(owned) do if aura.Id == current then currentAura = aura break end end
+        local desired
+        if turnStarted and currentAura then
+            desired = HalloweenRules.Next({currentAura}, cooldowns, blocked, unavailable, now, current, spent, scores, learned, context)
+            if not desired then turnStarted = false spent = {} end
+        end
+        if not desired then
+            desired = HalloweenRules.Turn(owned, cooldowns, blocked, unavailable, now, current, spent, scores, learned, context)
+        end
         local planContext=table.clone(context)
         planContext.Height,planContext.Speed,planContext.LateralSpeed,planContext.StableFor=0,0,0,10
-        local readyPlan=HalloweenRules.Turn(owned,cooldowns,blocked,unavailable,now,turnStarted and current or nil,spent,scores,learned,planContext)
-        if readyPlan and (not desired or readyPlan.Tier>desired.Tier or turnStarted and readyPlan.Aura.Id==current and desired.Aura.Id~=current) then
-            local same=HalloweenRules.Next({readyPlan.Aura},cooldowns,blocked,unavailable,now,current,spent,scores,learned,context)
-            desired=same or readyPlan
-        end
+        planContext.Origin,planContext.Position,planContext.Velocity,planContext.Motion=nil,nil,nil,nil
+        local readyPlan
+        if turnStarted and currentAura then readyPlan=HalloweenRules.Next({currentAura},cooldowns,blocked,unavailable,now,current,spent,scores,learned,planContext)
+        else readyPlan=HalloweenRules.Turn(owned,cooldowns,blocked,unavailable,now,current,spent,scores,learned,planContext) end
         local plan=desired or readyPlan or HalloweenRules.Next(owned,{}, {},unavailable,now,current,nil,scores,learned,planContext)
         if desired then
+            local arm = leadArm[desired.Key] or 1
+            local lead = desired.AimLead or 0
+            desired.LeadTrim = arm == 2 and -lead or (arm == 3 and lead * 0.8 or 0)
+            desired.Range = math.max(4, desired.Range * (rangeTrim[desired.Key] or 1))
             local setting = tonumber(bridge:GetAttribute("EngageDistance")) or 12
             desired.Range = math.min(desired.Range, math.max(setting, desired.Preferred and desired.Preferred+5 or setting))
         end
@@ -8412,7 +8492,7 @@ local ok, failure = pcall(function()
         attr("AttackMaxHeight",plan and plan.MaxHeight or 6)
         attr("ScoreSource", desired and desired.Source or "Cooling down")
         attr("NoReadySkills",desired==nil)
-        -- A height/aim/safety rejection still needs an approach; it is not a cooldown.
+
         attr("SkillsCoolingDown",readyPlan==nil)
         attr("NextAura", desired and desired.Aura.Label or "Cooling down") attr("NextSkill", desired and desired.Skill or "None")
         if pendingCast and (not humanoid or humanoid.Health <= 0 or pendingCast.Character ~= nil and pendingCast.Character ~= character) then pendingCast=nil castUntil=0 spent={} turnStarted=false restoreRotation() end
@@ -8421,6 +8501,12 @@ local ok, failure = pcall(function()
         if target~=approachTarget or not valid then attr("NeedsApproach",false) approachTarget=target end
         if not valid or target~=lastCastFailure then attr("AimRejectedSince",nil) end
         if valid and root and plan and math.abs(point.Position.Y-root.Position.Y)>(plan.MaxHeight or 9) then attr("NeedsApproach",true) end
+        if valid and readyPlan and not desired and not pendingCast then
+            attr("CastStatus","Repositioning for reliable impact")
+            attr("NeedsApproach",true)
+            if lastCastFailure~=target then lastCastFailure=target lastTargetFailureAt=now end
+            attr("AimRejectedSince",lastTargetFailureAt)
+        end
         local active = d and humanoid and humanoid.Health > 0 and root and not root.Anchored and valid
             and bridge:GetAttribute("FarmEnabled") == true and bridge:GetAttribute("Permit") == true
         if not active or pendingCast or not desired or not inventoryFree() or aimPreparation and (aimPreparation.Target~=target or aimPreparation.Key~=desired.Key or aimPreparation.Character~=character or (point.Position-root.Position).Magnitude>desired.Range) then
@@ -8449,11 +8535,18 @@ local ok, failure = pcall(function()
                 if entry and not skillUI:GetDisabled(desired.Skill) then
                     local direction, aimPoint = HalloweenRules.Shot(desired,root.Position,point.Position,velocity)
                     local params = RaycastParams.new() params.FilterType = Enum.RaycastFilterType.Exclude params.RespectCanCollide = true
-                    -- Orbs can live outside NPCs; exclude their own collision body.
+
                     params.FilterDescendantsInstances = { character, target, folder }
-                    local obstructed = workspace:Raycast(root.Position,point.Position-root.Position,params) or workspace:Raycast(root.Position,aimPoint-root.Position,params)
-                    attr("NeedsApproach",obstructed~=nil)
-                    local canCast, reason = HalloweenRules.CastWindow(desired,root.Position,point.Position,velocity,now-stableSince,obstructed == nil,motion)
+                    local hold=Vector3.new(0,2.5,0)
+                    local rayFrom=root.Position+hold
+                    local rayTo=Vector3.new(aimPoint.X,point.Position.Y,aimPoint.Z)+hold
+                    local hit=workspace:Raycast(rayFrom,rayTo-rayFrom,params)
+                    local gap=(rayTo-rayFrom).Magnitude
+                    local obstructed=hit~=nil and (hit.Position-rayFrom).Magnitude<gap*0.8
+                    local closeEnough=gap<=desired.Range*0.6
+                    local clear=(desired.AimMode=="SelfArea") or closeEnough or not obstructed
+                    attr("NeedsApproach",not clear and obstructed)
+                    local canCast, reason = HalloweenRules.CastWindow(desired,root.Position,point.Position,velocity,now-stableSince,clear,motion)
                     if not canCast then
                         attr("CastStatus",reason) direction = nil
                         aimPreparation=nil attr("AimPreparing",false)
@@ -8463,17 +8556,7 @@ local ok, failure = pcall(function()
                         if now-lastTargetFailureAt>=1.5 then attr("NeedsApproach",true) end
                     end
                     if direction then
-                        if not aimPreparation then
-                            aimPreparation={Target=target,Key=desired.Key,Character=character,At=now,Position=root.Position}
-                            attr("AimPreparing",true)
-                            humanoid:MoveTo(root.Position)
-                        end
-                        local drift=Vector3.new(root.Position.X-aimPreparation.Position.X,0,root.Position.Z-aimPreparation.Position.Z).Magnitude
-                        local ownVelocity=root.AssemblyLinearVelocity
-                        if drift>0.35 or Vector3.new(ownVelocity.X,0,ownVelocity.Z).Magnitude>2 then
-                            aimPreparation.At=now aimPreparation.Position=root.Position
-                        end
-                        if now-aimPreparation.At<0.15 then direction=nil attr("CastStatus","Settling attack position") end
+                        aimPreparation=nil attr("AimPreparing",false)
                     end
                     if direction then
                         aimPreparation=nil attr("AimPreparing",false)
@@ -8481,7 +8564,7 @@ local ok, failure = pcall(function()
                         attr("CastStatus","Committed aim / " .. desired.Skill)
                         lastCastFailure=nil lastTargetFailureAt=0 attr("NeedsApproach",false) attr("AimRejectedSince",nil)
                         if CFrame.lookAt then root.CFrame = CFrame.lookAt(root.Position, Vector3.new(root.Position.X + direction.X, root.Position.Y, root.Position.Z + direction.Z)) end
-                        blocked[desired.Key] = now + 12 castUntil = now + desired.Lock
+                        blocked[desired.Key] = now + 0.6 castUntil = now + desired.Lock
                         turnStarted = true spent[desired.Key] = true
                         local animations = {}
                         if module.GetDescendants then
@@ -8628,7 +8711,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
                 end
             end
         end
-        if pinned and (target==best or not best or HalloweenRules.IsOrb(target) or not HalloweenRules.IsOrb(best) and (HalloweenRules.Kind(target)=="Boss" or HalloweenRules.Kind(best)~="Boss")) then return target, pinned end
+        if pinned then return target,pinned end
         return best, bestRoot
     end
     local function groundGoal(point, model, root)
@@ -8642,12 +8725,28 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         return Vector3.new(point.X, hit.Position.Y + 3, point.Z)
     end
     local function moveDirect(humanoid, root, goal, urgent)
-        if Navigation.TryStep then Navigation.TryStep(LocalPlayer.Character, humanoid, root, goal) end
         if urgent or not moveGoal or (moveGoal - goal).Magnitude > 2.5 or os.clock() - lastCommand > 1.5 then
             if os.clock() - lastCommand >= 0.15 or urgent then
+                if Navigation.TryStep then Navigation.TryStep(LocalPlayer.Character, humanoid, root, goal) end
                 humanoid:MoveTo(goal) lastCommand, moveGoal = os.clock(), goal
             end
         end
+    end
+    local orbitSign,orbitFlipAt,orbitStep=1,0,0
+    local function orbitMove(model,root,point,radius,humanoid)
+        if os.clock()>=orbitFlipAt then orbitFlipAt=os.clock()+2.5 orbitSign=-orbitSign end
+        if radius<6 then radius=6 end
+        local goal=HalloweenRules.Orbit(root.Position,point.Position,radius,orbitSign)
+        if goal then
+            local standing=groundGoal(goal,model,root)
+            if standing then moveDirect(humanoid,root,standing,false) return true end
+            local dir=Vector3.new(goal.X-root.Position.X,0,goal.Z-root.Position.Z)
+            if dir.Magnitude>0.5 then
+                local step=groundGoal(root.Position+dir.Unit*4,model,root)
+                if step then moveDirect(humanoid,root,step,false) return true end
+            end
+        end
+        return false
     end
     local function chaseGoal(model, root, point, range)
         local offset = root.Position - point.Position offset = Vector3.new(offset.X, 0, offset.Z)
@@ -8842,8 +8941,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         if not lease then lease = MovementCoordinator.AcquirePriority("Halloween") if lease then leaseAt = os.clock() end end
         if not lease or root.Anchored then attribute("Permit", false) status = "Waiting for fishing / current task to settle" return end
         if not MovementCoordinator.IsOwner("Halloween", lease) then lease = nil attribute("Permit", false) return end
-        -- Hold combat ownership through the encounter. Fishing resumes only after targets clear.
-        -- Merchant priority is handled above, after the current native catch has drained.
+
         local hpPercent = humanoid.Health / math.max(humanoid.MaxHealth, 1) * 100
         if previousHP and humanoid.Health < previousHP then recentDamage=now end
         previousHP=humanoid.Health
@@ -8861,9 +8959,9 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         end
         attribute("CloseEnemies",pressure)
         local safeOrb = HalloweenRules.IsOrb(target) and nearest > 45 and now-recentDamage>2
-        local retreatAt=math.max(Config.HalloweenRetreatHP,HalloweenRules.Kind(target)=="Boss" and 60 or 45)
+        local retreatAt=HalloweenRules.Number(Config.HalloweenRetreatHP,20,5,70)
         if safeOrb then recovering=false
-        elseif hpPercent <= retreatAt or hpPercent<65 and pressure>=2 then recovering=true end
+        elseif hpPercent <= retreatAt or hpPercent<=math.max(retreatAt,35) and pressure>=2 then recovering=true end
         if recovering and hpPercent >= math.min(90,retreatAt+25) and now-recentDamage>2 then recovering=false end
         attribute("Recovering",recovering)
         local warnings = Config.HalloweenAutoDodge and hazards(now) or {}
@@ -8873,10 +8971,24 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         local telegraphDanger=danger
         local retreatDistance=math.clamp((tonumber(bridge:GetAttribute("PreferredDistance")) or 16)+8,20,32)
         local contactDanger=HalloweenRules.Danger(root.Position,crowdWarnings,1,now)
-        local holdingCast=bridge:GetAttribute("Casting")==true and hpPercent>=80 and pressure<=1
-        if not holdingCast and contactDanger>0 and (cooling or hpPercent<65 or pressure>=2 or (tonumber(bridge:GetAttribute("PreferredDistance")) or 0)>12) then
+
+        local holdingCast=bridge:GetAttribute("Casting")==true or bridge:GetAttribute("AimPreparing")==true
+        local contactRetreat=Config.HalloweenAutoDodge and contactDanger>0 and (cooling or recovering) and not holdingCast
+        if contactRetreat then
             for _,warning in ipairs(crowdWarnings) do warnings[#warnings+1]=warning end
             danger=math.max(danger,contactDanger)
+        end
+        attribute("TelegraphDanger",telegraphDanger)
+        attribute("ContactAvoidance",contactRetreat==true)
+        if (bridge:GetAttribute("Casting")==true or bridge:GetAttribute("AimPreparing")==true) and telegraphDanger==0 and not recovering then
+            attribute("Permit",true)
+            moveEpoch+=1 moving=false
+            local holdRange=tonumber(bridge:GetAttribute("AttackRange")) or 25
+            local holdPreferred=math.min(holdRange*0.85,tonumber(bridge:GetAttribute("PreferredDistance")) or holdRange*0.65)
+            orbitMove(model,root,targetRoot,math.clamp(holdPreferred*0.8,7,holdRange*0.8),humanoid)
+            lastPosition,lastProgressAt=root.Position,os.clock()
+            status=bridge:GetAttribute("Casting")==true and "Orbiting while using "..tostring(bridge:GetAttribute("LastSkill") or "skill") or "Orbiting to line up a skill"
+            return
         end
         if recovering and danger == 0 and nearest >= retreatDistance then
             attribute("Permit", hpPercent>25) moveEpoch += 1 moving=false
@@ -8914,22 +9026,25 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
                 end
             end
             dodgeUntil = now + 0.3
-            -- Contact avoidance alone must not permanently suppress the quick
-            -- ready attack when every escape direction is blocked.
+
             if not dodgeGoal and telegraphDanger==0 and hpPercent>45 and not cooling then attribute("Permit",true) end
             if dodgeGoal then moveDirect(humanoid, root, dodgeGoal, moveGoal == nil) status = recovering and "Retreating to recover HP" or cooling and "Keeping distance during cooldown" or "Dodging attack warning"
             else if moveGoal then humanoid:MoveTo(root.Position) moveGoal = nil end status = "No clear dodge route" end
             return
         end
         if not recovering and (bridge:GetAttribute("Casting")==true or bridge:GetAttribute("AimPreparing")==true) then
-            -- A submitted self-area effect cannot chase the target. Real danger
-            -- and HP retreat above still preempt this hold.
+
             dodgeGoal=nil
-            if moving or moveGoal then moveEpoch+=1 moving=false moveGoal=nil humanoid:MoveTo(root.Position) end
+            moveEpoch+=1 moving=false
+            orbitMove(model,root,targetRoot,math.clamp(range*0.7,7,range*0.9),humanoid)
             lastPosition,lastProgressAt=root.Position,os.clock()
             attribute("Permit",true)
-            status=bridge:GetAttribute("Casting")==true and "Using "..tostring(bridge:GetAttribute("LastSkill") or "skill") or "Settling attack position"
+            status=bridge:GetAttribute("Casting")==true and "Orbiting while using "..tostring(bridge:GetAttribute("LastSkill") or "skill") or "Orbiting to line up a skill"
             return
+        end
+
+        if telegraphDanger==0 and not cooling and not recovering then
+            dodgeGoal=nil dodgeUntil=0
         end
         if dodgeGoal and now - dodgeStarted < 2 and ((root.Position - dodgeGoal).Magnitude > 3 or now < dodgeUntil) then
             attribute("Permit", danger == 0) moveDirect(humanoid, root, dodgeGoal, false) status = "Leaving attack area" return
@@ -8939,11 +9054,11 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         local range = tonumber(bridge:GetAttribute("AttackRange")) or 25
         local preferred = math.min(range*0.85,tonumber(bridge:GetAttribute("PreferredDistance")) or range*0.65)
         local distance = (targetRoot.Position - root.Position).Magnitude
-        if cooling and distance <= preferred+2 and bridge:GetAttribute("NeedsApproach")~=true then
+        if cooling and distance <= preferred+8 and bridge:GetAttribute("NeedsApproach")~=true then
             attribute("Permit",false) moveEpoch+=1 moving=false
-            if moveGoal then humanoid:MoveTo(root.Position) moveGoal=nil end
+            orbitMove(model,root,targetRoot,math.clamp(preferred+3,8,range*0.95),humanoid)
             lastProgressAt=os.clock() lastPosition=root.Position
-            status="Waiting for skills at safe distance" return
+            status="Orbiting while skills recover" return
         end
         attribute("Permit", not cooling)
         local rejectedSince=tonumber(bridge:GetAttribute("AimRejectedSince"))
@@ -8960,13 +9075,22 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             routeReason="Target moved; updating route"
         end
         local requested=tonumber(bridge:GetAttribute("RequestedCasts")) or 0
+        if requested>lastRequestedCount then lastRequestedCount=requested lastCastAt=os.clock() end
+        if lastCastAt==0 then lastCastAt=os.clock() end
+        if distance<=range+4 and os.clock()-lastCastAt>4.5 and bridge:GetAttribute("Casting")~=true then
+            lastCastAt=os.clock() lastRecovery="No cast accepted; repositioning"
+            approachPhase=(approachPhase+1)%8 forceApproachUntil=os.clock()+1.5
+            moveEpoch+=1 moving=false moveGoal=nil nextChase=0
+            lastPosition,lastProgressAt=root.Position,os.clock()
+            routeReason=lastRecovery
+        end
         if not combatWatch or combatWatch.Target~=target then
             combatWatch={Target=target,HP=health,Elapsed=0,Requested=requested,Failures=0}
         elseif type(health)=="number" and type(combatWatch.HP)=="number" and health~=combatWatch.HP then
             combatWatch.HP,combatWatch.Elapsed,combatWatch.Requested,combatWatch.Failures=health,0,requested,0
         end
         if distance<=range+3 then combatWatch.Elapsed+=elapsed end
-        -- Health progress is used only for recovery, never as personal damage credit.
+
         if type(health)=="number" and combatWatch.Elapsed>=12 and requested-combatWatch.Requested>=2
             and bridge:GetAttribute("Casting")~=true and bridge:GetAttribute("InventoryReserved")~=true
             and bridge:GetAttribute("NoReadySkills")~=true then
@@ -8983,12 +9107,13 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
                 status="Temporarily skipping unresponsive target" return
             end
         end
-        -- Jumping in place is not route progress.
+
         if not lastPosition or Vector3.new(lastPosition.X-root.Position.X,0,lastPosition.Z-root.Position.Z).Magnitude > 0.6 then lastPosition,lastProgressAt=root.Position,os.clock() end
         if distance <= preferred + 1.5 and bridge:GetAttribute("NeedsApproach") ~= true and os.clock()>=forceApproachUntil then
-            if moving or moveGoal then moveEpoch += 1 moving=false moveGoal=nil humanoid:MoveTo(root.Position) end
-            lastProgressAt=os.clock() moveGoal=nil
-            status = "Attacking " .. HalloweenRules.Label(target)
+            moveEpoch += 1 moving=false
+            orbitMove(model,root,targetRoot,math.clamp(preferred*0.9,7,range*0.9),humanoid)
+            lastProgressAt=os.clock() lastPosition=root.Position
+            status = "Locked on " .. HalloweenRules.Label(target)
         elseif moving and os.clock()-lastProgressAt > ((Navigation.GetState and Navigation.GetState().Status=="Computing route") and 7.5 or 4.5) then
             moveEpoch+=1 moving=false moveGoal=nil nextChase=os.clock()+0.1
             approachPhase=(approachPhase+1)%8 forcePathUntil=os.clock()+12
@@ -9005,8 +9130,8 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             directStalls += 1 forcePathUntil=os.clock()+12
             lastProgressAt=os.clock() lastPosition=root.Position
             routeReason="Direct route stalled; switching to pathfinding" status="Finding another route"
-            if directStalls >= 2 then
-                unreachable[target]=os.clock()+5 target,targetRoot=nil,nil lastPosition=nil directStalls=0
+            if directStalls >= 3 then
+                unreachable[target]=os.clock()+2 target,targetRoot=nil,nil lastPosition=nil directStalls=0
                 attribute("Permit",false)
             end
         elseif not moving and os.clock() >= nextChase then
@@ -9102,8 +9227,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             end
             if stopping and bridge:GetAttribute("Stopped")==true and os.clock()>=restartAt
                 and workspace:GetServerTimeNow()>=math.max(tonumber(bridge:GetAttribute("WorkerBusyUntil")) or 0,tonumber(bridge:GetAttribute("EquipBusyUntil")) or 0) then
-                -- Start only after the previous worker acknowledged shutdown.
-                -- A hung worker must never overlap another packet sender.
+
                 if living and Alive then
                     actorRestarts+=1 launched=launch() stopping=not launched
                     backoff=math.min(30,backoff*2) restartAt=os.clock()+backoff
@@ -9300,7 +9424,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.38", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.48", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -9636,6 +9760,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.38")
+local loader, failure = loadstring(source, "BonesHub 3.48")
 if not loader then error(failure) end
 return loader()
