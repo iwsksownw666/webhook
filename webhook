@@ -1317,7 +1317,7 @@ local Navigation = (function()
             state.JumpBlocked=false
         end
         if os.clock()<jumpCooldown or os.clock()-jumpLast<1.1 then return false end
-        if jumpCount>=2 then jumpCooldown=os.clock()+8 state.JumpBlocked=true return false end
+        if jumpCount>=3 then jumpCooldown=os.clock()+3 state.JumpBlocked=true return false end
         jumpCount+=1 jumpLast=os.clock()
         state.JumpAttempts=(state.JumpAttempts or 0)+1
         humanoid.Jump=true
@@ -1435,8 +1435,8 @@ local Navigation = (function()
         local forward = offset.Unit * math.min(3, offset.Magnitude)
         local low = workspace:Raycast(feet + Vector3.new(0, 0.5, 0), forward, ray)
         if not low or workspace:Raycast(feet + Vector3.new(0, 4.5, 0), forward, ray) then return false end
-        local landing = workspace:Raycast(feet + forward + Vector3.new(0, 4.5, 0), Vector3.new(0, -7, 0), ray)
-        if not landing or landing.Normal.Y < 0.65 or landing.Position.Y < feet.Y - 1.5 or landing.Position.Y > feet.Y + 3.5 then return false end
+        local landing = workspace:Raycast(feet + forward + Vector3.new(0, 6.5, 0), Vector3.new(0, -9, 0), ray)
+        if not landing or landing.Normal.Y < 0.65 or landing.Position.Y < feet.Y - 1.5 or landing.Position.Y > feet.Y + 5.5 then return false end
         if not requestJump(humanoid,root,destination) then return false end
         stepHumanoid, stepAt = humanoid, os.clock()
         state.StepJumps += 1
@@ -8811,10 +8811,32 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         if offset.Magnitude > 1 and workspace:Raycast(root.Position, offset, params) then return nil end
         return Vector3.new(point.X, hit.Position.Y + 3, point.Z)
     end
+    local stepAnchor, stepAnchorAt, stepJumpAt = nil, 0, 0
+    local function assistStep(humanoid, root, goal)
+        local now = os.clock()
+        if not humanoid or humanoid.Health <= 0 or root.Anchored then stepAnchor = nil return end
+        if humanoid.FloorMaterial == Enum.Material.Air then stepAnchor = nil return end
+        if humanoid.MoveDirection.Magnitude < 0.3 then stepAnchor = nil return end
+        local progress = stepAnchor and Vector3.new(root.Position.X - stepAnchor.X, 0, root.Position.Z - stepAnchor.Z).Magnitude or 99
+        if not stepAnchor or progress > 0.6 then
+            stepAnchor, stepAnchorAt = root.Position, now
+            return
+        end
+        if now - stepAnchorAt < 0.3 then return end
+        if now - stepJumpAt < 0.7 then return end
+        stepJumpAt = now
+        stepAnchor, stepAnchorAt = root.Position, now
+        humanoid.Jump = true
+        pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Jumping) end)
+        humanoid:MoveTo(goal)
+        lastCommand, moveGoal = now, goal
+        routeReason = "Stepping up"
+    end
     local function moveDirect(humanoid, root, goal, urgent)
+        if Navigation.TryStep then Navigation.TryStep(LocalPlayer.Character, humanoid, root, goal) end
+        assistStep(humanoid, root, goal)
         if urgent or not moveGoal or (moveGoal - goal).Magnitude > 2.5 or os.clock() - lastCommand > 1.5 then
             if os.clock() - lastCommand >= 0.15 or urgent then
-                if Navigation.TryStep then Navigation.TryStep(LocalPlayer.Character, humanoid, root, goal) end
                 humanoid:MoveTo(goal) lastCommand, moveGoal = os.clock(), goal
             end
         end
@@ -9544,7 +9566,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.52", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.53", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -9890,6 +9912,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.52")
+local loader, failure = loadstring(source, "BonesHub 3.53")
 if not loader then error(failure) end
 return loader()
