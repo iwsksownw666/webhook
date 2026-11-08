@@ -160,7 +160,7 @@ local DEFAULT_CONFIG = {
     HalloweenAuras = { "PYTHIOS", "CHILLSEAR", "Archangel", "Starscourge_Radiant" }, HalloweenTargets = { "Boss", "Orb", "Minion" }, HalloweenDamageScores = {},
     HalloweenSearchDistance = 1000, HalloweenESPDistance = 5000, HalloweenDodgeMargin = 4, HalloweenRetreatHP = 20, HalloweenEngageDistance = 12,
     AutoMerchant = false, MerchantSelections = { Mari = {}, Jester = {}, Rin = {} }, MerchantCatalogs = { Mari = {}, Jester = {}, Rin = {} }, MerchantPurchases = {}, MerchantAmounts = { Mari = {}, Jester = {}, Rin = {} },
-    AutoDailyQuests = false, AutoClaimDailyRewards = false, DailyObbySupports = true,
+    AutoDailyQuests = false, AutoClaimDailyRewards = false, DailyObbySupports = true, DailyObby = false,
     AutoWeatherPotions = false, PotionBiomes = {}, WeatherPotions = {}, WeatherPotionAmounts = {},
     AutoEquipment = false, EquipmentRecipes = {}, AutoDeleteAuras = false, DeleteAuras = {},
     AutoReexecute = false, AutoFish = false, AutoSellFish = false, EarlyFishing = false,
@@ -1329,45 +1329,123 @@ end)()
 local MovementCoordinator = (function()
     local controller = {}
     local owner, ticket, serial = nil, nil, 0
+    local clock = os.clock
+    local ownerSince, ownerPriority = 0, 0
     local queue = {}
+    local stats = { Grants = 0, Preemptions = 0, Starved = 0, Expired = 0, Yields = 0 }
+    local priorities = { Daily = 100, Merchant = 90, Halloween = 80, Fishing = 30, Craft = 20, Equipment = 20, Weather = 15, Potion = 10, Aura = 10, MemoryParty = 5 }
+    local minimumHold = { Daily = 2, Merchant = 1, Halloween = 1.5, Fishing = 0.8, Craft = 1, Equipment = 1 }
+    local ttl = { Daily = 240, Merchant = 150, Fishing = 180, Craft = 180, Equipment = 180, Halloween = 120 }
+    local yieldTo = { Fishing = { Craft = true, Equipment = true } }
+    local guard = { Craft = { Fishing = true }, Equipment = { Fishing = true } }
+    local instant = { Daily = true }
+    local starvation = 25
+    local function note(message, level)
+        if type(log) == "function" then pcall(log, message, level) end
+    end
+    local function priority(name) return priorities[name] or 25 end
+    local function hold(name) return minimumHold[name] or 1 end
+    local function lifetime(name) return ttl[name] or 90 end
+    local function find(name)
+        for index, entry in ipairs(queue) do if entry.Name == name then return entry, index end end
+    end
+    local function leave(name)
+        local entry, index = find(name)
+        if index then table.remove(queue, index) end
+        return entry
+    end
+    local function enter(name)
+        local entry = find(name)
+        if entry then return entry end
+        entry = { Name = name, At = clock() }
+        queue[#queue + 1] = entry
+        return entry
+    end
+    local function ordered()
+        local now = clock()
+        table.sort(queue, function(a, b)
+            local starvedA, starvedB = now - a.At > starvation, now - b.At > starvation
+            if starvedA ~= starvedB then return starvedA end
+            local priorityA, priorityB = priority(a.Name), priority(b.Name)
+            if priorityA ~= priorityB then return priorityA > priorityB end
+            return a.At < b.At
+        end)
+        return queue[1]
+    end
+    local function hand(name)
+        serial += 1
+        owner, ticket, ownerSince, ownerPriority = name, serial, clock(), priority(name)
+        stats.Grants += 1
+        return ticket
+    end
+    local function refresh()
+        if owner and clock() - ownerSince > lifetime(owner) then
+            stats.Expired += 1
+            note("Scheduler released " .. owner .. " after " .. tostring(math.floor(clock() - ownerSince)) .. "s", "WARN")
+            owner, ownerSince, ownerPriority = nil, 0, 0
+        end
+        local first = ordered()
+        if not owner then
+            if not first then return nil end
+            leave(first.Name)
+            return hand(first.Name)
+        end
+        if not first then return nil end
+        local held = clock() - ownerSince
+        local wanted = priority(first.Name)
+        local starved = clock() - first.At > starvation
+        local yields = yieldTo[owner] and yieldTo[owner][first.Name] == true and held >= hold(owner)
+        local blocked = guard[owner] and guard[owner][first.Name] == true
+        local needHold = instant[first.Name] ~= true
+        if (wanted > ownerPriority and (held >= hold(owner) or not needHold) and not blocked) or yields or starved then
+            if wanted > ownerPriority then
+                stats.Preemptions += 1
+                note("Scheduler preempted " .. owner .. " for " .. first.Name, "INFO")
+            elseif yields then
+                stats.Yields += 1
+                note("Scheduler let " .. first.Name .. " run ahead of " .. owner, "INFO")
+            else
+                stats.Starved += 1
+                note("Scheduler starved " .. owner .. " for " .. first.Name, "WARN")
+            end
+            owner, ownerSince, ownerPriority = nil, 0, 0
+            leave(first.Name)
+            return hand(first.Name)
+        end
+        return nil
+    end
     function controller.Acquire(name)
         if owner == name then return ticket end
-        if not table.find(queue, name) then queue[#queue + 1] = name end
-        if owner or queue[1] ~= name then return nil end
-        table.remove(queue, 1)
-        serial += 1
-        owner, ticket = name, serial
-        return ticket
+        enter(name)
+        refresh()
+        if owner == name then leave(name) return ticket end
+        return nil
     end
     function controller.AcquirePriority(name)
         if owner == name then return ticket end
-        local index = table.find(queue, name)
-        if index then table.remove(queue, index) end
-        table.insert(queue, 1, name)
-        if owner then return nil end
-        table.remove(queue, 1)
-        serial += 1
-        owner, ticket = name, serial
-        return ticket
+        enter(name)
+        refresh()
+        if owner == name then leave(name) return ticket end
+        return nil
     end
     function controller.Release(name, lease)
-        if owner ~= name or ticket ~= lease then return false end
-        owner, ticket = nil, nil
+        if owner ~= name or (lease ~= nil and ticket ~= lease) then return false end
+        owner, ticket, ownerSince, ownerPriority = nil, nil, 0, 0
         return true
     end
     function controller.Cancel(name)
-        local index = table.find(queue, name)
-        if index then table.remove(queue, index) end
+        leave(name)
     end
-    function controller.IsOwner(name, lease)
-        return owner == name and (lease == nil or lease == ticket)
-    end
-    function controller.Wants(name)
-        return table.find(queue, name) ~= nil
-    end
+    function controller.IsOwner(name, lease) return owner == name and (lease == nil or lease == ticket) end
+    function controller.Wants(name) return find(name) ~= nil end
+    function controller.Update() return refresh() end
     function controller.GetState()
-        return { Owner = owner, Ticket = ticket, Waiting = table.clone(queue) }
+        local waiting = {}
+        for _, entry in ipairs(queue) do waiting[#waiting + 1] = { Name = entry.Name, Priority = priority(entry.Name), Waited = clock() - entry.At } end
+        return { Owner = owner, Ticket = ticket, Waiting = waiting, Held = owner and clock() - ownerSince or 0, Stats = stats, Priority = ownerPriority }
     end
+    function controller.SetClock(value) if type(value) == "function" then clock = value end end
+    function controller.Priorities() return priorities end
     return controller
 end)()
 
@@ -5239,6 +5317,7 @@ local Automation = (function()
     local navBusy, navOwner, navTicket, movingHumanoid = false, nil, nil, nil
     local encodedSnapshot, cachedSnapshot
     local equipmentNext, dailyNext, obbyNext, commandSerial, equipmentCursor = 0, 0, 0, 0, 0
+    local obbyFailures = 0
     local equipmentStatus, dailyStatus = "Disabled", "Disabled"
     local equipmentAttempts = {}
     local dailyEpoch
@@ -6240,6 +6319,17 @@ if not ok then attribute("Error", tostring(err)) end
         end)
     end
     local function obby(valid, quest)
+        if Config.DailyObby ~= true then
+            dailyStatus = "Obby skipped"
+            obbyNext = os.clock() + 600
+            return
+        end
+        if obbyFailures >= 2 then
+            obbyFailures = 0
+            dailyStatus = "Obby disabled after repeated failures"
+            obbyNext = os.clock() + 1800
+            return
+        end
         local map = workspace:FindFirstChild("Map")
         local givers = map and map:FindFirstChild("BuffGivers")
         local giver = givers and givers:FindFirstChild("ObbyBlessing")
@@ -6263,18 +6353,18 @@ if not ok then attribute("Error", tostring(err)) end
             dailyStatus = "Walking to the Obby start"
             local arrived, reason = travel(route[1] + Vector3.new(0, 3, 0), valid, 4)
             if not valid() then return end
-            if not arrived then dailyStatus = reason dailyNext = os.clock() + 45 return end
+            if not arrived then obbyFailures += 1 dailyStatus = reason dailyNext = os.clock() + 45 return end
             attribute("ObbyRouteStart", route[1])
             attribute("ObbyRouteEnd", route[#route])
             arrived, reason = walkObbyRoute(route, valid)
-            if not arrived then dailyStatus = reason clearSupports() dailyNext = os.clock() + 45 return end
+            if not arrived then obbyFailures += 1 dailyStatus = reason clearSupports() dailyNext = os.clock() + 45 return end
             local _, _, latestRoot = character()
             root = latestRoot
             if not root then return end
         end
         dailyStatus = "Completing Obby"
         local reached, reachReason = movePoint(target + Vector3.new(0, 3, 0), valid, 3, 5)
-        if not reached then dailyStatus = reachReason clearSupports() dailyNext = os.clock() + 30 return end
+        if not reached then obbyFailures += 1 dailyStatus = reachReason clearSupports() dailyNext = os.clock() + 30 return end
         local _, _, finalRoot = character()
         if finalRoot and (finalRoot.Position - target).Magnitude <= 7 then attribute("ObbyReachedAt", workspace:GetServerTimeNow()) end
         local deadline, confirmed = os.clock() + 6, false
@@ -6329,7 +6419,10 @@ if not ok then attribute("Error", tostring(err)) end
                 if quest.Id == 19 then craft[#craft + 1] = "Fortune Potion II"
                 elseif quest.Id == 20 then craft[#craft + 1] = "Haste Potion I"
                 elseif quest.Id == 25 or quest.Id == 26 then fishing = true
-                elseif quest.Id == 21 or quest.Id == 22 then if os.clock() >= obbyNext then movementQuest = quest else passive = "Obby cooldown: " .. tostring(math.ceil(obbyNext - os.clock())) .. " s" end
+                elseif quest.Id == 21 or quest.Id == 22 then
+                    if Config.DailyObby ~= true then passive = "Obby skipped"
+                    elseif os.clock() >= obbyNext then movementQuest = quest
+                    else passive = "Obby cooldown: " .. tostring(math.ceil(obbyNext - os.clock())) .. " s" end
                 elseif quest.Id == 10 or quest.Id == 11 then movementQuest = movementQuest or quest
                 elseif quest.Id >= 14 and quest.Id <= 18 then passive = data.AutoRoll and "Native Auto Roll is progressing" or "Waiting for native Auto Roll"
                 elseif quest.Id == 12 or quest.Id == 13 then passive = "Using daily task potions"
@@ -9766,7 +9859,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.55", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.56", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -10005,6 +10098,7 @@ function API.SetAutomationEnabled(feature, value) return Automation.SetEnabled(f
 function API.SelectAutomation(feature, values) return Automation.Select(feature, values) end
 function API.GetScriptCompatibilityState() return ScriptCompatibility.GetState() end
 function API.GetNavigationState() return Navigation.GetState() end
+function API.GetSchedulerState() return MovementCoordinator.GetState() end
 function API.GetSessionFeed() return { Stats = SessionFeed.Stats(), Uptime = SessionFeed.Uptime(), Recent = SessionFeed.Recent(12), Digest = SessionFeed.Digest() } end
 function API.SendSessionDigest() return sendDigest() end
 function API.SetAutoReexecute(value) return Reexecution.SetEnabled(value) end
@@ -10125,6 +10219,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.55")
+local loader, failure = loadstring(source, "BonesHub 3.56")
 if not loader then error(failure) end
 return loader()
