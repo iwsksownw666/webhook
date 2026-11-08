@@ -6576,6 +6576,7 @@ local MerchantAutomation = (function()
     local enabled, living, busy = Config.AutoMerchant == true, true, false
     local bridge, lease, mountedPage
     local status, lastError, currentMerchant = "Watching merchant spawns", nil, nil
+    local visitStartedAt, purchaseDoneSeen, purchaseSince = 0, nil, 0
     local selectors, signatures, metrics, processed = {}, {}, {}, {}
     local syncing, generation, retryAt = false, 0, 0
     Config.MerchantAmounts = Config.MerchantAmounts or { Mari = {}, Jester = {}, Rin = {} }
@@ -6608,8 +6609,10 @@ local MerchantAutomation = (function()
     end
     local function nearby(info)
         local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if not root or root.Anchored then return false end
         local position = info and info.location
-        return root and not root.Anchored and position and (root.Position - Vector3.new(position.X, position.Y, position.Z)).Magnitude <= 15
+        if type(position) ~= "table" then return true end
+        return (root.Position - Vector3.new(position.X, position.Y, position.Z)).Magnitude <= 22
     end
     local function waitFor(key, sequence, seconds, token)
         local deadline = os.clock() + seconds
@@ -6636,6 +6639,7 @@ local MerchantAutomation = (function()
         return false
     end
     local function visit(id, merchant, group, products, token)
+        visitStartedAt = os.clock()
         local deadline = os.clock() + 100
         status, currentMerchant, lastError = "Waiting for current task", group, nil
         repeat
@@ -6670,7 +6674,6 @@ local MerchantAutomation = (function()
             local purchase = (bridge:GetAttribute("PurchaseSequence") or 0) + 1
             put("PurchaseMerchantId", id) put("PurchaseProductId", product.Id)
             put("PurchaseAmount", MerchantRules.Quantity((Config.MerchantAmounts[group] or {})[product.Name]))
-            processed[id] = true
             put("PurchaseSequence", purchase)
             if not waitFor("PurchaseDone", purchase, 15) then lastError = "Purchase response unconfirmed; resending paused" break end
             local actual = bridge:GetAttribute("PurchaseActual")
@@ -6680,7 +6683,13 @@ local MerchantAutomation = (function()
                 visitPurchases += actual
                 log(group .. ": purchased " .. tostring(actual) .. " " .. product.Name, "INFO")
                 saveConfig()
-            else lastError = bridge:GetAttribute("PurchaseStatus") end
+                processed[id] = true
+            else
+                lastError = bridge:GetAttribute("PurchaseStatus")
+                local text = tostring(lastError or "")
+                if text:find("Purchase limit", 1, true) or text:find("Insufficient", 1, true)
+                    or text:find("Out of stock", 1, true) or text:find("Product locked", 1, true) then processed[id] = true end
+            end
         end
         put("CloseSequence", (bridge:GetAttribute("CloseSequence") or 0) + 1)
         if living and visitPurchases > 0 and bridge:GetAttribute("PurchaseInFlight") ~= true then
@@ -6695,6 +6704,7 @@ local MerchantAutomation = (function()
         lease = nil
         MovementCoordinator.Cancel("Merchant")
         busy = false
+        visitStartedAt = 0
     end
     local function choose()
         local candidates = {}
@@ -7141,6 +7151,22 @@ put("Stopped", true)
             local ok, reason = pcall(function()
                 for _, group in ipairs(groups) do mountSelector(group) mountQuantities(group) end
                 refreshMerchants(false) updateCatalogs()
+                for id in pairs(processed) do if not MerchantCache[id] then processed[id] = nil end end
+                local done = tonumber(bridge:GetAttribute("PurchaseDone")) or 0
+                if purchaseDoneSeen ~= done then purchaseDoneSeen, purchaseSince = done, os.clock() end
+                if bridge:GetAttribute("PurchaseInFlight") == true and os.clock() - purchaseSince > 20 then
+                    put("PurchaseInFlight", false)
+                    put("PurchaseStatus", "Cleared stale purchase flag")
+                    purchaseSince = os.clock()
+                    lastError = "Recovered a stuck purchase"
+                end
+                if busy and visitStartedAt > 0 and os.clock() - visitStartedAt > 60 then
+                    lastError = "Merchant visit timed out; recovering"
+                    status = "Recovering merchant visit"
+                    generation += 1
+                    release()
+                    retryAt = os.clock() + 3
+                end
                 if enabled and not busy and dataReady() and bridge:GetAttribute("PurchaseInFlight") ~= true and os.clock() >= retryAt then
                     local selected = choose()
                     if not selected then
@@ -7150,6 +7176,8 @@ put("Stopped", true)
                     end
                     if selected then
                         busy = true
+                        visitStartedAt = os.clock()
+                        lastError = nil
                         local token = generation
                         task.spawn(function()
                             local worked, failure = pcall(visit, selected.Id, selected.Info, selected.Group, selected.Products, token)
@@ -9424,7 +9452,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.48", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.49", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -9760,6 +9788,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.48")
+local loader, failure = loadstring(source, "BonesHub 3.49")
 if not loader then error(failure) end
 return loader()
