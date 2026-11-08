@@ -1155,6 +1155,47 @@ local Appearance = (function()
     end
 
     local sized = setmetatable({}, { __mode = "k" })
+    local fitted = setmetatable({}, { __mode = "k" })
+    local function fit(object)
+        if not (object:IsA("TextLabel") or object:IsA("TextButton")) then return end
+        local text = object.Text
+        if type(text) ~= "string" then return end
+        object.TextTruncate = Enum.TextTruncate.AtEnd
+        if #text > 140 or text:find("\n", 1, true) then
+            if not fitted[object] then
+                fitted[object] = true
+                object:GetPropertyChangedSignal("Text"):Connect(function()
+                    local value = object.Text
+                    if type(value) == "string" and #value > 220 and not value:find("\n", 1, true) then
+                        object.Text = value:sub(1, 219) .. "…"
+                    end
+                end)
+            end
+            return
+        end
+        object.TextWrapped = false
+        object.TextScaled = true
+        local limit = object:FindFirstChildOfClass("UITextSizeConstraint")
+        if not limit then
+            limit = Instance.new("UITextSizeConstraint")
+            limit.MinTextSize = 8
+            local base = object.TextSize
+            if type(base) ~= "number" or base <= 0 then base = 14 end
+            local cap = math.clamp(base, 12, 15)
+            if #text > 24 then cap = 13 elseif #text > 12 then cap = 14 end
+            limit.MaxTextSize = math.min(cap, math.clamp(base, 10, 15))
+            limit.Parent = object
+        end
+        if not fitted[object] then
+            fitted[object] = true
+            object:GetPropertyChangedSignal("Text"):Connect(function()
+                local value = object.Text
+                if type(value) == "string" and #value > 96 and not value:find("\n", 1, true) then
+                    object.Text = value:sub(1, 95) .. "…"
+                end
+            end)
+        end
+    end
     function appearance.Style(object)
         if object:IsA("GuiObject") then
             local color = object.BackgroundColor3
@@ -1174,6 +1215,7 @@ local Appearance = (function()
                     elseif object.TextColor3.R >= 0.3 then object.TextColor3 = colors.Muted end
                 end
                 if object:IsA("TextBox") then object.ClearTextOnFocus = false end
+                fit(object)
                 if object:IsA("TextLabel") and object.Text == "bones hub" then
                     object.TextColor3 = colors.Accent
                 end
@@ -6641,31 +6683,31 @@ local MerchantAutomation = (function()
     local function visit(id, merchant, group, products, token)
         visitStartedAt = os.clock()
         local deadline = os.clock() + 100
-        status, currentMerchant, lastError = "Waiting for current task", group, nil
+        status, currentMerchant, lastError = "Waiting for task", group, nil
         repeat
             if not valid(token) or not MerchantCache[id] then return end
             lease = MovementCoordinator.AcquirePriority("Merchant")
             if not lease then task.wait(0.1) end
         until lease or os.clock() >= deadline
-        if not lease then lastError = "Current task has not released movement" return end
+        if not lease then lastError = "Movement busy" return end
         put("InventoryReserved", true)
         deadline = os.clock() + 15
         while valid(token) and not idle() and os.clock() < deadline do task.wait(0.1) end
         if not valid(token) then return end
-        if not idle() then lastError = "Waiting for pending inventory operation" return end
-        if not dataReady() then lastError = "Waiting for merchant inventory data" return end
-        if not nearby(merchant) and (bridge:GetAttribute("TeleporterCount") or 0) <= 0 then lastError = "Merchant Teleport not owned" return end
+        if not idle() then lastError = "Inventory busy" return end
+        if not dataReady() then lastError = "Waiting for data" return end
+        if not nearby(merchant) and (bridge:GetAttribute("TeleporterCount") or 0) <= 0 then lastError = "No teleporter" return end
         local sequence = (bridge:GetAttribute("TeleportSequence") or 0) + 1
         put("TargetMerchantId", id)
         put("TeleportSequence", sequence)
         status = "Teleporting to " .. group
-        if not waitFor("TeleportDone", sequence, 5, token) then lastError = "Teleport request unconfirmed" return end
+        if not waitFor("TeleportDone", sequence, 5, token) then lastError = "Teleport unconfirmed" return end
         local teleportStatus = bridge:GetAttribute("TeleportStatus")
         if teleportStatus ~= "Teleport sent" and teleportStatus ~= "Already at merchant" and not tostring(teleportStatus):find("Opened ", 1, true) then lastError = tostring(teleportStatus) return end
         deadline = os.clock() + 15
         while valid(token) and MerchantCache[id] and not nearby(merchant) and os.clock() < deadline do task.wait(0.1) end
         if not valid(token) then return end
-        if not MerchantCache[id] or not nearby(merchant) then lastError = "Merchant arrival not confirmed" return end
+        if not MerchantCache[id] or not nearby(merchant) then lastError = "Arrival unconfirmed" return end
         local visitPurchases = 0
         for _, product in ipairs(products) do
             if not valid(token) or not MerchantCache[id] or not nearby(merchant) then break end
@@ -6675,7 +6717,7 @@ local MerchantAutomation = (function()
             put("PurchaseMerchantId", id) put("PurchaseProductId", product.Id)
             put("PurchaseAmount", MerchantRules.Quantity((Config.MerchantAmounts[group] or {})[product.Name]))
             put("PurchaseSequence", purchase)
-            if not waitFor("PurchaseDone", purchase, 15) then lastError = "Purchase response unconfirmed; resending paused" break end
+            if not waitFor("PurchaseDone", purchase, 15) then lastError = "Purchase unconfirmed" break end
             local actual = bridge:GetAttribute("PurchaseActual")
             if bridge:GetAttribute("PurchaseSuccess") == true and type(actual) == "number" and actual > 0 then
                 local key = group .. " / " .. product.Name
@@ -6696,7 +6738,7 @@ local MerchantAutomation = (function()
             status = "Resetting after merchant"
             if not resetCharacter() then lastError = "Waiting for respawn" end
         end
-        status = visitPurchases > 0 and "Merchant complete; previous tasks resumed" or "No selected products purchased"
+        status = visitPurchases > 0 and "Merchant done" or "Nothing bought"
     end
     local function release()
         put("InventoryReserved", false)
@@ -7075,7 +7117,7 @@ local ok, failure = pcall(function()
                 elseif not root or root.Anchored then put("TeleportStatus", "Character locked")
                 elseif not idle() then put("TeleportStatus", "Inventory busy")
                 elseif nearby(info) then put("TeleportStatus", "Already at merchant")
-                elseif MerchantRules.Amount(playerData(), "Merchant Teleport") < 1 then put("TeleportStatus", "Merchant Teleport not owned")
+                elseif MerchantRules.Amount(playerData(), "Merchant Teleport") < 1 then put("TeleportStatus", "No teleporter")
                 else
                     pendingName, pendingUntil = MerchantRules.Group(info.merchant_name), os.clock() + 15
                     inventory.UseItem.send({ itemName = "Merchant Teleport", amount = 1 })
@@ -7191,7 +7233,8 @@ put("Stopped", true)
                     local total, lines = 0, {}
                     for name, count in pairs(statistics) do total += count lines[#lines + 1] = name .. ": " .. tostring(count) end
                     table.sort(lines)
-                    local text = lastError and status .. ": " .. tostring(lastError) or status
+                    local text = lastError and (status .. " | " .. tostring(lastError)) or status
+                    if #text > 54 then text = text:sub(1, 53) .. "…" end
                     if metrics.Status[1] and metrics.Status[1].ValueLabel then metrics.Status[1].ValueLabel.Text = text end
                     if metrics.Status[2] and metrics.Status[2].ValueLabel then metrics.Status[2].ValueLabel.Text = tostring(total) end
                     if metrics.Items and metrics.Items.ValueLabel then metrics.Items.ValueLabel.Text = #lines > 0 and table.concat(lines, " | ") or "None" end
@@ -7734,7 +7777,7 @@ function HalloweenBounty.Create(options)
             if uncertain.FinalReward then blocked = true
             elseif now >= nextClaim then status = "Claiming final reward" request(claim, "FinalReward", "FinalReward", hunt.NextUpdateTime) return end
         end
-        status = blocked and "Unconfirmed claim; awaiting server confirmation" or (hunt.FinalReward ~= nil or acknowledged.FinalReward) and "Daily rewards claimed" or "Waiting for completed bounties"
+        status = blocked and "Awaiting claim confirm" or (hunt.FinalReward ~= nil or acknowledged.FinalReward) and "Daily rewards claimed" or "Waiting for bounties"
         if dirty and now >= nextFetch then dirty = false status = status request(fetch) end
     end
     return self
@@ -9461,7 +9504,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.50", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.51", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
@@ -9497,6 +9540,16 @@ pcall(function()
 end)
 
 TabLayout.Install(UI)
+task.spawn(function()
+    local core = game:GetService("CoreGui")
+    for _, delay in ipairs({ 0.6, 1.6, 4 }) do
+        task.wait(delay)
+        pcall(function()
+            local gui = core:FindFirstChild(UI_ROOT_NAME)
+            if gui then Appearance.Finish(gui) end
+        end)
+    end
+end)
 UI:SetSidebarUserStatus(false)
 UI:SetBootStep("Building macro controls", 0.18, "main page")
 UI:AddSectionHeader(7, "Notifications", "Weather, merchant stock and aura equipment")
@@ -9797,6 +9850,6 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.50")
+local loader, failure = loadstring(source, "BonesHub 3.51")
 if not loader then error(failure) end
 return loader()
