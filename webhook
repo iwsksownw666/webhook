@@ -4845,7 +4845,7 @@ local inventoryDirty, inventorySource, count = true, nil, 0
 local nextInventory = 0
 local cachedReplica, cachedReplicaKey
 local cachedSpot, cachedSpotId, cachedPoints
-local lastSnapshot, suppressResults, suppressedResults = nil, true, 0
+local lastSnapshot, suppressResults, suppressedResults, nextSuppressionScan = nil, true, 0, 0
 local sale, session, retired
 local shutdownDeadline
 local saleSequence, caught, sold, earlyConfirmed = 0, 0, 0, 0
@@ -5006,31 +5006,43 @@ for _, callback in pairs(packets.quit.getListeners()) do
     if debug.info(callback, "s"):find("ClientHandlers.FishingClient", 1, true) then nativeCleanup.Finish = callback break end
 end
 bridge:SetAttribute("NativeCleanupReady", nativeCleanup.Finish ~= nil)
-for index, original in pairs(rewardCallbacks) do
-    if debug.info(original, "s"):find("ClientHandlers.FishingClient", 1, true) then
-        local wrapped = function(...)
-            local prior = getthreadidentity and getthreadidentity()
-            if setthreadidentity then setthreadidentity(8) end
-            local value = ...
-            if ownedFishing and session and session.submitted and type(value) == "table" and nativeCleanup.Finish then
-                pcall(nativeCleanup.Finish)
+local function installSuppression()
+    local installed = false
+    for index, original in pairs(packets.reward.getListeners()) do
+        if debug.info(original, "s"):find("ClientHandlers.FishingClient", 1, true) then
+            local already = false
+            for _, upvalue in pairs(debug.getupvalues(original)) do
+                if upvalue == bridge then already = true break end
             end
-            if bridge and ownedFishing and suppressResults then
-                suppressedResults += 1
-                if ui.isResultMode then ui.isResultMode = false end
-                if ui.rewardModel ~= nil then ui.rewardModel = nil end
-                ui.isFishing = false
-                if setthreadidentity and prior then setthreadidentity(prior) end
-                return
+            if not already then
+                local wrapped = function(...)
+                    local prior = getthreadidentity and getthreadidentity()
+                    if setthreadidentity then setthreadidentity(8) end
+                    local value = ...
+                    if ownedFishing and session and session.submitted and type(value) == "table" and nativeCleanup.Finish then
+                        pcall(nativeCleanup.Finish)
+                    end
+                    if bridge and ownedFishing and suppressResults then
+                        suppressedResults += 1
+                        if ui.isResultMode then ui.isResultMode = false end
+                        if ui.rewardModel ~= nil then ui.rewardModel = nil end
+                        ui.isFishing = false
+                        if setthreadidentity and prior then setthreadidentity(prior) end
+                        return
+                    end
+                    if setthreadidentity and prior then setthreadidentity(prior) end
+                    return original(...)
+                end
+                rewardCallbacks[index] = wrapped
+                replacements[#replacements + 1] = { list = rewardCallbacks, original = original, wrapped = wrapped }
+                suppressionReady = true
+                installed = true
             end
-            if setthreadidentity and prior then setthreadidentity(prior) end
-            return original(...)
         end
-        rewardCallbacks[index] = wrapped
-        replacements[#replacements + 1] = { list = rewardCallbacks, original = original, wrapped = wrapped }
-        suppressionReady = true
     end
+    return installed
 end
+installSuppression()
 bridge:SetAttribute("ResultSuppressionReady", suppressionReady)
 local collection = packets.sellAllFish.getListeners()
 for index, original in pairs(collection) do
@@ -5086,6 +5098,15 @@ local ok, failure = pcall(function()
             finishNative()
         end
         suppressResults = bridge:GetAttribute("HideResults") ~= false
+        if os.clock() >= nextSuppressionScan then
+            nextSuppressionScan = os.clock() + 3
+            if not suppressionReady and installSuppression() then bridge:SetAttribute("ResultSuppressionReady", true) end
+            if not nativeCleanup.Finish then
+                for _, callback in pairs(packets.quit.getListeners()) do
+                    if debug.info(callback, "s"):find("ClientHandlers.FishingClient", 1, true) then nativeCleanup.Finish = callback bridge:SetAttribute("NativeCleanupReady", true) break end
+                end
+            end
+        end
         for _ = 1, math.min(#events, 64) do
             local event = table.remove(events, 1)
             event.callback(table.unpack(event.arguments, 1, event.arguments.n))
@@ -9859,7 +9880,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.56", LogoImage = "",
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.57", LogoImage = "",
     InterfaceMotion = Config.InterfaceMotion,
     GuiParent = "CoreGui", InitialPage = 1, ToggleKey = "K", SidebarWidth = 180,
     WindowWidth = 920, WindowHeight = 580, SplashMode = "boot", BootSteps = 7,
