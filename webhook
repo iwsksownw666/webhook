@@ -16,6 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
+local SCRIPT_VERSION = "3.59"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -156,7 +157,7 @@ local function preloadPacketNamespaces()
 end
 task.spawn(preloadPacketNamespaces)
 local DEFAULT_CONFIG = {
-    HalloweenAutoFarm = false, HalloweenAutoOrbs = false, HalloweenAutoBounty = false, HalloweenCombatAlerts = false, HalloweenCombatWebhook = "", HalloweenESP = false, HalloweenCombatHUD = true, HalloweenAutoDodge = true, HalloweenAutoEquip = true, HalloweenRotateAuras = true,
+    HalloweenAutoFarm = false, HalloweenAutoOrbs = false, HalloweenAutoBounty = false, HalloweenCombatAlerts = false, HalloweenCombatWebhook = "", HalloweenBossAlerts = true, HalloweenESP = false, HalloweenCombatHUD = true, HalloweenAutoDodge = true, HalloweenAutoEquip = true, HalloweenRotateAuras = true,
     HalloweenAuras = { "PYTHIOS", "CHILLSEAR", "Archangel", "Starscourge_Radiant" }, HalloweenTargets = { "Boss", "Orb", "Minion" }, HalloweenDamageScores = {},
     HalloweenSearchDistance = 1000, HalloweenESPDistance = 5000, HalloweenDodgeMargin = 4, HalloweenRetreatHP = 20, HalloweenEngageDistance = 12,
     AutoMerchant = false, MerchantSelections = { Mari = {}, Jester = {}, Rin = {} }, MerchantCatalogs = { Mari = {}, Jester = {}, Rin = {} }, MerchantPurchases = {}, MerchantAmounts = { Mari = {}, Jester = {}, Rin = {} },
@@ -261,7 +262,7 @@ local function assetImage(assetId)
 end
 
 local function footer(label)
-    return { text = label or string.format("bones hub by Ethereal - v3.8 | %dms", pingMs()) }
+    return { text = label or string.format("bones hub by Ethereal - v" .. SCRIPT_VERSION .. " | %dms", pingMs()) }
 end
 
 local SessionFeed = (function()
@@ -270,6 +271,7 @@ local SessionFeed = (function()
     local startedAt = os.clock()
     local limit = 400
     local rules = {
+        { Key = "boss", Match = "boss spawn" },
         { Key = "delivery", Match = "webhook delivered" },
         { Key = "delivery", Match = "webhook failed" },
         { Key = "biome", Match = "biome" },
@@ -317,7 +319,7 @@ local SessionFeed = (function()
             "**Events:** " .. tostring(counters.total or 0) .. "  **Problems:** " .. tostring(counters.problems or 0),
             "**Biomes:** " .. tostring(counters.biome or 0) .. "  **Merchants:** " .. tostring(counters.merchant or 0) .. "  **Purchases:** " .. tostring(counters.purchase or 0),
             "**Quests:** " .. tostring(counters.quest or 0) .. "  **Auras:** " .. tostring(counters.aura or 0) .. "  **Fish:** " .. tostring(counters.fish or 0),
-            "**Combat:** " .. tostring(counters.combat or 0) .. "  **Recoveries:** " .. tostring(counters.recovery or 0),
+            "**Combat:** " .. tostring(counters.combat or 0) .. "  **Bosses:** " .. tostring(counters.boss or 0) .. "  **Recoveries:** " .. tostring(counters.recovery or 0),
         }
         local recent = feed.Recent(5)
         if #recent > 0 then
@@ -8251,6 +8253,67 @@ local Halloween = (function()
         Encode = function(value) return HttpService:JSONEncode(value) end,
         Request = function(options) if type(requestFunction) ~= "function" then error("HTTP request API unavailable") end return requestFunction(options) end,
     })
+    local bossAlerts = (function()
+        local board = { Sent = 0, Error = nil, Last = nil, LastAt = 0, Skipped = 0 }
+        local seen = setmetatable({}, { __mode = "k" })
+        local cooldown = {}
+        local function destination()
+            local custom = trim(Config.HalloweenCombatWebhook or "")
+            return custom ~= "" and custom or trim(Config.Webhook or "")
+        end
+        local function active() return Config.HalloweenBossAlerts == true and living and Alive end
+        local function myRoot()
+            local character = LocalPlayer.Character
+            return character and character:FindFirstChild("HumanoidRootPart")
+        end
+        function board.Send(model)
+            if not active() or seen[model] then return false end
+            seen[model] = true
+            local label = tostring(HalloweenRules.Label(model) or model.Name)
+            local now = os.clock()
+            local wait = cooldown[label]
+            if wait and now < wait then board.Skipped += 1 return false end
+            local url = destination()
+            if not isWebhook(url) then board.Error = "Set webhook URL" return false end
+            cooldown[label] = now + 120
+            board.Last, board.LastAt = label, now
+            local health, maximum = HalloweenRules.Health(model)
+            local point, mine = model:FindFirstChild("HumanoidRootPart"), myRoot()
+            local distance = point and mine and math.floor((point.Position - mine.Position).Magnitude) or nil
+            local body = HttpService:JSONEncode({ allowed_mentions = { parse = {} }, embeds = { {
+                title = "Boss Spawned", color = 0xB15CFF,
+                description = "**" .. label .. "** entered the world.",
+                fields = {
+                    { name = "Health", value = health and (tostring(math.floor(health)) .. " / " .. tostring(math.floor(maximum or health))) or "Unknown", inline = true },
+                    { name = "Distance", value = distance and (tostring(distance) .. "m") or "Unknown", inline = true },
+                    { name = "Biome", value = tostring(State.CurrentBiome or "Unknown"), inline = true },
+                    { name = "Server", value = "||" .. tostring(game.JobId):sub(-8) .. "||", inline = false },
+                },
+                footer = { text = "Bones Hub | " .. tostring(LocalPlayer.DisplayName) .. " (@" .. tostring(LocalPlayer.Name) .. ")" },
+                timestamp = DateTime.now():ToIsoDate(),
+            } } })
+            task.spawn(function()
+                local ok, result = pcall(function()
+                    return requestFunction({ Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body, Timeout = 10 })
+                end)
+                local response = ok and result or nil
+                local status = type(response) == "table" and tonumber(response.StatusCode or response.Status) or nil
+                if status and status >= 200 and status < 300 then
+                    board.Sent += 1 board.Error = nil
+                    log("Boss spawn: " .. label .. " (webhook delivered)", "INFO")
+                else
+                    board.Error = status and ("HTTP " .. tostring(status)) or "delivery unconfirmed"
+                    log("Boss spawn: " .. label .. " (webhook failed - " .. tostring(board.Error) .. ")", "WARN")
+                end
+            end)
+            return true
+        end
+        function board.GetState()
+            return { Sent = board.Sent, Error = board.Error, Last = board.Last, LastAt = board.LastAt, Skipped = board.Skipped,
+                Enabled = Config.HalloweenBossAlerts == true, Configured = isWebhook(destination()) }
+        end
+        return board
+    end)()
     local lastReport
     local ACTOR_SOURCE = [======[
 if setthreadidentity then setthreadidentity(8) end
@@ -9068,7 +9131,11 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         if lease and MovementCoordinator.IsOwner("Halloween",lease) and root and not root.Anchored then humanoid:MoveTo(root.Position) end
     end
     local function add(model)
-        if model:IsA("Model") and not records[model] then records[model] = { Kind = HalloweenRules.Kind(model), Label = HalloweenRules.Label(model) } nextChoice=0 end
+        if model:IsA("Model") and not records[model] then
+            records[model] = { Kind = HalloweenRules.Kind(model), Label = HalloweenRules.Label(model) }
+            nextChoice = 0
+            if records[model].Kind == "Boss" then bossAlerts.Send(model) end
+        end
     end
     local function remove(model)
         records[model] = nil HalloweenESP.Remove(model)
@@ -9239,7 +9306,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         attribute("EngageDistance", Config.HalloweenEngageDistance or 12)
     end
     function controller.SetEnabled(feature, value)
-        local key = ({ Farm = "HalloweenAutoFarm", Orbs = "HalloweenAutoOrbs", Bounty = "HalloweenAutoBounty", Alerts = "HalloweenCombatAlerts", ESP = "HalloweenESP", HUD = "HalloweenCombatHUD", Dodge = "HalloweenAutoDodge", Equip = "HalloweenAutoEquip", Rotate = "HalloweenRotateAuras" })[feature]
+        local key = ({ Farm = "HalloweenAutoFarm", Orbs = "HalloweenAutoOrbs", Bounty = "HalloweenAutoBounty", Alerts = "HalloweenCombatAlerts", Boss = "HalloweenBossAlerts", ESP = "HalloweenESP", HUD = "HalloweenCombatHUD", Dodge = "HalloweenAutoDodge", Equip = "HalloweenAutoEquip", Rotate = "HalloweenRotateAuras" })[feature]
         if not key then return false end
         value = value == true Config[key] = value
         if (feature == "Farm" or feature == "Orbs") and value then Config.HalloweenAutoEquip, Config.HalloweenRotateAuras = true, true end
@@ -9276,7 +9343,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         local count = 0 for _ in pairs(records) do count += 1 end
         local esp = HalloweenESP.GetState()
         return { Enabled = enabled(), AutoOrbs = Config.HalloweenAutoOrbs == true, ESP = Config.HalloweenESP, Dodge = Config.HalloweenAutoDodge, Status = status, Error = errorText or (bridge and bridge:GetAttribute("Error")),
-            AutoBounty = Config.HalloweenAutoBounty == true, Bounty = bounty.GetState(), CombatAlerts = Config.HalloweenCombatAlerts == true, CombatWebhook = reports.GetState(),
+            AutoBounty = Config.HalloweenAutoBounty == true, Bounty = bounty.GetState(), CombatAlerts = Config.HalloweenCombatAlerts == true, CombatWebhook = reports.GetState(), BossAlerts = Config.HalloweenBossAlerts == true, BossWebhook = bossAlerts.GetState(),
             OwnKills = bridge and bridge:GetAttribute("OwnKills") or 0, CastStatus = bridge and bridge:GetAttribute("CastStatus"),
             ESPTracked = esp.Tracked, ESPVisible = esp.Visible, PathStatus = routeReason,
             Recoveries=recoveries, PursuitRecoveries=pursuitRecoveries, LastRecovery=lastRecovery, ActorRestarts=actorRestarts, ActorErrors=bridge and bridge:GetAttribute("ActorErrors") or 0,
@@ -9301,8 +9368,9 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         toggles.Alerts = UI:AddToggle(page, "Combat Reward Webhook", Config.HalloweenCombatAlerts == true, function(value) if not syncing then controller.SetEnabled("Alerts",value) end end)
         local webhook = UI:AddInput(page,"Combat Webhook URL","Optional - uses Discord Webhook URL when empty",controller.SetWebhook)
         webhook:Set(Config.HalloweenCombatWebhook or "")
-        rows = UI:AddMetricRow(page, { { Label = "Your Defeats", Value = "0" }, { Label = "Combat Alerts", Value = "Disabled" } })
-        metrics["Your Defeats"], metrics["Combat Alerts"] = rows[1], rows[2]
+        toggles.BossWebhook = UI:AddToggle(page, "Boss Spawn Webhook", Config.HalloweenBossAlerts == true, function(value) if not syncing then controller.SetEnabled("Boss", value) end end)
+        rows = UI:AddMetricRow(page, { { Label = "Your Defeats", Value = "0" }, { Label = "Combat Alerts", Value = "Disabled" }, { Label = "Boss Alerts", Value = "Disabled" } })
+        metrics["Your Defeats"], metrics["Combat Alerts"], metrics["Boss Alerts"] = rows[1], rows[2], rows[3]
         UI:AddDivider(page, "Combat Options")
         local targetControl = UI:AddMultiSelect(page, "Target Types", { "Boss", "Orb", "Minion" }, function(map)
             if syncing then return end
@@ -9736,6 +9804,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
                     ["Bounty Hunt"] = state.Bounty.Status .. " / " .. tostring(state.Bounty.Claimed) .. " claimed",
                     ["Your Defeats"] = tostring(state.OwnKills) .. " last hits",
                     ["Combat Alerts"] = not state.CombatAlerts and "Disabled" or state.CombatWebhook.Error or not state.CombatWebhook.Configured and "Set webhook URL" or tostring(state.CombatWebhook.Sent) .. " delivered",
+                    ["Boss Alerts"] = not state.BossAlerts and "Disabled" or state.BossWebhook.Error or not state.BossWebhook.Configured and "Set webhook URL" or tostring(state.BossWebhook.Sent) .. " delivered / " .. tostring(state.BossWebhook.Last or "none"),
                     ["Confirmed Casts"] = tostring(state.ConfirmedCasts or 0), ["Dodge Status"] = dodgeGoal and "Dodging" or Config.HalloweenAutoDodge and "Watching attack warnings" or "Disabled" }
                 for key, value in pairs(values) do local row = metrics[key] if row and row.ValueLabel and row.ValueLabel.Parent then row.ValueLabel.Text = value end end
             end
@@ -9952,7 +10021,7 @@ mountInterface = function(page)
         if UI then UI:Destroy() end
         Controls = {}
 UI = library.new({
-    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = "3.58", LogoImage = logoImage(),
+    AppName = "bones hub", AppSubtitle = "by Ethereal", AppVersion = SCRIPT_VERSION, LogoImage = logoImage(),
     AccentColor = Color3.fromRGB(168, 105, 255),
     Colors = {
         Bg = Color3.fromRGB(10, 10, 16), Bg2 = Color3.fromRGB(14, 14, 21), Sidebar = Color3.fromRGB(7, 7, 11),
