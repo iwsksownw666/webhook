@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.60"
+local SCRIPT_VERSION = "3.61"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -2195,15 +2195,20 @@ local Potion = (function()
         local _, _, root = currentCharacter()
         local target = cauldronPosition()
         if not root or not target then setStatus("Waiting for cauldron") return end
-        setStatus("Walking to cauldron")
-        local arrived, movementError = travel(target, token, 9)
+        local _, _, here = currentCharacter()
+        local arrived, movementError = true, nil
+        if not here or (here.Position - target).Magnitude > 8 then
+            setStatus("Walking to cauldron")
+            arrived, movementError = travel(target, token, 9)
+        end
         if not arrived then setStatus("Movement paused", movementError) nextAttempt = os.clock() + 30 return end
         local function make()
+            for _ = 1, 40 do
             if not active(token) then return end
-            local latest = awaitData(function() return true end,token,6)
+            local latest = awaitData(function() return true end,token,3)
             if not latest then setStatus("Waiting for fresh crafting data") nextAttempt=os.clock()+10 return end
             local ready,filled = plan(latest)
-            if not ready then setStatus("Ingredients changed during travel") nextAttempt=os.clock()+10 return end
+            if not ready and not filled then setStatus("Waiting for complete ingredients") return end
             if bridge and bridge.Parent then bridge:SetAttribute("MutationPending",true) end
             local _, _, currentRoot = currentCharacter()
             if not currentRoot or (currentRoot.Position - target).Magnitude > 12 then setStatus("Outside crafting range") return end
@@ -2244,13 +2249,15 @@ local Potion = (function()
                 return
             end
             local confirmed = awaitData(function(value) return value.Count > previousCount end, token, 8)
-            if confirmed then
-                if pendingOutcomes[recipeName]~=nil then completed += 1 pendingOutcomes[recipeName]=nil end
-                log(recipeName .. " crafted; inventory " .. tostring(previousCount) .. " -> " .. tostring(confirmed.Count), "INFO")
-                setStatus("Craft confirmed")
-            else
+            if not confirmed then
                 setStatus("Inventory unconfirmed; crafting paused")
                 nextAttempt = os.clock() + 30
+                return
+            end
+            if pendingOutcomes[recipeName]~=nil then completed += 1 pendingOutcomes[recipeName]=nil end
+            log(recipeName .. " crafted; inventory " .. tostring(previousCount) .. " -> " .. tostring(confirmed.Count), "INFO")
+            setStatus("Craft confirmed x" .. tostring(completed))
+            if not MovementCoordinator.IsOwner("Potion", movementTicket) then return end
             end
         end
         local ok, err = pcall(make)
@@ -2298,8 +2305,15 @@ local Potion = (function()
             end
         end
         if not available then manualOnce = false setStatus("Waiting for complete ingredients") MovementCoordinator.Cancel("Potion") return false end
+        local priorityTable = MovementCoordinator.Priorities()
+        local previousPriority = priorityTable and priorityTable.Potion
+        if priorityTable then priorityTable.Potion = 85 end
         movementTicket = MovementCoordinator.Acquire("Potion")
-        if not movementTicket then manualOnce = false return false end
+        if not movementTicket then
+            if priorityTable and previousPriority then priorityTable.Potion = previousPriority end
+            manualOnce = false
+            return false
+        end
         busy, navigationOwner, operationEpoch = true, "Potion", epoch
         local token = epoch
         task.spawn(function()
@@ -2310,8 +2324,9 @@ local Potion = (function()
             if not ok then setStatus("Crafting error", tostring(err)) nextAttempt = os.clock() + 30 end
             MovementCoordinator.Release("Potion", movementTicket)
             movementTicket, movingHumanoid, navigationOwner, busy, manualOnce = nil, nil, nil, false, false
+            if priorityTable and previousPriority then priorityTable.Potion = previousPriority end
             if not inFlight and bridge and bridge.Parent then bridge:SetAttribute("MutationPending", false) end
-            nextAttempt = math.max(nextAttempt, os.clock() + 2)
+            nextAttempt = math.max(nextAttempt, os.clock() + 0.5)
         end)
         return true
     end
@@ -4241,7 +4256,7 @@ local FishingAutomation = (function()
     local controller = {}
     local bridge, metrics, selector
     local enabled, autoSell, early, living = Config.AutoFish == true, Config.AutoSellFish == true, Config.EarlyFishing == true, true
-    local taskEnabled = false
+    local taskEnabled, forceOff = false, Config.AutoFish ~= true
     local areas, blocked = {}, {}
     local epoch, nextAttempt, sellSequence = 0, 0, 0
     local sellRequested, selling, saleFault = false, false, false
@@ -4297,21 +4312,29 @@ local FishingAutomation = (function()
 
     function controller.SetEnabled(value)
         value = value == true
-        if enabled == value then return enabled end
+        forceOff = not value
+        if not value then taskEnabled = false end
+        if enabled == value then
+            if bridge then bridge:SetAttribute("Enabled", (enabled or taskEnabled) and not forceOff) end
+            return enabled
+        end
         enabled = value
         Config.AutoFish = enabled
         saveConfig()
         cancel()
-        if bridge then bridge:SetAttribute("Enabled", enabled or taskEnabled) end
+        if bridge then
+            bridge:SetAttribute("Enabled", enabled or taskEnabled)
+            if not enabled then bridge:SetAttribute("Paused", true) end
+        end
         return enabled
     end
 
     function controller.SetTaskEnabled(value)
-        value = value == true
+        value = value == true and not forceOff
         if taskEnabled == value then return end
         taskEnabled = value
         cancel()
-        if bridge then bridge:SetAttribute("Enabled", enabled or taskEnabled) end
+        if bridge then bridge:SetAttribute("Enabled", (enabled or taskEnabled) and not forceOff) end
     end
 
     function controller.SelectAreas(values)
@@ -4741,6 +4764,14 @@ end)()
     local function step()
         local current = snapshot()
         if not current then releaseMovement() return end
+        if not ((enabled or taskEnabled) and not forceOff) then
+            if bridge and bridge:GetAttribute("Enabled") == true then bridge:SetAttribute("Enabled", false) end
+            if not current.Fishing and not current.SalePending then
+                pause(true)
+                releaseMovement()
+                return
+            end
+        end
         if combatPending() then
             attribute("YieldAfterCatch", true)
             if current.Fishing or current.SalePending or selling then
@@ -9491,7 +9522,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         end
         if hasTarget then
             combatHoldUntil = os.clock() + 2
-            if target.HasTag and target:HasTag("orbMinion") then orbUnlockUntil=os.clock()+8 end
+            if target and target.HasTag and target:HasTag("orbMinion") then orbUnlockUntil=os.clock()+8 end
         end
         local unlocking=false
         if lease and root and os.clock()<orbUnlockUntil then
