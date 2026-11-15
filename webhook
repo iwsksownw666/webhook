@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.61"
+local SCRIPT_VERSION = "3.62"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -2198,6 +2198,16 @@ local Potion = (function()
         local _, _, here = currentCharacter()
         local arrived, movementError = true, nil
         if not here or (here.Position - target).Magnitude > 8 then
+            local fishingBridge = game:GetService("CoreGui"):FindFirstChild("BonesHubFishingBridge")
+            if fishingBridge and fishingBridge:GetAttribute("CraftHold") ~= true then
+                fishingBridge:SetAttribute("CraftHold", true)
+                local releaseDeadline = os.clock() + 6
+                while os.clock() < releaseDeadline and active(token) do
+                    local _, _, waitRoot = currentCharacter()
+                    if not waitRoot or not waitRoot.Anchored then break end
+                    task.wait(0.1)
+                end
+            end
             setStatus("Walking to cauldron")
             arrived, movementError = travel(target, token, 9)
         end
@@ -2311,6 +2321,7 @@ local Potion = (function()
         movementTicket = MovementCoordinator.Acquire("Potion")
         if not movementTicket then
             if priorityTable and previousPriority then priorityTable.Potion = previousPriority end
+            setStatus("Waiting for movement")
             manualOnce = false
             return false
         end
@@ -2325,6 +2336,8 @@ local Potion = (function()
             MovementCoordinator.Release("Potion", movementTicket)
             movementTicket, movingHumanoid, navigationOwner, busy, manualOnce = nil, nil, nil, false, false
             if priorityTable and previousPriority then priorityTable.Potion = previousPriority end
+            local fishingBridge = game:GetService("CoreGui"):FindFirstChild("BonesHubFishingBridge")
+            if fishingBridge and fishingBridge:GetAttribute("CraftHold") == true then fishingBridge:SetAttribute("CraftHold", false) end
             if not inFlight and bridge and bridge.Parent then bridge:SetAttribute("MutationPending", false) end
             nextAttempt = math.max(nextAttempt, os.clock() + 0.5)
         end)
@@ -2346,7 +2359,11 @@ local Potion = (function()
         epoch += 1
         rowsDirty = true
         if not enabled then hideRows() end
-        if not enabled then MovementCoordinator.Cancel("Potion") end
+        if not enabled then
+            MovementCoordinator.Cancel("Potion")
+            local fishingBridge = game:GetService("CoreGui"):FindFirstChild("BonesHubFishingBridge")
+            if fishingBridge and fishingBridge:GetAttribute("CraftHold") == true then fishingBridge:SetAttribute("CraftHold", false) end
+        end
         if not enabled and movingHumanoid and MovementCoordinator.IsOwner("Potion", movementTicket) then
             local _, _, root = currentCharacter()
             if root then pcall(function() movingHumanoid:MoveTo(root.Position) end) end
@@ -4764,8 +4781,11 @@ end)()
     local function step()
         local current = snapshot()
         if not current then releaseMovement() return end
-        if not ((enabled or taskEnabled) and not forceOff) then
-            if bridge and bridge:GetAttribute("Enabled") == true then bridge:SetAttribute("Enabled", false) end
+        local craftHold = bridge and bridge:GetAttribute("CraftHold") == true
+        local wantEnabled = (enabled or taskEnabled) and not forceOff and not craftHold
+        if bridge and bridge:GetAttribute("Enabled") ~= wantEnabled then bridge:SetAttribute("Enabled", wantEnabled) end
+        if not wantEnabled then
+            if bridge and bridge:GetAttribute("Paused") ~= true and (craftHold or forceOff) then bridge:SetAttribute("Paused", true) end
             if not current.Fishing and not current.SalePending then
                 pause(true)
                 releaseMovement()
