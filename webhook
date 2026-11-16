@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.63"
+local SCRIPT_VERSION = "3.64"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -3051,16 +3051,10 @@ local ok, err = pcall(function()
         return math.max(0, math.ceil(last + 43200 - workspace:GetServerTimeNow())), last
     end
     local function nearStation()
+
         local character = player.Character
-        local root = character and character:FindFirstChild("HumanoidRootPart")
         local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-        local map = workspace:FindFirstChild("Map")
-        local miscs = map and map:FindFirstChild("Miscs")
-        local station = miscs and miscs:FindFirstChild("StartFlip")
-        local base = station and station.PrimaryPart
-        local prompt = base and base:FindFirstChildOfClass("ProximityPrompt")
-        return root and humanoid and humanoid.Health > 0 and prompt and prompt.Enabled
-            and (root.Position - base.Position).Magnitude <= prompt.MaxActivationDistance
+        return humanoid ~= nil and humanoid.Health > 0
     end
     local function findCatalog()
         for _, connection in ipairs(getconnections(remote.OnClientEvent)) do
@@ -3228,7 +3222,7 @@ local ok, err = pcall(function()
         elseif blockedAt == last then
             status("Start unconfirmed; paused")
         elseif not nearStation() then
-            status("Move near Memory Match")
+            status("Starting")
         else
             blockedAt = last
             local id = http:GenerateGUID(false)
@@ -3265,7 +3259,7 @@ local ok, err = pcall(function()
         task.wait(0.25)
     end
 end)
-if not ok and active() then status("Memory Party error", tostring(err)) end
+if not ok and active() then status("Memory Match error", tostring(err)) end
 for _, connection in ipairs(connections) do connection:Disconnect() end
 
 ]====]
@@ -3335,7 +3329,7 @@ local function escape(value)
     return tostring(value):gsub("([\\*_~|>])", "\\%1"):gsub("@", "@" .. utf8.char(0x200B))
 end
 local function payload(kind, data)
-    local body = { "# Memory Party " .. (kind == "Started" and "Started" or data.Confirmed and "Finished" or "Paused"),
+    local body = { "# Memory Match " .. (kind == "Started" and "Started" or data.Confirmed and "Finished" or "Paused"),
         "**Player:** " .. escape(player.Name), "**Time:** <t:" .. tostring(data.Timestamp or os.time()) .. ":F>" }
     if kind == "Started" then
         local selected = data.Selected or {}
@@ -3355,7 +3349,7 @@ local function payload(kind, data)
     local text = table.concat(body, "\n")
     return { allowed_mentions = { parse = {} }, embeds = { { description = text:sub(1, 4096),
         color = kind == "Started" and 0x55B8FF or data.Confirmed and 0x57F287 or 0xFEE75C,
-        footer = { text = "bones hub | Memory Party" } } } }
+        footer = { text = "bones hub | Memory Match" } } } }
 end
 local function notify(kind, data)
     if not SETTINGS.WebhooksEnabled then return end
@@ -3576,26 +3570,26 @@ do
     end
     function MemoryParty.Mount(page)
         mounted, selector, signature = page, nil, nil
-        UI:AddDivider(page, "Memory Party")
-        toggle = UI:AddToggle(page, "Auto Memory Party", MemoryParty.GetState().Enabled, function(value)
+        UI:AddDivider(page, "Memory Match")
+        toggle = UI:AddToggle(page, "Auto Memory Match", MemoryParty.GetState().Enabled, function(value)
             if not syncing then MemoryParty.SetEnabled(value) end
         end)
         mountSelector()
         rows = {}
         for _, metric in ipairs(UI:AddMetricRow(page, {
-            { Label = "Status", Value = "--", Unit = "Memory Party" },
+            { Label = "Status", Value = "--", Unit = "Memory Match" },
             { Label = "Matched Pairs", Value = "0/10", Unit = "Confirmed" },
         })) do rows[#rows + 1] = metric end
-        UI:AddButtonRow(page, { { Text = "Resume Memory Party", Style = "ghost", Width = 190, Callback = function()
+        UI:AddButtonRow(page, { { Text = "Resume Memory Match", Style = "ghost", Width = 190, Callback = function()
             local ok, err = MemoryParty.ResetSession()
             if not ok then log(err, "WARN") end
         end } })
         refresh()
     end
     function MemoryParty.MountWebhook(page)
-        UI:AddDivider(page, "Memory Party Notifications")
-        UI:AddToggle(page, "Memory Party Webhooks", Config.MemoryPartyWebhooks ~= false, MemoryParty.SetWebhooksEnabled)
-        local input = UI:AddInput(page, "Memory Party Webhook URL", "Optional - uses Discord Webhook URL when empty", MemoryParty.SetWebhookURL)
+        UI:AddDivider(page, "Memory Match Notifications")
+        UI:AddToggle(page, "Memory Match Webhooks", Config.MemoryPartyWebhooks ~= false, MemoryParty.SetWebhooksEnabled)
+        local input = UI:AddInput(page, "Memory Match Webhook URL", "Optional - uses Discord Webhook URL when empty", MemoryParty.SetWebhookURL)
         input:Set(Config.MemoryPartyWebhook or "")
     end
     task.spawn(function()
