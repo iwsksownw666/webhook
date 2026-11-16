@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.64"
+local SCRIPT_VERSION = "3.65"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -4766,10 +4766,11 @@ end)()
         local current = snapshot()
         if not current then releaseMovement() return end
         local craftHold = bridge and bridge:GetAttribute("CraftHold") == true
-        local wantEnabled = (enabled or taskEnabled) and not forceOff and not craftHold
+        local merchantHold = bridge and (tonumber(bridge:GetAttribute("MerchantHold")) or 0) > os.clock()
+        local wantEnabled = (enabled or taskEnabled) and not forceOff and not craftHold and not merchantHold
         if bridge and bridge:GetAttribute("Enabled") ~= wantEnabled then bridge:SetAttribute("Enabled", wantEnabled) end
         if not wantEnabled then
-            if bridge and bridge:GetAttribute("Paused") ~= true and (craftHold or forceOff) then bridge:SetAttribute("Paused", true) end
+            if bridge and bridge:GetAttribute("Paused") ~= true and (craftHold or merchantHold or forceOff) then bridge:SetAttribute("Paused", true) end
             if not current.Fishing and not current.SalePending then
                 pause(true)
                 releaseMovement()
@@ -6988,6 +6989,17 @@ local MerchantAutomation = (function()
         if not nearby(merchant) and (bridge:GetAttribute("TeleporterCount") or 0) <= 0 then lastError = "No teleporter" return end
         local sequence = (bridge:GetAttribute("TeleportSequence") or 0) + 1
         put("TargetMerchantId", id)
+        local fishingBridge = game:GetService("CoreGui"):FindFirstChild("BonesHubFishingBridge")
+        if fishingBridge then
+            fishingBridge:SetAttribute("MerchantHold", os.clock() + 25)
+            local releaseDeadline = os.clock() + 4
+            while valid(token) and os.clock() < releaseDeadline do
+                local character = LocalPlayer.Character
+                local root = character and character:FindFirstChild("HumanoidRootPart")
+                if not root or not root.Anchored then break end
+                task.wait(0.1)
+            end
+        end
         put("TeleportSequence", sequence)
         status = "Teleporting to " .. group
         if not waitFor("TeleportDone", sequence, 5, token) then lastError = "Teleport unconfirmed" return end
@@ -6995,6 +7007,7 @@ local MerchantAutomation = (function()
         if teleportStatus ~= "Teleport sent" and teleportStatus ~= "Already at merchant" and not tostring(teleportStatus):find("Opened ", 1, true) then lastError = tostring(teleportStatus) return end
         deadline = os.clock() + 15
         while valid(token) and MerchantCache[id] and not nearby(merchant) and os.clock() < deadline do task.wait(0.1) end
+        if fishingBridge and (tonumber(fishingBridge:GetAttribute("MerchantHold")) or 0) > 0 then fishingBridge:SetAttribute("MerchantHold", 0) end
         if not valid(token) then return end
         if not MerchantCache[id] or not nearby(merchant) then lastError = "Arrival unconfirmed" return end
         local visitPurchases = 0
