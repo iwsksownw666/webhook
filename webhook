@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.68"
+local SCRIPT_VERSION = "3.71"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -7168,12 +7168,20 @@ local MerchantAutomation = (function()
         local signature = table.concat(names, "\n")
         if quantitySignatures[group] == signature then return end
         quantitySignatures[group] = signature
-        for _, control in ipairs(quantityControls[group] or {}) do if control.Frame then control.Frame:Destroy() end end
+        local baseOrder
+        for _, control in ipairs(quantityControls[group] or {}) do
+            if control.Frame then
+                if baseOrder == nil then baseOrder = control.Frame.LayoutOrder end
+                control.Frame:Destroy()
+            end
+        end
         quantityControls[group] = {}
-        for _, name in ipairs(names) do
+        if baseOrder == nil and selectors[group] and selectors[group].Frame then baseOrder = selectors[group].Frame.LayoutOrder + 1 end
+        for index, name in ipairs(names) do
             local control = UI:AddInputNumber(mountedPage, group .. " / " .. name .. " Quantity", {
                 Min = 1, Max = 1000000, Default = MerchantRules.Quantity((Config.MerchantAmounts[group] or {})[name]), Placeholder = "1",
             }, function(value) controller.SetQuantity(group, name, value) end)
+            if baseOrder and control.Frame then control.Frame.LayoutOrder = baseOrder + index - 1 end
             quantityControls[group][#quantityControls[group] + 1] = control
         end
     end
