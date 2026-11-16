@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.65"
+local SCRIPT_VERSION = "3.66"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -2218,7 +2218,12 @@ local Potion = (function()
             local latest = awaitData(function() return true end,token,3)
             if not latest then setStatus("Waiting for fresh crafting data") nextAttempt=os.clock()+10 return end
             local ready,filled = plan(latest)
-            if not ready and not filled then setStatus("Waiting for complete ingredients") return end
+            local addable = false
+            for _, ingredient in ipairs(latest.Ingredients or {}) do
+                local missing = math.max(0, (tonumber(ingredient.Required) or 0) - (tonumber(ingredient.Added) or 0))
+                if missing > 0 and (tonumber(ingredient.Owned) or 0) > 0 then addable = true break end
+            end
+            if not ready and not filled and not addable then setStatus("Waiting for ingredients") return end
             if bridge and bridge.Parent then bridge:SetAttribute("MutationPending",true) end
             local _, _, currentRoot = currentCharacter()
             if not currentRoot or (currentRoot.Position - target).Magnitude > 12 then setStatus("Outside crafting range") return end
@@ -2311,6 +2316,12 @@ local Potion = (function()
             if data then
                 local ready, filled = plan(data)
                 if ready or filled or (pendingOutcomes[name] and data.Count > pendingOutcomes[name]) then available = true end
+                if not available then
+                    for _, ingredient in ipairs(data.Ingredients or {}) do
+                        local missing = math.max(0, (tonumber(ingredient.Required) or 0) - (tonumber(ingredient.Added) or 0))
+                        if missing > 0 and (tonumber(ingredient.Owned) or 0) > 0 then available = true break end
+                    end
+                end
 
             end
         end
@@ -2676,13 +2687,12 @@ local Potion = (function()
                 end
                 if mounted then
                     local encoded = bridge and bridge:GetAttribute("Snapshot")
-                    if rowsDirty or encoded ~= renderedSnapshot then
+                    if true then
                     local visible = {}
                     local catalog = catalogSnapshot()
                     if catalog then mountSelector(catalog.Recipes or {}) end
-                    if enabled then
                     for _, name in ipairs(selectedRecipes) do
-                      local selectedData = readSnapshot(name)
+                      local selectedData = readSnapshot(name) or (catalog and catalog.ByRecipe and catalog.ByRecipe[name])
                       for _, ingredient in ipairs(selectedData and selectedData.Ingredients or {}) do
                         local key = name .. ":" .. ingredient.Name
                         visible[key] = true
@@ -2690,13 +2700,13 @@ local Potion = (function()
                             rows[key] = UI:AddMetricRow(mounted, { { Label = name .. " / " .. ingredient.DisplayName, Value = "", Unit = "Owned / Required | Added" } })[1]
                         end
                         local label = rows[key].ValueLabel
-                        local value = tostring(ingredient.Owned) .. " / " .. tostring(ingredient.Required) .. " | " .. tostring(ingredient.Added)
+                        local value = tostring(ingredient.Owned or 0) .. " / " .. tostring(ingredient.Required or 0) .. " | " .. tostring(ingredient.Added or 0)
                         if label and label.Text ~= value then label.Text = value end
                       end
                     end
-                    end
                     for key, row in pairs(rows) do
-                        local frame = row.Frame or row.ValueLabel and row.ValueLabel.Parent
+                        local frame = row.Frame or (row.ValueLabel and row.ValueLabel.Parent)
+                        while frame and not frame:IsA("Frame") do frame = frame.Parent end
                         local show = enabled and visible[key] == true
                         if frame and frame.Parent and frame.Visible ~= show then frame.Visible = show end
                     end
@@ -6695,7 +6705,31 @@ if not ok then attribute("Error", tostring(err)) end
     end
     function controller.OpenJake()
         if not bridge or not bridge.Parent then return false end
-        attribute("JakeOpenSequence", (bridge:GetAttribute("JakeOpenSequence") or 0) + 1)
+        task.spawn(function()
+            local map = workspace:FindFirstChild("Map")
+            local building = map and map:FindFirstChild("SHOP")
+            local npc = building and building:FindFirstChild("Jake")
+            local character = LocalPlayer.Character
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            if npc and root and (root.Position - npc:GetPivot().Position).Magnitude > 16 then
+                local fishingBridge = game:GetService("CoreGui"):FindFirstChild("BonesHubFishingBridge")
+                if fishingBridge then fishingBridge:SetAttribute("MerchantHold", os.clock() + 20) end
+                local deadline = os.clock() + 4
+                while os.clock() < deadline do
+                    local current = LocalPlayer.Character
+                    local point = current and current:FindFirstChild("HumanoidRootPart")
+                    if not point or not point.Anchored then break end
+                    task.wait(0.1)
+                end
+                local ticket = MovementCoordinator.Acquire("Craft")
+                if ticket then
+                    pcall(function() Navigation.Walk(npc:GetPivot().Position, function() return Alive end, 7) end)
+                    MovementCoordinator.Release("Craft", ticket)
+                end
+                if fishingBridge then fishingBridge:SetAttribute("MerchantHold", 0) end
+            end
+            attribute("JakeOpenSequence", (bridge:GetAttribute("JakeOpenSequence") or 0) + 1)
+        end)
         return true
     end
     function controller.MountInventory(weatherPage, craftPage, auraPage)
