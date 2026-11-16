@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.66"
+local SCRIPT_VERSION = "3.67"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -2191,10 +2191,20 @@ local Potion = (function()
                 return
             end
         end
-        if not ready then setStatus("Waiting for complete ingredients") return end
         local _, _, root = currentCharacter()
         local target = cauldronPosition()
         if not root or not target then setStatus("Waiting for cauldron") return end
+        local distanceToCauldron = (root.Position - target).Magnitude
+        local addable = false
+        for _, ingredient in ipairs(data.Ingredients or {}) do
+            local missing = math.max(0, (tonumber(ingredient.Required) or 0) - (tonumber(ingredient.Added) or 0))
+            if missing > 0 and (tonumber(ingredient.Owned) or 0) > 0 then addable = true break end
+        end
+
+        if not ready and not (addable and distanceToCauldron <= 150) then
+            setStatus("Waiting for complete ingredients")
+            return
+        end
         local _, _, here = currentCharacter()
         local arrived, movementError = true, nil
         if not here or (here.Position - target).Magnitude > 8 then
@@ -2211,7 +2221,7 @@ local Potion = (function()
             setStatus("Walking to cauldron")
             arrived, movementError = travel(target, token, 9)
         end
-        if not arrived then setStatus("Movement paused", movementError) nextAttempt = os.clock() + 30 return end
+        if not arrived then setStatus("Movement paused", movementError) nextAttempt = os.clock() + 90 return end
         local function make()
             for _ = 1, 40 do
             if not active(token) then return end
@@ -2309,26 +2319,29 @@ local Potion = (function()
     local function launch(force)
         if busy or not alive then return false end
         manualOnce = force == true
-        local available = false
+        local craftReady, addable = false, false
         for _, name in ipairs(workRecipes()) do
             local data = readSnapshot(name)
-            if not data then available = true end
+            if not data then craftReady = true end
             if data then
                 local ready, filled = plan(data)
-                if ready or filled or (pendingOutcomes[name] and data.Count > pendingOutcomes[name]) then available = true end
-                if not available then
-                    for _, ingredient in ipairs(data.Ingredients or {}) do
-                        local missing = math.max(0, (tonumber(ingredient.Required) or 0) - (tonumber(ingredient.Added) or 0))
-                        if missing > 0 and (tonumber(ingredient.Owned) or 0) > 0 then available = true break end
-                    end
+                if ready or filled or (pendingOutcomes[name] and data.Count > pendingOutcomes[name]) then craftReady = true end
+                for _, ingredient in ipairs(data.Ingredients or {}) do
+                    local missing = math.max(0, (tonumber(ingredient.Required) or 0) - (tonumber(ingredient.Added) or 0))
+                    if missing > 0 and (tonumber(ingredient.Owned) or 0) > 0 then addable = true break end
                 end
-
             end
         end
-        if not available then manualOnce = false setStatus("Waiting for complete ingredients") MovementCoordinator.Cancel("Potion") return false end
+        local character = LocalPlayer.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local cauldron = cauldronPosition()
+        local nearCauldron = root ~= nil and cauldron ~= nil and (root.Position - cauldron).Magnitude <= 150
+        local available = craftReady or (addable and nearCauldron)
+        if not available then manualOnce = false setStatus(craftReady and "Waiting for movement" or "Waiting for complete ingredients") MovementCoordinator.Cancel("Potion") return false end
         local priorityTable = MovementCoordinator.Priorities()
         local previousPriority = priorityTable and priorityTable.Potion
-        if priorityTable then priorityTable.Potion = 85 end
+
+        if priorityTable then priorityTable.Potion = craftReady and 85 or 10 end
         movementTicket = MovementCoordinator.Acquire("Potion")
         if not movementTicket then
             if priorityTable and previousPriority then priorityTable.Potion = previousPriority end
