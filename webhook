@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.72"
+local SCRIPT_VERSION = "3.74"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -7168,21 +7168,22 @@ local MerchantAutomation = (function()
         local signature = table.concat(names, "\n")
         if quantitySignatures[group] == signature then return end
         quantitySignatures[group] = signature
-        for _, control in ipairs(quantityControls[group] or {}) do
+        for _, entry in ipairs(quantityControls[group] or {}) do
+            local control = entry.Control or entry
             if control.Frame then control.Frame:Destroy() end
-        end
-        quantityControls[group] = {}
-        for _, name in ipairs(Config.MerchantCatalogs[group] or {}) do
-            local title = group .. " / " .. name .. " Quantity"
-            for _, object in ipairs(mountedPage:GetDescendants()) do
-                if object:IsA("TextLabel") and object.Text == title then object:Destroy() end
+            if entry.Control and entry.Title then
+                for _, object in ipairs(mountedPage:GetDescendants()) do
+                    if object:IsA("TextLabel") and object.Text == entry.Title then object:Destroy() break end
+                end
             end
         end
+        quantityControls[group] = {}
         for _, name in ipairs(names) do
-            local control = UI:AddInputNumber(mountedPage, group .. " / " .. name .. " Quantity", {
+            local title = group .. " / " .. name .. " Quantity"
+            local control = UI:AddInputNumber(mountedPage, title, {
                 Min = 1, Max = 1000000, Default = MerchantRules.Quantity((Config.MerchantAmounts[group] or {})[name]), Placeholder = "1",
             }, function(value) controller.SetQuantity(group, name, value) end)
-            quantityControls[group][#quantityControls[group] + 1] = control
+            quantityControls[group][#quantityControls[group] + 1] = { Control = control, Title = title }
         end
     end
     function controller.SetEnabled(value)
