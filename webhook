@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.62"
+local SCRIPT_VERSION = "3.63"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -3572,14 +3572,7 @@ do
             if label and label.Parent then label.Text = text end
         end
         value(1, state.Status or "--")
-        local cd = state.Remaining
-        value(2, cd and string.format("%02d:%02d:%02d (%d s)", math.floor(cd / 3600), math.floor(cd / 60) % 60, cd % 60, cd) or "--")
-        value(3, tostring(state.Pairs) .. "/10")
-        value(4, tostring(state.Attempts))
-        local rewards = {}
-        for _, reward in ipairs(state.Rewards) do rewards[#rewards + 1] = reward.Name .. " x" .. reward.Quantity end
-        value(5, #rewards > 0 and table.concat(rewards, ", ") or "None confirmed")
-        value(6, state.WebhookStatus or "Idle")
+        value(2, tostring(state.Pairs) .. "/10")
     end
     function MemoryParty.Mount(page)
         mounted, selector, signature = page, nil, nil
@@ -3589,13 +3582,10 @@ do
         end)
         mountSelector()
         rows = {}
-        for _, definitions in ipairs({
-            { { Label = "Status", Value = "--", Unit = "Memory Party" }, { Label = "Cooldown", Value = "--", Unit = "Remaining" } },
-            { { Label = "Matched Pairs", Value = "0/10", Unit = "Server confirmed" }, { Label = "Attempts", Value = "10", Unit = "Remaining" } },
-            { { Label = "Last Rewards", Value = "None confirmed", Unit = "Matched rewards" }, { Label = "Webhook", Value = "Idle", Unit = "Delivery" } },
-        }) do
-            for _, metric in ipairs(UI:AddMetricRow(page, definitions)) do rows[#rows + 1] = metric end
-        end
+        for _, metric in ipairs(UI:AddMetricRow(page, {
+            { Label = "Status", Value = "--", Unit = "Memory Party" },
+            { Label = "Matched Pairs", Value = "0/10", Unit = "Confirmed" },
+        })) do rows[#rows + 1] = metric end
         UI:AddButtonRow(page, { { Text = "Resume Memory Party", Style = "ghost", Width = 190, Callback = function()
             local ok, err = MemoryParty.ResetSession()
             if not ok then log(err, "WARN") end
@@ -9443,20 +9433,12 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         UI:AddSectionHeader(page, "Combat", "Pythios & Chillsear first; finish ready skills before switching")
         local definitions = { { "Farm", "Start Combat", "HalloweenAutoFarm" }, { "Orbs", "Auto Farm Orbs", "HalloweenAutoOrbs" }, { "ESP", "Monster ESP", "HalloweenESP" }, { "HUD", "Combat HUD", "HalloweenCombatHUD" }, { "Dodge", "Auto Dodge Attacks", "HalloweenAutoDodge" } }
         for _, entry in ipairs(definitions) do toggles[entry[1]] = UI:AddToggle(page, entry[2], Config[entry[3]], function(value) if not syncing then controller.SetEnabled(entry[1], value) end end) end
-        local rows = UI:AddMetricRow(page, { { Label = "Combat Status", Value = "Disabled" }, { Label = "Confirmed Casts", Value = "0" }, { Label = "Step Jumps", Value = "0 / 0" } })
-        metrics["Combat Status"], metrics["Confirmed Casts"], metrics["Step Jumps"] = rows[1], rows[2], rows[3]
-        rows = UI:AddMetricRow(page, { { Label = "Target", Value = "None" }, { Label = "Current Aura", Value = "None" }, { Label = "Next Skill", Value = "None" } })
-        metrics.Target, metrics["Current Aura"], metrics["Next Skill"] = rows[1], rows[2], rows[3]
         UI:AddDivider(page, "Rewards")
         toggles.Bounty = UI:AddToggle(page, "Auto Claim Bounty Hunt", Config.HalloweenAutoBounty == true, function(value) if not syncing then controller.SetEnabled("Bounty", value) end end)
-        rows = UI:AddMetricRow(page, { { Label = "Bounty Hunt", Value = "Disabled" } })
-        metrics["Bounty Hunt"] = rows[1]
         toggles.Alerts = UI:AddToggle(page, "Combat Reward Webhook", Config.HalloweenCombatAlerts == true, function(value) if not syncing then controller.SetEnabled("Alerts",value) end end)
         local webhook = UI:AddInput(page,"Combat Webhook URL","Optional - uses Discord Webhook URL when empty",controller.SetWebhook)
         webhook:Set(Config.HalloweenCombatWebhook or "")
         toggles.BossWebhook = UI:AddToggle(page, "Boss Spawn Webhook", Config.HalloweenBossAlerts == true, function(value) if not syncing then controller.SetEnabled("Boss", value) end end)
-        rows = UI:AddMetricRow(page, { { Label = "Your Defeats", Value = "0" }, { Label = "Combat Alerts", Value = "Disabled" }, { Label = "Boss Alerts", Value = "Disabled" } })
-        metrics["Your Defeats"], metrics["Combat Alerts"], metrics["Boss Alerts"] = rows[1], rows[2], rows[3]
         UI:AddDivider(page, "Combat Options")
         local targetControl = UI:AddMultiSelect(page, "Target Types", { "Boss", "Orb", "Minion" }, function(map)
             if syncing then return end
@@ -9889,14 +9871,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
             if os.clock() >= nextMetrics then
                 nextMetrics = os.clock() + 0.5
                 local state = controller.GetState()
-                local values = { ["Combat Status"] = errorText or status, Target = state.Target or "None", ["Combat Auras"] = tostring(state.OwnedCount or 0) .. " owned combat auras",
-                    ["Current Aura"] = state.CurrentAura or "None", ["Next Skill"] = (state.NextAura or "Waiting") .. " / " .. (state.NextSkill or "None"),
-                    ["Bounty Hunt"] = state.Bounty.Status .. " / " .. tostring(state.Bounty.Claimed) .. " claimed",
-                    ["Your Defeats"] = tostring(state.OwnKills) .. " last hits",
-                    ["Combat Alerts"] = not state.CombatAlerts and "Disabled" or state.CombatWebhook.Error or not state.CombatWebhook.Configured and "Set webhook URL" or tostring(state.CombatWebhook.Sent) .. " delivered",
-                    ["Boss Alerts"] = not state.BossAlerts and "Disabled" or state.BossWebhook.Error or not state.BossWebhook.Configured and "Set webhook URL" or tostring(state.BossWebhook.Sent) .. " delivered / " .. tostring(state.BossWebhook.Last or "none"),
-                    ["Confirmed Casts"] = tostring(state.ConfirmedCasts or 0),
-                    ["Step Jumps"] = tostring(state.Nav.Jumps or 0) .. " / " .. tostring(state.Nav.Probes or 0) .. " probes", ["Dodge Status"] = dodgeGoal and "Dodging" or Config.HalloweenAutoDodge and "Watching attack warnings" or "Disabled" }
+                local values = {}
                 for key, value in pairs(values) do local row = metrics[key] if row and row.ValueLabel and row.ValueLabel.Parent then row.ValueLabel.Text = value end end
             end
             task.wait(enabled() and 0.1 or 0.5)
