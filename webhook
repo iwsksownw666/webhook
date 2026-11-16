@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.67"
+local SCRIPT_VERSION = "3.68"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -1982,6 +1982,7 @@ local Potion = (function()
     local controller = {}
     local enabled, busy, alive = Config.AutoPotionCraft == true, false, true
     local epoch, completed, nextAttempt, sequence = 0, 0, 0, 0
+    local nextAddOnlyAt = 0
     local bridge, inFlight, mounted, movingHumanoid, navigationOwner
     local status, lastError = "Loading recipes", nil
     local rows = {}
@@ -2201,7 +2202,8 @@ local Potion = (function()
             if missing > 0 and (tonumber(ingredient.Owned) or 0) > 0 then addable = true break end
         end
 
-        if not ready and not (addable and distanceToCauldron <= 150) then
+        local portalReady = bridge ~= nil and bridge:GetAttribute("PortalUnlocked") == true
+        if not ready and not (addable and (distanceToCauldron <= 150 or portalReady)) then
             setStatus("Waiting for complete ingredients")
             return
         end
@@ -2336,12 +2338,16 @@ local Potion = (function()
         local root = character and character:FindFirstChild("HumanoidRootPart")
         local cauldron = cauldronPosition()
         local nearCauldron = root ~= nil and cauldron ~= nil and (root.Position - cauldron).Magnitude <= 150
-        local available = craftReady or (addable and nearCauldron)
+        local portalReady = bridge ~= nil and bridge:GetAttribute("PortalUnlocked") == true
+        local addTrip = addable and craftReady == false and (nearCauldron or portalReady)
+        if addTrip and os.clock() < nextAddOnlyAt then addTrip = false end
+        local available = craftReady or addTrip
         if not available then manualOnce = false setStatus(craftReady and "Waiting for movement" or "Waiting for complete ingredients") MovementCoordinator.Cancel("Potion") return false end
+        if addTrip then nextAddOnlyAt = os.clock() + 240 end
         local priorityTable = MovementCoordinator.Priorities()
         local previousPriority = priorityTable and priorityTable.Potion
 
-        if priorityTable then priorityTable.Potion = craftReady and 85 or 10 end
+        if priorityTable then priorityTable.Potion = craftReady and 85 or 60 end
         movementTicket = MovementCoordinator.Acquire("Potion")
         if not movementTicket then
             if priorityTable and previousPriority then priorityTable.Potion = previousPriority end
