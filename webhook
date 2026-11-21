@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.75"
+local SCRIPT_VERSION = "3.76"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -5220,6 +5220,9 @@ end)()
             Spot = target and target:GetAttribute("spotId"), Error = lastError or (bridge and (bridge:GetAttribute("Error") or bridge:GetAttribute("FishingError"))),
             Count = current.Count, Capacity = current.Capacity, Coins = current.Coins,
             Caught = current.Caught, Sold = current.Sold, EarlyConfirmed = current.EarlyConfirmed,
+            EarlyAttempts = current.EarlyAttempts, EarlyRejected = current.EarlyRejected,
+            SavedSeconds = current.SavedSeconds, FinishStatus = current.FinishStatus,
+            LastRewardLead = current.LastRewardLead, LastRestartDelay = bridge and bridge:GetAttribute("LastRestartDelay"),
             SuppressedResults = current.SuppressedResults,
             DataReady = next(current) ~= nil, SaleReady = bridge and bridge:GetAttribute("SaleReady") == true,
             Phase = bridge and bridge:GetAttribute("Phase"),
@@ -5234,7 +5237,7 @@ end)()
         local points = spots()
         FishSpots.Refresh(points)
         UI:AddToggle(page, "Auto Fish", enabled, controller.SetEnabled)
-        UI:AddToggle(page, "Early Finish (1.5s)", early, controller.SetEarly)
+        UI:AddToggle(page, "Safe Early Finish", early, controller.SetEarly)
         UI:AddToggle(page, "Hide Catch Result", hideResults, controller.SetHideResults)
         UI:AddToggle(page, "Auto Sell When Full", autoSell, controller.SetAutoSell)
         UI:AddButtonRow(page, {
@@ -5244,6 +5247,7 @@ end)()
         metrics = UI:AddMetricRow(page, {
             { Label = "Fish", Value = "--", Unit = "Inventory / Capacity" },
             { Label = "Fish Coins", Value = "--", Unit = "Balance" },
+            { Label = "Early Finish", Value = "Waiting for catch", Unit = "Confirmed catches / Time saved" },
         })
         local current = snapshot()
         if current then
@@ -5308,7 +5312,50 @@ local lastSnapshot, suppressResults, suppressedResults, nextSuppressionScan = ni
 local sale, session, retired
 local shutdownDeadline
 local saleSequence, caught, sold, earlyConfirmed = 0, 0, 0, 0
-local earlyLead = 1.5
+local FinishPolicy = (function()
+    local policy = {}
+    local attempts, confirmed, rejected, saved = 0, 0, 0, 0
+    local fallbackUntil, lastLead = 0, nil
+    local function finite(value)
+        return type(value) == "number" and value == value and math.abs(value) < math.huge
+    end
+    function policy.Plan(session, now, early)
+        if not session or session.submitted or session.quitSent or not finite(session.deadline) then return nil, 0 end
+        local lead = early and now >= fallbackUntil and 1.5 or 0
+        return session.deadline - lead, lead
+    end
+    function policy.Submit(session, now, lead)
+        if session.submitted or session.quitSent then return false end
+        session.submitted, session.submittedAt, session.early = true, now, lead > 0 and now < session.deadline
+        session.waitUntil = os.clock() + 5
+        if session.early then attempts += 1 end
+        return true
+    end
+    function policy.Reject(session, now)
+        if not session or session.rejectionCounted or not session.submitted or not session.early or session.quitSent then return end
+        session.rejectionCounted = true
+        rejected += 1
+        fallbackUntil = now + 60
+    end
+    function policy.Reward(session, now, success)
+        if not session then return end
+        if not success then policy.Reject(session, now) return end
+        lastLead = finite(session.deadline) and session.deadline - now or nil
+        if session.submitted and session.early and lastLead and lastLead > 0 then
+            confirmed += 1
+            saved += lastLead
+        end
+    end
+    function policy.State(now, early)
+        return {
+            Attempts = attempts, Confirmed = confirmed, Rejected = rejected,
+            SavedSeconds = saved, LastLead = lastLead,
+            Status = not early and "Standard timing" or now < fallbackUntil and "Standard timing: early finish rejected" or "Safe early finish (up to 1.5s)",
+            FallbackRemaining = math.max(0, fallbackUntil - now),
+        }
+    end
+    return policy
+end)()
 local nextCast, nextSale, nextSnapshot = 0, 0, 0
 local lastRestartedReward
 local saleReady, ownedFishing, resetSale = false, false, false
@@ -5347,9 +5394,16 @@ task.spawn(function()
             for _, fish in pairs(current.FishInventory or {}) do
                 if type(fish) == "table" and type(fish.id) == "string" then amount += 1 end
             end
+            local finish = FinishPolicy.State(workspace:GetServerTimeNow(), bridge:GetAttribute("Early") == true)
             local value = { Count = amount, Capacity = tonumber(current.FishInventorySize) or 0,
                 Coins = tonumber(current.FishCoins) or 0, Caught = caught, Sold = sold,
-                EarlyConfirmed = earlyConfirmed, SuppressedResults = suppressedResults,
+                EarlyConfirmed = finish.Confirmed,
+                EarlyAttempts = finish.Attempts,
+                EarlyRejected = finish.Rejected,
+                SavedSeconds = finish.SavedSeconds,
+                FinishStatus = finish.Status,
+                LastRewardLead = finish.LastLead,
+                SuppressedResults = suppressedResults,
                 Fishing = ownedFishing or ui.isFishing == true, Minigame = session and session.deadline ~= nil or false,
                 SalePending = sale ~= nil }
             local encoded = http:JSONEncode(value)
@@ -5380,7 +5434,12 @@ for _, name in ipairs({ "reward", "playGame", "beginFishing", "quit", "addFish",
 end
 local function listen(packet, callback)
     local wrapped = function(...)
-        if bridge then events[#events + 1] = { callback = callback, arguments = table.pack(...) } end
+        if bridge then
+            local arguments = table.pack(...)
+            arguments.n += 1
+            arguments[arguments.n] = workspace:GetServerTimeNow()
+            events[#events + 1] = { callback = callback, arguments = arguments }
+        end
     end
     packet.listen(wrapped)
     listeners[#listeners + 1] = { packet = packet, callback = wrapped }
@@ -5389,6 +5448,7 @@ local function quitOwned(reason)
     if ownedFishing and session and not session.quitSent then
         packets.quit.send()
         session.quitSent = true
+        session.releaseAfter = os.clock() + 0.25
         session.waitUntil = os.clock() + 8
     end
     nextCast = os.clock() + 0.5
@@ -5409,26 +5469,34 @@ end)
 listen(packets.playGame, function(params)
     if not ownedFishing or not session then return end
     session.began = true
-    session.deadline = tonumber(params.endTimestamp)
+    local deadline = type(params) == "table" and tonumber(params.endTimestamp)
+    local now = workspace:GetServerTimeNow()
+    if type(deadline) ~= "number" or deadline ~= deadline or deadline == math.huge or deadline <= now - 5 or deadline > now + 100 then
+        quitOwned("Invalid fishing timer; restarting safely")
+        return
+    end
+    session.deadline = deadline
     session.waitUntil = os.clock() + 90
 end)
-listen(packets.reward, function(value)
-    if not ownedFishing or not session then return end
-    if value.rewardInfo then
+listen(packets.reward, function(value, receivedAt)
+    if not ownedFishing or not session or type(value) ~= "table" then return end
+    local received = type(receivedAt) == "number" and receivedAt or workspace:GetServerTimeNow()
+    FinishPolicy.Reward(session, received, type(value.rewardInfo) == "table")
+    if type(value.rewardInfo) == "table" then
         caught += 1
         inventoryDirty = true
         bridge:SetAttribute("LastFishUID", value.rewardInfo.uid)
-        if session.submitted and session.early and session.deadline and workspace:GetServerTimeNow() < session.deadline then earlyConfirmed += 1 end
-        bridge:SetAttribute("LastRewardLead", session.deadline and session.deadline - workspace:GetServerTimeNow() or nil)
+        bridge:SetAttribute("LastRewardLead", session.deadline and session.deadline - received or nil)
     end
     ownedFishing, session = false, nil
     bridge:SetAttribute("LastRewardAt", os.clock())
     nextCast = os.clock()
 end)
-listen(packets.quit, function()
+listen(packets.quit, function(receivedAt)
     if ownedFishing then
+        FinishPolicy.Reject(session, type(receivedAt) == "number" and receivedAt or workspace:GetServerTimeNow())
         ownedFishing, session = false, nil
-        nextCast = os.clock() + 0.5
+        nextCast = os.clock() + 0.15
     end
 end)
 listen(packets.sellAllFishConfirm, function()
@@ -5658,20 +5726,18 @@ local ok, failure = pcall(function()
             end
             if ownedFishing then
                 local sessionRoot = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-                if session and session.quitSent and os.clock() >= session.waitUntil and (not sessionRoot or not sessionRoot.Anchored) then
+                if session and session.quitSent and os.clock() >= (session.releaseAfter or session.waitUntil) and (not sessionRoot or not sessionRoot.Anchored) then
                     ownedFishing, session = false, nil
                     finishNative()
                 elseif session and session.deadline then
-                    local lead = allowed() and bridge:GetAttribute("Early") == true and earlyLead or 0
-                    if not session.submitted and workspace:GetServerTimeNow() >= session.deadline - lead then
-                        session.submitted = true
-                        session.early = lead > 0
-                        session.waitUntil = os.clock() + 5
-                        bridge:SetAttribute("LastSubmitLead", session.deadline - workspace:GetServerTimeNow())
+                    local now = workspace:GetServerTimeNow()
+                    local submitAt, lead = FinishPolicy.Plan(session, now, bridge:GetAttribute("Early") == true)
+                    if submitAt and now >= submitAt and FinishPolicy.Submit(session, now, lead) then
+                        bridge:SetAttribute("LastSubmitLead", session.deadline - now)
                         packets.gameResult.send(true)
                     elseif os.clock() > session.waitUntil then
-                        local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-                        if not root or not root.Anchored then quitOwned("Fishing result timed out") end
+                        FinishPolicy.Reject(session, workspace:GetServerTimeNow())
+                        quitOwned("Fishing result timed out; requesting server release")
                     end
                 elseif not allowed() or bridge:GetAttribute("SellAuthorized") == true then
                     quitOwned()
@@ -5712,9 +5778,10 @@ local ok, failure = pcall(function()
         if sale or bridge:GetAttribute("SellAuthorized") == true then delay = 0.04
         elseif ownedFishing then
             if session and session.deadline and not session.submitted then
-                local lead = bridge:GetAttribute("Early") == true and earlyLead or 0
-                local untilSubmit = session.deadline - lead - workspace:GetServerTimeNow()
+                local submitAt = FinishPolicy.Plan(session, workspace:GetServerTimeNow(), bridge:GetAttribute("Early") == true)
+                local untilSubmit = submitAt and submitAt - workspace:GetServerTimeNow() or 0.1
                 delay = math.clamp(untilSubmit, 0.025, 0.1)
+            elseif session and session.submittedAt and workspace:GetServerTimeNow() - session.submittedAt < 2 then delay = 0.025
             else delay = 0.1 end
         elseif allowed() then delay = 0.1 end
         task.wait(delay)
@@ -5780,6 +5847,10 @@ end
                 end
                 if current.Coins ~= lastCoins then
                     if metrics[2] and metrics[2].ValueLabel then metrics[2].ValueLabel.Text = tostring(current.Coins) end
+                    if metrics[3] and metrics[3].ValueLabel then
+                        metrics[3].ValueLabel.Text = tostring(current.EarlyConfirmed or 0) .. " confirmed | " .. string.format("%.1fs saved", current.SavedSeconds or 0)
+                            .. ((current.EarlyRejected or 0) > 0 and " | " .. tostring(current.EarlyRejected) .. " rejected" or "")
+                    end
                     lastCoins = current.Coins
                 end
             end
