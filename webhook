@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.74"
+local SCRIPT_VERSION = "3.75"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -166,6 +166,7 @@ local DEFAULT_CONFIG = {
     AutoEquipment = false, EquipmentRecipes = {}, AutoDeleteAuras = false, DeleteAuras = {},
     AutoReexecute = false, AutoFish = false, AutoSellFish = false, EarlyFishing = false,
     HideFishingResults = true, AutoPotionCraft = false, PotionRecipes = {}, MacroRunning = false,
+    AutoBankUpgrade = false,
     AutoWeatherControllers = false,
     AutoEden = false,
     AutoMemoryParty = false, MemoryPartyItems = {}, MemoryPartyWebhook = "", MemoryPartyWebhooks = true,
@@ -2735,6 +2736,349 @@ local Potion = (function()
                 if (enabled or #taskRecipes > 0) and not busy and os.clock() >= nextAttempt then launch() end
             end)
             if not ok then setStatus("Crafting error", tostring(err)) nextAttempt = os.clock() + 30 end
+            task.wait(0.5)
+        end
+    end)
+    return controller
+end)()
+
+local BankAutomation = (function()
+    local controller = {}
+    local living, enabled = true, Config.AutoBankUpgrade == true
+    local bridge, rows, toggle
+    local syncing = false
+    local ACTOR_SOURCE = [==[
+if setthreadidentity then setthreadidentity(8) end
+local rs = game:GetService("ReplicatedStorage")
+local player = game:GetService("Players").LocalPlayer
+local bridge = game:GetService("CoreGui"):FindFirstChild("BonesHubBankBridge")
+if not bridge then return end
+local function active()
+    if setthreadidentity then setthreadidentity(8) end
+    return bridge.Parent ~= nil and bridge:GetAttribute("Active") == true
+end
+local function attribute(key, value)
+    if active() and bridge:GetAttribute(key) ~= value then bridge:SetAttribute(key, value) end
+end
+local function status(value, err)
+    attribute("Status", value)
+    attribute("Error", err)
+end
+local http = game:GetService("HttpService")
+local rc, store, remote, bankRemote
+local connections, costs, costLevel = {}, nil, nil
+local pending, manualSequence, workerStarted = nil, 0, os.clock()
+local retryAt, failures, blockedSignature = 0, 0, nil
+local nextDiscovery = 0
+local function finite(value)
+    return type(value) == "number" and value == value and math.abs(value) < math.huge
+end
+local function recordCosts(level, ingredients)
+    if not finite(level) or type(ingredients) ~= "table" then return end
+    local nextCosts = {}
+    for _, item in pairs(ingredients) do
+        if type(item) ~= "table" or type(item.id) ~= "string"
+            or not finite(item.amount) or item.amount <= 0 then return end
+        nextCosts[#nextCosts + 1] = { Id = item.id, Required = item.amount }
+    end
+    table.sort(nextCosts, function(a, b) return a.Id < b.Id end)
+    costs, costLevel = nextCosts, level
+end
+local function discoverCosts(level, data)
+    if costLevel == level and costs and #costs > 0 then return end
+    costs, costLevel = nil, nil
+    local button = data.BankEnabled == false and store.repair_button or store.upgrade_button
+    local callback = button and button.Callback
+    local getter = (debug and debug.getupvalues) or getupvalues
+    if type(callback) ~= "function" or type(getter) ~= "function" then return end
+    local ok, values = pcall(getter, callback)
+    if not ok or type(values) ~= "table" then return end
+    for _, value in pairs(values) do
+        if type(value) == "table" then
+            local found, candidate = pcall(function()
+                local result = {}
+                for _, item in pairs(value) do
+                    if type(item) ~= "table" or type(item.id) ~= "string"
+                        or not finite(item.max_amount) or item.max_amount <= 0 then return nil end
+                    result[#result + 1] = { id = item.id, amount = item.max_amount }
+                end
+                return #result > 0 and result or nil
+            end)
+            if found and candidate then recordCosts(level, candidate) return end
+        end
+    end
+end
+local function initialize()
+    if rc and store and remote and remote.Parent and bankRemote.Parent == rs:FindFirstChild("Remote") then return true end
+    if os.clock() < nextDiscovery then return false end
+    nextDiscovery = os.clock() + 3
+    local folder = rs:FindFirstChild("Remote")
+    folder = folder and folder:FindFirstChild("Bank")
+    local upgrade = folder and folder:FindFirstChild("UpgradeBank")
+    if not upgrade or not upgrade:IsA("RemoteFunction") then
+        status("Waiting for UpgradeBank remote")
+        return false
+    end
+    local ok, result = pcall(function()
+        return {
+            Replica = require(rs.ReplicaController),
+            Store = require(rs.Modules.UI.BankUI).store,
+        }
+    end)
+    if not active() then return false end
+    if not ok then status("Waiting for native bank data", tostring(result)) return false end
+    for _, connection in ipairs(connections) do connection:Disconnect() end
+    table.clear(connections)
+    rc, store, remote, bankRemote = result.Replica, result.Store, upgrade, folder
+    costs, costLevel = nil, nil
+    for _, name in ipairs({ "BankInitialized", "BankUpgraded" }) do
+        local event = folder:FindFirstChild(name)
+        if event then
+            connections[#connections + 1] = event.OnClientEvent:Connect(function(level, ingredients)
+                if not active() then return end
+                recordCosts(level, ingredients)
+                attribute("ObservedLevel", level)
+            end)
+        end
+    end
+    return true
+end
+local function snapshot()
+    if not initialize() then return end
+    local uid = player:GetAttribute("UID")
+    local replica = uid and rc.GetReplicaById(uid)
+    local data = replica and replica.Data
+    if type(data) ~= "table" or not finite(data.Bank) or not finite(data.BankCapacity)
+        or type(data.BankEnabled) ~= "boolean" then
+        attribute("DataReady", false)
+        status("Waiting for player bank replica")
+        return
+    end
+    local level = store.level
+    if not finite(level) or level % 1 ~= 0 or level < 0 or level > 7
+        or (data.BankEnabled and level == 0)
+        or (not data.BankEnabled and level ~= 0) then
+        attribute("DataReady", false)
+        status("Waiting for bank initialization")
+        return
+    end
+    discoverCosts(level, data)
+    local missing, materialSummary, signature = {}, {}, { tostring(level), tostring(data.BankEnabled) }
+    local known = costLevel == level and costs ~= nil and #costs > 0
+    if known then
+        for _, item in ipairs(costs) do
+            local entry = type(data.Inventory) == "table" and data.Inventory[item.Id]
+            local count = type(entry) == "table" and entry.Amount or entry
+            count = finite(count) and math.max(0, count) or 0
+            signature[#signature + 1] = item.Id .. "=" .. tostring(count)
+            materialSummary[#materialSummary + 1] = item.Id .. " " .. tostring(count) .. "/" .. tostring(item.Required)
+            if count < item.Required then
+                missing[#missing + 1] = { Id = item.Id, Owned = count, Required = item.Required }
+            end
+        end
+    end
+    attribute("DataReady", true)
+    attribute("Level", level)
+    attribute("Balance", data.Bank)
+    attribute("Capacity", data.BankCapacity)
+    attribute("BankEnabled", data.BankEnabled)
+    attribute("Full", data.BankCapacity > 0 and data.Bank >= data.BankCapacity)
+    attribute("CostsKnown", known)
+    attribute("Materials", table.concat(materialSummary, " | "))
+    attribute("Missing", http:JSONEncode(missing))
+    return {
+        Level = level, Enabled = data.BankEnabled, Capacity = data.BankCapacity,
+        Balance = data.Bank, Known = known, Missing = missing,
+        Signature = table.concat(signature, ";"),
+    }
+end
+local function eligible(data)
+    if data.Level >= 7 then return false, "Bank is already max level" end
+    if not data.Known then return false, "Waiting for native upgrade costs" end
+    if #data.Missing > 0 then
+        local parts = {}
+        for _, item in ipairs(data.Missing) do
+            parts[#parts + 1] = item.Id .. " (" .. tostring(item.Owned) .. "/" .. tostring(item.Required) .. ")"
+        end
+        return false, "Missing materials: " .. table.concat(parts, ", ")
+    end
+    local button = data.Enabled and store.upgrade_button or store.repair_button
+    if button and button.Processing == true then return false, "Native bank request in progress" end
+    return true
+end
+local function confirmed(before, data)
+    return data.Level > before.Level or data.Capacity > before.Capacity
+        or (not before.Enabled and data.Enabled)
+end
+local function finish(success, message, timeout)
+    if not pending then return end
+    if pending.Thread and not pending.Replied then pcall(task.cancel, pending.Thread) end
+    attribute("Running", false)
+    if success then
+        attribute("Confirmed", (bridge:GetAttribute("Confirmed") or 0) + 1)
+        failures, blockedSignature = 0, nil
+        retryAt = os.clock() + 2
+        status(message)
+    else
+        failures += 1
+        retryAt = os.clock() + math.min(120, 15 * 2 ^ math.min(3, failures - 1))
+        blockedSignature = timeout and pending.Before.Signature or nil
+        status(message, message)
+    end
+    pending = nil
+end
+local function start(data)
+    pending = { Before = data, Started = os.clock(), Replied = false }
+    local request = pending
+    attribute("Running", true)
+    attribute("Attempts", (bridge:GetAttribute("Attempts") or 0) + 1)
+    status(data.Enabled and "Sending UpgradeBank packet" or "Sending bank repair packet")
+    request.Thread = task.spawn(function()
+        local ok, reply = pcall(function() return remote:InvokeServer() end)
+        if not active() or pending ~= request then return end
+        request.Ok, request.Reply, request.Replied = ok, reply, true
+    end)
+end
+local function step()
+    attribute("Heartbeat", os.clock())
+    attribute("WorkerStarted", workerStarted)
+    local sequence = bridge:GetAttribute("UpgradeSequence") or 0
+    local manual = sequence ~= manualSequence
+    local data = snapshot()
+    if not active() then return end
+    if pending then
+        manualSequence = sequence
+        if data and confirmed(pending.Before, data) then
+            finish(true, "Bank upgrade confirmed: level " .. tostring(data.Level))
+        elseif os.clock() - pending.Started >= 8 then
+            local reply = pending.Reply
+            local detail = type(reply) == "string" and reply or
+                (type(reply) == "table" and tostring(reply.message or reply.Message or reply.error or "No level change"))
+                or "No level change"
+            finish(false, "Bank upgrade not confirmed after 8s: " .. detail, true)
+        elseif pending.Replied and not pending.Ok then
+            local reply = pending.Reply
+            local detail = type(reply) == "string" and reply or
+                (type(reply) == "table" and tostring(reply.message or reply.Message or reply.error or "No level change"))
+                or (pending.Ok and "No level change" or tostring(reply))
+            finish(false, "Bank upgrade not confirmed: " .. detail)
+        end
+        return
+    end
+    if bridge:GetAttribute("Enabled") ~= true and not manual then status("Disabled") return end
+    if not data then return end
+    manualSequence = sequence
+    local ready, reason = eligible(data)
+    if not ready then status(reason) return end
+    if os.clock() < retryAt then
+        if manual then status("Bank request cooling down") end
+        return
+    end
+    if blockedSignature == data.Signature and not manual then
+        status("Bank upgrade not confirmed; waiting for data change or manual retry", bridge:GetAttribute("Error"))
+        return
+    end
+    if manual then blockedSignature = nil end
+    start(data)
+end
+status("Waiting for bank data")
+while active() do
+    local ok, err = pcall(step)
+    if not ok then status("Bank automation error", tostring(err)) end
+    task.wait(0.25)
+end
+if pending and pending.Thread then pcall(task.cancel, pending.Thread) end
+for _, connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
+]==]
+    function controller.SetEnabled(value)
+        enabled = value == true
+        Config.AutoBankUpgrade = enabled
+        if bridge and bridge.Parent then bridge:SetAttribute("Enabled", enabled) end
+        if toggle and type(toggle.Set) == "function" then
+            syncing = true pcall(toggle.Set, toggle, enabled) syncing = false
+        end
+        saveConfig()
+        return enabled
+    end
+    function controller.Upgrade()
+        if not bridge or not bridge.Parent or not bridge:GetAttribute("Ready") then
+            return false, "Bank worker is not ready"
+        end
+        if bridge:GetAttribute("Running") then return false, "Bank request already in progress" end
+        bridge:SetAttribute("UpgradeSequence", (bridge:GetAttribute("UpgradeSequence") or 0) + 1)
+        return true
+    end
+    function controller.GetStatus()
+        return bridge and bridge:GetAttribute("Status") or "Waiting for bank worker"
+    end
+    function controller.GetState()
+        return {
+            Enabled = enabled, Status = controller.GetStatus(),
+            Error = bridge and bridge:GetAttribute("Error"),
+            Running = bridge and bridge:GetAttribute("Running") == true,
+            DataReady = bridge and bridge:GetAttribute("DataReady") == true,
+            Level = bridge and bridge:GetAttribute("Level"),
+            Balance = bridge and bridge:GetAttribute("Balance"),
+            Capacity = bridge and bridge:GetAttribute("Capacity"),
+            Materials = bridge and bridge:GetAttribute("Materials"),
+            Attempts = bridge and bridge:GetAttribute("Attempts") or 0,
+            Confirmed = bridge and bridge:GetAttribute("Confirmed") or 0,
+        }
+    end
+    function controller.Mount(page)
+        UI:AddDivider(page, "Bank")
+        toggle = UI:AddToggle(page, "Auto Upgrade Bank", enabled, function(value)
+            if not syncing then controller.SetEnabled(value) end
+        end)
+        UI:AddButtonRow(page, { { Text = "Upgrade Bank Now", Style = "ghost", Width = 200, Callback = controller.Upgrade } })
+        rows = {}
+        for _, name in ipairs({ "Bank Status", "Bank Level / Balance", "Bank Materials" }) do
+            rows[name] = UI:AddMetricRow(page, { { Label = name, Value = "Waiting for data" } })[1]
+        end
+    end
+    function controller.Destroy()
+        living, enabled = false, false
+        if bridge then bridge:SetAttribute("Active", false) bridge:Destroy() bridge = nil end
+        rows, toggle = nil, nil
+    end
+    task.spawn(function()
+        local core = game:GetService("CoreGui")
+        local old = core:FindFirstChild("BonesHubBankBridge")
+        if old then old:SetAttribute("Active", false) old:Destroy() end
+        if not living or not Alive then return end
+        bridge = Instance.new("Folder")
+        bridge.Name = "BonesHubBankBridge"
+        bridge:SetAttribute("Active", true)
+        bridge:SetAttribute("Enabled", enabled)
+        bridge.Parent = core
+        local actor = game:GetService("ReplicatedFirst"):FindFirstChild("ClientHandlers")
+        local runner = ENV.run_on_actor or run_on_actor
+        if type(runner) ~= "function" or not actor then
+            bridge:SetAttribute("Status", "Actor support unavailable")
+            return
+        end
+        local ok, err = pcall(runner, actor, ACTOR_SOURCE)
+        if bridge and bridge.Parent then
+            bridge:SetAttribute("Ready", ok)
+            if not ok then bridge:SetAttribute("Status", "Bank worker failed") bridge:SetAttribute("Error", tostring(err)) end
+        end
+    end)
+    task.spawn(function()
+        while living and Alive do
+            if rows then
+                local data = controller.GetState()
+                local values = {
+                    ["Bank Status"] = data.Status,
+                    ["Bank Level / Balance"] = "Lv " .. tostring(data.Level or "--") .. " | " .. tostring(data.Balance or "--") .. "/" .. tostring(data.Capacity or "--"),
+                    ["Bank Materials"] = data.Materials and data.Materials ~= "" and data.Materials or "Waiting for native upgrade costs",
+                }
+                for name, value in pairs(values) do
+                    local row = rows[name]
+                    if row and row.ValueLabel and row.ValueLabel.Parent and row.ValueLabel.Text ~= value then
+                        row.ValueLabel.Text = value
+                    end
+                end
+            end
             task.wait(0.5)
         end
     end)
@@ -6767,6 +7111,7 @@ if not ok then attribute("Error", tostring(err)) end
         metrics["Equipment Status"] = UI:AddMetricRow(craftPage, { { Label = "Equipment Status", Value = "Disabled" } })[1]
         UI:AddButtonRow(craftPage, { { Text = "Open Jake's Workshop", Style = "ghost", Width = 200, Callback = controller.OpenJake } })
         metrics["Jake Workshop"] = UI:AddMetricRow(craftPage, { { Label = "Jake Workshop", Value = "Ready near Jake" } })[1]
+        BankAutomation.Mount(craftPage)
         UI:AddDivider(auraPage, "Aura Cleanup")
         toggles.Delete = UI:AddToggle(auraPage, "Auto Delete Excess Auras", Config.AutoDeleteAuras, function(value) controller.SetEnabled("Delete", value) end)
         selectControl("Auras", "Auras to Delete", {}, "DeleteAuras")
@@ -10373,6 +10718,7 @@ local mountedInterface, interfaceFailure = mountInterface()
 if not mountedInterface then
     ScriptCompatibility.Destroy()
     AuraNotifications.Destroy()
+    BankAutomation.Destroy()
     WeatherControllers.Destroy()
     EdenAutomation.Destroy()
     MemoryParty.Destroy()
@@ -10423,6 +10769,9 @@ function API.SetMerchantEnabled(value) return MerchantAutomation.SetEnabled(valu
 function API.SelectMerchantProducts(merchant, values) return MerchantAutomation.Select(merchant, values) end
 function API.GetMerchantAutomationState() return MerchantAutomation.GetState() end
 function API.SetPotionEnabled(value) return Potion.SetEnabled(value) end
+function API.SetBankEnabled(value) return BankAutomation.SetEnabled(value) end
+function API.UpgradeBankNow() return BankAutomation.Upgrade() end
+function API.GetBankState() return BankAutomation.GetState() end
 function API.GetPotionState() return Potion.GetState() end
 function API.SelectPotion(value) return Potion.SelectRecipe(value) end
 function API.SelectPotions(values) return Potion.SelectRecipes(values) end
@@ -10481,6 +10830,7 @@ function API.Destroy()
     Alive = false
     ScriptCompatibility.Destroy()
     AuraNotifications.Destroy()
+    BankAutomation.Destroy()
     WeatherControllers.Destroy()
     EdenAutomation.Destroy()
     MemoryParty.Destroy()
@@ -10531,6 +10881,7 @@ task.spawn(connectMerchantEvents)
 ]=====]
 local env = (getgenv and getgenv()) or _G
 env.__BONES_HUB_SOURCE = source
-local loader, failure = loadstring(source, "BonesHub 3.56")
+local chunkVersion = source:match('local SCRIPT_VERSION = "([%d%.%w]+)"') or "unknown"
+local loader, failure = loadstring(source, "BonesHub " .. chunkVersion)
 if not loader then error(failure) end
 return loader()
