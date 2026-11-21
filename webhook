@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.77"
+local SCRIPT_VERSION = "3.78"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -121,7 +121,7 @@ end
 local CONFIG_DIR = "BiomeMacroConfigs"
 local CONFIG_FILE = CONFIG_DIR .. "/BonesHub_" .. tostring(LocalPlayer.UserId) .. ".json"
 local LEGACY_CONFIG_FILE = CONFIG_DIR .. "/Config_" .. tostring(LocalPlayer.UserId) .. ".json"
-local UI_URL = "https://raw.githubusercontent.com/iamkaizo-ui/Obsidianplus/9c9e4e8998abdb7742d3bc0b231a767366025677/Library.lua"
+local UI_URL = "https://raw.githubusercontent.com/iwsksownw666/webhook/main/ui/BonesObsidian-3.78.lua"
 local BIOME_ICON_IDS = {
     WINDY = 138169499467564, HELL = 89721298978404, CORRUPTION = 137622939436355,
     SNOWY = 109912975653138, RAINY = 137992545432987, NULL = 120277135407020,
@@ -170,7 +170,7 @@ local DEFAULT_CONFIG = {
     AutoWeatherControllers = false,
     AutoEden = false,
     AutoMemoryParty = false, MemoryPartyItems = {}, MemoryPartyWebhook = "", MemoryPartyWebhooks = true,
-    Webhook = "", SessionDigest = false, PSLink = "", AntiAfk = true, BiomeScanInterval = 0.5, UIMode = "Obsidian", InterfaceMotion = true, InterfaceStyleVersion = 4,
+    Webhook = "", SessionDigest = false, PSLink = "", AntiAfk = true, BiomeScanInterval = 0.5, UIMode = "Obsidian", InterfaceMotion = true, UIRainbowBorder = true, InterfaceStyleVersion = 5,
     AuraEnabled = false, AuraMinimum = 1000000, AuraWebhook = "", AuraPing = false,
     PingBiomes = {
         HEAVEN = false, NULL = false, HELL = false, STARFALL = false, WINDY = false,
@@ -376,8 +376,8 @@ local function loadConfig()
     end
 end
 loadConfig()
-if Config.InterfaceStyleVersion ~= 4 or Config.UIMode ~= "Obsidian" then
-    Config.UIMode, Config.InterfaceStyleVersion = "Obsidian", 4
+if Config.InterfaceStyleVersion ~= 5 or Config.UIMode ~= "Obsidian" then
+    Config.UIMode, Config.InterfaceStyleVersion = "Obsidian", 5
     saveConfig()
 end
 
@@ -1286,6 +1286,19 @@ local MovementCoordinator = (function()
         stats.Grants += 1
         return ticket
     end
+    local function fishingBusy(nextOwner)
+        if nextOwner~="Merchant" and nextOwner~="Halloween" then return false end
+        local b=game:GetService("CoreGui"):FindFirstChild("BonesHubFishingBridge")
+        if not b or b:GetAttribute("Active")~=true then return false end
+        -- Publish the handoff before checking the round, closing the instant-recast race.
+        b:SetAttribute("YieldAfterCatch",true)
+        if workspace:GetServerTimeNow()-(tonumber(b:GetAttribute("OperationUpdatedAt")) or 0)>2 then return false end
+        if b:GetAttribute("RoundActive")==true or b:GetAttribute("SellAuthorized")==true then return true end
+        local character=LocalPlayer.Character
+        local root=character and character:FindFirstChild("HumanoidRootPart")
+        return root and root.Anchored==true
+    end
+
     local function refresh()
         if owner and clock() - ownerSince > lifetime(owner) then
             stats.Expired += 1
@@ -1295,10 +1308,12 @@ local MovementCoordinator = (function()
         local first = ordered()
         if not owner then
             if not first then return nil end
+            if fishingBusy(first.Name) then return nil end
             leave(first.Name)
             return hand(first.Name)
         end
         if not first then return nil end
+        if owner == "Fishing" and fishingBusy(first.Name) then return nil end
         local held = clock() - ownerSince
         local wanted = priority(first.Name)
         local starved = clock() - first.At > starvation
@@ -5113,7 +5128,7 @@ end)()
         UI:AddToggle(page, "Hide Catch Result", hideResults, controller.SetHideResults)
         UI:AddToggle(page, "Auto Sell When Full", autoSell, controller.SetAutoSell)
         UI:AddButtonRow(page, {
-            { Text = "Instant Sell Fish (All)", Style = "primary", Width = 200, Callback = controller.SellAll },
+            { Text = "Sell All Fish", Style = "primary", Width = 200, Callback = controller.SellAll },
             { Text = "Stop Selling", Style = "danger", Width = 130, Callback = controller.CancelSale },
         })
         metrics = UI:AddMetricRow(page, {
@@ -5360,14 +5375,14 @@ listen(packets.reward, function(value, receivedAt)
         bridge:SetAttribute("LastFishUID", value.rewardInfo.uid)
         bridge:SetAttribute("LastRewardLead", session.deadline and session.deadline - received or nil)
     end
-    ownedFishing, session = false, nil
+    ownedFishing, session = false, nil bridge:SetAttribute("RoundActive", false)
     bridge:SetAttribute("LastRewardAt", os.clock())
     nextCast = os.clock()
 end)
 listen(packets.quit, function(receivedAt)
     if ownedFishing then
         FinishPolicy.Reject(session, type(receivedAt) == "number" and receivedAt or workspace:GetServerTimeNow())
-        ownedFishing, session = false, nil
+        ownedFishing, session = false, nil bridge:SetAttribute("RoundActive", false)
         nextCast = os.clock() + 0.15
     end
 end)
@@ -5477,23 +5492,24 @@ local ok, failure = pcall(function()
         local iterationOK, iterationError = pcall(function()
         if setthreadidentity then setthreadidentity(8) end
         bridge:SetAttribute("OperationUpdatedAt", workspace:GetServerTimeNow())
+        bridge:SetAttribute("RoundActive", ownedFishing)
         if not alive() and not shutdownDeadline then shutdownDeadline = os.clock() + 100 end
         if ownedFishing and session and session.character ~= player.Character then
-            ownedFishing, session = false, nil
+            ownedFishing, session = false, nil bridge:SetAttribute("RoundActive", false)
             finishNative()
         end
         if ownedFishing and session and os.clock() - session.started > 100 then
             quitOwned("Fishing session timed out; waiting for native release")
             local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
             if not root or not root.Anchored then
-                ownedFishing, session = false, nil
+                ownedFishing, session = false, nil bridge:SetAttribute("RoundActive", false)
                 finishNative()
                 nextCast = os.clock() + 2
             end
         end
         if ownedFishing and shutdownDeadline and os.clock() >= shutdownDeadline then
             quitOwned("Fishing shutdown timed out")
-            ownedFishing, session = false, nil
+            ownedFishing, session = false, nil bridge:SetAttribute("RoundActive", false)
             finishNative()
         end
         suppressResults = bridge:GetAttribute("HideResults") ~= false
@@ -5599,7 +5615,7 @@ local ok, failure = pcall(function()
             if ownedFishing then
                 local sessionRoot = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
                 if session and session.quitSent and os.clock() >= (session.releaseAfter or session.waitUntil) and (not sessionRoot or not sessionRoot.Anchored) then
-                    ownedFishing, session = false, nil
+                    ownedFishing, session = false, nil bridge:SetAttribute("RoundActive", false)
                     finishNative()
                 elseif session and session.deadline then
                     local now = workspace:GetServerTimeNow()
@@ -5635,6 +5651,7 @@ local ok, failure = pcall(function()
                     bridge:SetAttribute("FishingError", nil)
                     session = { waitUntil = os.clock() + 8, began = false, submitted = false, character = character, started = os.clock() }
                     ownedFishing = true
+                    bridge:SetAttribute("RoundActive", true)
                     bridge:SetAttribute("LastStartAt", os.clock())
                     local settled = bridge:GetAttribute("LastRewardAt")
                     if settled and settled ~= lastRestartedReward then
@@ -7276,7 +7293,12 @@ local MerchantAutomation = (function()
         local potion = core:FindFirstChild("BonesHubPotionBridge")
         if potion and potion:GetAttribute("MutationPending") then return false end
         local combat = core:FindFirstChild("BonesHubHalloweenBridge")
-        if combat and (combat:GetAttribute("InventoryReserved") == true or combat:GetAttribute("Casting") == true) then return false end
+        if combat then
+            local now=workspace:GetServerTimeNow()
+            local fresh=combat:GetAttribute("Active")==true and now-(tonumber(combat:GetAttribute("Heartbeat")) or 0)<3
+            local busyUntil=math.max(tonumber(combat:GetAttribute("WorkerBusyUntil")) or 0,tonumber(combat:GetAttribute("EquipBusyUntil")) or 0)
+            if (fresh or now<busyUntil) and (combat:GetAttribute("InventoryReserved")==true or combat:GetAttribute("Casting")==true) then return false end
+        end
         local weather = core:FindFirstChild("BonesHubWeatherControllers")
         return not weather or (weather:GetAttribute("ItemBusyUntil") or 0) <= os.clock()
     end
@@ -7322,6 +7344,7 @@ local MerchantAutomation = (function()
         until lease or os.clock() >= deadline
         if not lease then lastError = "Movement busy" return end
         put("InventoryReserved", true)
+        status = "Waiting for current combat action"
         deadline = os.clock() + 15
         while valid(token) and not idle() and os.clock() < deadline do task.wait(0.1) end
         if not valid(token) then return end
@@ -9162,6 +9185,7 @@ local function bind(packet, callback)
     local guarded = function(...)
         local prior = getthreadidentity and getthreadidentity()
         elevate()
+        if not alive() then if prior and setthreadidentity then setthreadidentity(prior) end return end
         local ok, why = pcall(callback, ...)
         if not ok then attr("Error", tostring(why)) end
         if prior and setthreadidentity then setthreadidentity(prior) end
@@ -9418,7 +9442,7 @@ local ok, failure = pcall(function()
             aimPreparation=nil attr("AimPreparing",false)
         end
         if rotationLock and (not pendingCast or not active) then restoreRotation() end
-        if active and desired and not pendingEquip and not pendingCast and now >= castUntil and now >= equipSettled and inventoryFree() then
+        if alive() and active and desired and not pendingEquip and not pendingCast and now >= castUntil and now >= equipSettled and inventoryFree() then
             if not HalloweenRules.Equipped(d, desired.Aura) then
                 turnStarted = true
                 pendingEquip = { Aura = desired.Aura, Deadline = now + 4 }
@@ -9481,6 +9505,7 @@ local ok, failure = pcall(function()
                         pendingCast = { Character = character, Key = desired.Key, Skill = desired.Skill, Range = desired.Range, Preferred = desired.Preferred, Target = target, Before = hp, Solo = #players:GetPlayers() == 1, Animations = animations, AckDeadline = now+1.5, Deadline = now + math.clamp(desired.Lock+3,4,15) }
                         attr("Casting",true) attr("WorkerBusyUntil",castUntil)
                         requested += 1
+                        if not alive() or bridge:GetAttribute("Permit")~=true then return end
                         packets.UseSkill.send({ SkillName = desired.Skill, LookVector = direction, MouseHit = CFrame.lookAt and CFrame.lookAt(aimPoint, aimPoint + direction) or CFrame.new(aimPoint) })
                         attr("RequestedCasts", requested) attr("LastSkill", desired.Aura.Label .. " / " .. desired.Skill)
                     end
@@ -9513,7 +9538,7 @@ for _, b in ipairs(listeners) do
     pcall(function() local list = b.Packet.getListeners() local i = table.find(list, b.Callback) if i then table.remove(list, i) end end)
 end
 for _, connection in pairs(deathConnections) do connection:Disconnect() end
-attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
+attr("DataReady", false) attr("InventoryReserved", false) attr("Casting", false) attr("AimPreparing", false) attr("WorkerBusyUntil",0) attr("EquipBusyUntil",0) attr("Permit", false) attr("Stopped", true)
 
 ]======]
     local function attribute(k, v) if bridge and bridge.Parent and bridge:GetAttribute(k) ~= v then bridge:SetAttribute(k, v) end end
@@ -9828,6 +9853,9 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
     local function step()
         local now = workspace:GetServerTimeNow()
         local elapsed=math.clamp(os.clock()-lastStepAt,0,0.25) lastStepAt=os.clock()
+        if not bridge or not bridge.Parent or bridge:GetAttribute("Active")~=true then
+            release() status="Waiting for combat worker recovery" return
+        end
         if LocalPlayer.Character~=observedCharacter then
             release() observedCharacter=LocalPlayer.Character
             recovering,previousHP,recentDamage=false,nil,now
@@ -9849,7 +9877,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         end
         local model, humanoid, root = character()
         local hasTarget = enabled() and root and target and targetRoot and targetRoot.Parent and HalloweenRules.Attackable(target, npcFolder)
-        if hasTarget and root then
+        if hasTarget and root and lease and MovementCoordinator.IsOwner("Halloween",lease) and not root.Anchored then
             if not stuckAnchor or (root.Position - stuckAnchor).Magnitude > 1.2 then
                 stuckAnchor = root.Position
                 stuckSince = os.clock()
@@ -9913,6 +9941,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         if not lease or root.Anchored then attribute("Permit", false) status = "Waiting for fishing / current task to settle" return end
         if not MovementCoordinator.IsOwner("Halloween", lease) then lease = nil attribute("Permit", false) return end
 
+        local range = tonumber(bridge:GetAttribute("AttackRange")) or 25
         local hpPercent = humanoid.Health / math.max(humanoid.MaxHealth, 1) * 100
         if previousHP and humanoid.Health < previousHP then recentDamage=now end
         previousHP=humanoid.Health
@@ -10167,53 +10196,87 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Stopped", true)
         attribute("HUDStatus", hudOk and HalloweenHUD.Status() or tostring(hudFailure))
     end)
     task.spawn(function()
-        local old = core:FindFirstChild("BonesHubHalloweenBridge")
-        if old then
-            old:SetAttribute("Active", false)
-            local untilAt = os.clock() + 3
-            while old.Parent and old:GetAttribute("Stopped") ~= true and os.clock() < untilAt do task.wait(0.1) end
-            if old.Parent and old:GetAttribute("Stopped") ~= true then errorText = "Previous combat bridge still stopping" return end
-            old:Destroy()
-        end
-        if not living or not Alive then return end
-        bridge = Instance.new("Folder") bridge.Name = "BonesHubHalloweenBridge" bridge.Parent = core bridge:SetAttribute("Active", true)
-        targetValue = Instance.new("ObjectValue") targetValue.Name = "Target" targetValue.Parent = bridge
-        updateSettings()
         local runner = ENV.run_on_actor or run_on_actor
         local actor = game:GetService("ReplicatedFirst"):FindFirstChild("ClientHandlers")
         if type(runner) ~= "function" or not actor then errorText = "Actor support unavailable" return end
-        local function launch()
-            actorStartingAt=os.clock()
-            bridge:SetAttribute("Stopped",false) bridge:SetAttribute("Active",true)
-            bridge:SetAttribute("Heartbeat",workspace:GetServerTimeNow())
-            bridge:SetAttribute("DataReady",false) bridge:SetAttribute("Error",nil)
-            updateSettings()
-            local ok,failure=pcall(runner,actor,ACTOR_SOURCE)
-            if not ok then errorText=tostring(failure) bridge:SetAttribute("Active",false) return false end
-            errorText=nil return true
+        local function stop(worker)
+            if not worker or not worker.Parent then return end
+            worker:SetAttribute("Permit",false)
+            worker:SetAttribute("FarmEnabled",false)
+            worker:SetAttribute("CombatPending",false)
+            worker:SetAttribute("Active",false)
         end
-        local launched=launch()
-        local stopping=not launched
-        local restartAt=os.clock()+2
-        local backoff=2
-        while living and Alive and bridge.Parent do
-            task.wait(0.5)
-            local stale=workspace:GetServerTimeNow()-(bridge:GetAttribute("Heartbeat") or 0)>3
-            if not stopping and (bridge:GetAttribute("Stopped")==true or stale and os.clock()-actorStartingAt>4) then
-                stopping=true restartAt=os.clock()+backoff
-                bridge:SetAttribute("Active",false) release()
-                lastRecovery="Restarting unresponsive combat worker"
+        local function settled(worker)
+            if not worker or not worker.Parent then return true end
+            local now=workspace:GetServerTimeNow()
+            local busyUntil=math.max(tonumber(worker:GetAttribute("WorkerBusyUntil")) or 0,tonumber(worker:GetAttribute("EquipBusyUntil")) or 0)
+            if now<busyUntil then return false end
+            return worker:GetAttribute("Stopped")==true or now-(tonumber(worker:GetAttribute("Heartbeat")) or 0)>8
+        end
+        local old=core:FindFirstChild("BonesHubHalloweenBridge")
+        if old then
+            stop(old)
+            while living and Alive and not settled(old) do
+                status="Waiting for previous combat action to settle"
+                task.wait(0.25)
             end
-            if stopping and bridge:GetAttribute("Stopped")==true and os.clock()>=restartAt
-                and workspace:GetServerTimeNow()>=math.max(tonumber(bridge:GetAttribute("WorkerBusyUntil")) or 0,tonumber(bridge:GetAttribute("EquipBusyUntil")) or 0) then
-
-                if living and Alive then
-                    actorRestarts+=1 launched=launch() stopping=not launched
-                    backoff=math.min(30,backoff*2) restartAt=os.clock()+backoff
+            if not living or not Alive then return end
+            if old.Parent then old:Destroy() end
+        end
+        local restartAt, backoff, stopping, launchThread = 0,2,false,nil
+        local carry={}
+        local function launch()
+            bridge=Instance.new("Folder")
+            bridge.Name="BonesHubHalloweenBridge"
+            bridge:SetAttribute("Active",true)
+            bridge:SetAttribute("Stopped",false)
+            bridge:SetAttribute("Heartbeat",workspace:GetServerTimeNow())
+            bridge:SetAttribute("DataReady",false)
+            for name,value in pairs(carry) do bridge:SetAttribute(name,value) end
+            bridge.Parent=core
+            targetValue=Instance.new("ObjectValue")
+            targetValue.Name="Target" targetValue.Value=target targetValue.Parent=bridge
+            updateSettings()
+            actorStartingAt=os.clock()
+            local worker=bridge
+            launchThread=task.spawn(function()
+                local ok,failure=pcall(runner,actor,ACTOR_SOURCE)
+                if living and Alive and bridge==worker and worker.Parent then
+                    if not ok then errorText=tostring(failure) stop(worker)
+                    else errorText=nil end
                 end
+            end)
+        end
+        launch()
+        while living and Alive do
+            task.wait(0.5)
+            local now=workspace:GetServerTimeNow()
+            local stale=not bridge or not bridge.Parent or now-(tonumber(bridge:GetAttribute("Heartbeat")) or 0)>3
+            if not stopping and (not bridge or not bridge.Parent or bridge:GetAttribute("Active")~=true or bridge:GetAttribute("Stopped")==true or stale and os.clock()-actorStartingAt>4) then
+                stopping=true restartAt=os.clock()+backoff
+                stop(bridge) release()
+                lastRecovery="Restarting unresponsive combat worker"
+                status=lastRecovery
+            end
+            if stopping and os.clock()>=restartAt and settled(bridge) then
+                carry={}
+                if bridge and bridge.Parent then
+                    for _,name in ipairs({"OwnKills","OwnOrbs","RequestedCasts","ConfirmedCasts","ReportSequence","ActorErrors"}) do
+                        local value=bridge:GetAttribute(name)
+                        if value~=nil then carry[name]=value end
+                    end
+                    bridge:Destroy()
+                end
+                if launchThread then pcall(task.cancel,launchThread) end
+                actorRestarts+=1
+                launch() stopping=false
+                backoff=math.min(30,backoff*2)
             elseif not stopping and not stale and os.clock()-actorStartingAt>20 then backoff=2 end
         end
+        stop(bridge)
     end)
+
+
     task.spawn(function()
         while living and Alive do
             local ok, failure = pcall(step)
@@ -10361,24 +10424,35 @@ local function adaptObsidian(library)
     local factory = {}
     function factory.new(options)
         local ui = { Tabs = {}, Controls = {}, Library = library, Destroyed = false }
-        local current, pending, boxes, counts, serial = {}, {}, {}, {}, 0
+        local current, pending, boxes, counts, owners, serial = {}, {}, {}, {}, {}, 0
         local signalConnections = {}
+        local saveRevision = 0
+        local function scheduleSave()
+            saveRevision += 1
+            local revision = saveRevision
+            task.delay(0.4, function()
+                if not ui.Destroyed and revision == saveRevision then saveConfig() end
+            end)
+        end
         local names = { "Main", "Limbo", "Halloween", "Merchant", "Craft", "Tasks", "Aura", "Settings" }
         local icons = { "fish", "orbit", "ghost", "shopping-bag", "hammer", "list-checks", "sparkles", "settings" }
         library.Scheme.AccentColor = Color3.fromRGB(168, 115, 235)
         library.ForceCheckbox = false
         local motion = options.InterfaceMotion ~= false
+        local viewport = workspace.CurrentCamera.ViewportSize
+        if viewport.X < 280 or viewport.Y < 220 then viewport = Vector2.new(960, 650) end
+        local mobile = library.IsMobile or viewport.X < 720
         local window = library:CreateWindow({
             Title = "Bones Hub", Footer = "by Ethereal  |  v" .. tostring(options.AppVersion) .. "  |  K to hide",
-            Size = UDim2.fromOffset(960, 650), Center = true, AutoShow = true, Resizable = true,
+            Size = UDim2.fromOffset(math.min(mobile and viewport.X-16 or 960, viewport.X-16), math.min(mobile and viewport.Y-16 or 650, viewport.Y-16)), Center = true, AutoShow = true, Resizable = true,
             ShowCustomCursor = false, ToggleKeybind = Enum.KeyCode.K,
             DisableSearch = false, GlobalSearch = true, ShowMobileButtons = true, MobileButtonsSide = "Right",
             EnableCompacting = false, SidebarCompacted = false, Compact = false,
-            EnableSidebarResize = false, CornerRadius = 8,
+            EnableSidebarResize = false, CornerRadius = 8, Glow = false,
             Font = Enum.Font.Gotham,
             Animations = { ToggleWindow = motion, TabSwitch = motion, Dropdown = motion },
         })
-        window:SetSidebarWidth(180)
+        window:SetSidebarWidth(160)
         ui.Window = window
         ui.Root = library.ScreenGui
         if library.ScreenGui then library.ScreenGui.Name = UI_ROOT_NAME end
@@ -10387,6 +10461,8 @@ local function adaptObsidian(library)
             ui.Tabs[index] = window:AddTab({ Name = name, Icon = icons[index], Order = index })
             boxes[index], counts[index] = {}, 0
         end
+        window:RefreshResponsive()
+        window:SetRainbowBorder(options.RainbowBorder ~= false)
         local function escape(value)
             return (tostring(value or ""):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
         end
@@ -10405,7 +10481,14 @@ local function adaptObsidian(library)
             current[page], pending[page] = name, nil
             return boxes[page][name]
         end
-        local function resolve(page, text, kind)
+        local fixed = {
+            [1] = { ["Fishing Spots"]="Fishing", ["Weather"]="Weather Potions", ["Potions to Drink"]="Weather Potions", ["Preferred Memory Rewards"]="Memory Match" },
+            [5] = { ["Equipment and Workbenches"]="Equipment Crafting", ["Auto Craft Equipment"]="Equipment Crafting", ["Potions"]="Potion Crafting", ["Auto Craft"]="Potion Crafting" },
+        }
+        local function resolve(page, text, kind, stable)
+            local key = tostring(page) .. ":" .. tostring(text)
+            if fixed[page] and fixed[page][text] then return box(page, fixed[page][text]) end
+            if stable and owners[key] then return box(page, owners[key]) end
             if page == 4 then
                 local merchant = tostring(text):match("^(Mari) ") or tostring(text):match("^(Jester) ") or tostring(text):match("^(Rin) ")
                 if merchant then return box(page, merchant) end
@@ -10415,6 +10498,11 @@ local function adaptObsidian(library)
                 return box(page, "Potion Crafting")
             end
             return box(page)
+        end
+        local function interactive(page, text)
+            local group = resolve(page, text, nil, true)
+            owners[tostring(page) .. ":" .. text] = current[page]
+            return group
         end
         local function id(page, text)
             serial += 1
@@ -10436,7 +10524,7 @@ local function adaptObsidian(library)
             })
         end
         local function control(page, text, native, convert)
-            local wrapped = { Native = native, Frame = frameProxy(native), Quiet = false }
+            local wrapped = { Native = native, Frame = frameProxy(native), Quiet = false, Owner = owners[tostring(page) .. ":" .. text] }
             function wrapped:Set(value)
                 self.Quiet = true
                 local ok, err = pcall(native.SetValue, native, convert and convert(value) or value)
@@ -10457,18 +10545,18 @@ local function adaptObsidian(library)
         end
         function ui:AddToggle(page, text, default, callback, tooltip)
             local wrapped
-            local native = resolve(page, text):AddToggle(id(page, text), {
+            local native = interactive(page, text):AddToggle(id(page, text), {
                 Text = text, Default = default == true, Tooltip = tooltip,
-                Callback = function(value) if wrapped and not wrapped.Quiet and not ui.Destroyed and callback then callback(value) end end,
+                Callback = function(value) if wrapped and not wrapped.Quiet and not ui.Destroyed and callback then callback(value) scheduleSave() end end,
             })
             wrapped = control(page, text, native)
             return wrapped
         end
         function ui:AddInput(page, text, placeholder, callback)
             local wrapped
-            local native = resolve(page, text):AddInput(id(page, text), {
+            local native = interactive(page, text):AddInput(id(page, text), {
                 Text = text, Default = "", Placeholder = placeholder or "", Finished = false, AllowEmpty = true,
-                Callback = function(value) if wrapped and not wrapped.Quiet and not ui.Destroyed and callback then callback(value) end end,
+                Callback = function(value) if wrapped and not wrapped.Quiet and not ui.Destroyed and callback then callback(value) scheduleSave() end end,
             })
             wrapped = control(page, text, native, tostring)
             return wrapped
@@ -10482,7 +10570,7 @@ local function adaptObsidian(library)
                 number = math.clamp(number, info.Min or -math.huge, info.Max or math.huge)
                 return number
             end
-            local native = resolve(page, text):AddInput(id(page, text), {
+            local native = interactive(page, text):AddInput(id(page, text), {
                 Text = text, Default = tostring(info.Default or info.Min or 0), Placeholder = info.Placeholder or "",
                 Finished = true, Numeric = false, AllowEmpty = false, ClearTextOnBlur = false,
                 Callback = function(value)
@@ -10491,6 +10579,7 @@ local function adaptObsidian(library)
                     if not number then wrapped:Set(info.Default or info.Min or 0) return end
                     if tostring(number) ~= value then wrapped:Set(number) end
                     if callback then callback(number) end
+                    scheduleSave()
                 end,
             })
             wrapped = control(page, text, native, tostring)
@@ -10512,24 +10601,21 @@ local function adaptObsidian(library)
                 end
                 return selected
             end
-            local native = resolve(page, text):AddDropdown(id(page, text), {
+            local native = interactive(page, text):AddDropdown(id(page, text), {
                 Text = text, Values = values or {}, Default = {}, Multi = true, AllowNull = true,
                 Searchable = true, MaxVisibleDropdownItems = 9,
-                Callback = function(value) if wrapped and not wrapped.Quiet and not ui.Destroyed and callback then callback(selection(value)) end end,
+                Callback = function(value) if wrapped and not wrapped.Quiet and not ui.Destroyed and callback then callback(selection(value)) scheduleSave() end end,
             })
             wrapped = control(page, text, native, selection)
             return wrapped
         end
         function ui:AddButtonRow(page, definitions)
             local result = {}
-            local first
-            for index, item in ipairs(definitions) do
+            for _, item in ipairs(definitions) do
                 local info = { Text = item.Text, Func = function()
                     if not ui.Destroyed and item.Callback then item.Callback() end
                 end, Risky = item.Style == "danger" }
-                local native
-                if index % 2 == 0 then native = first:AddButton(info)
-                else native = resolve(page, item.Text):AddButton(info) first = native end
+                local native = resolve(page, item.Text):AddButton(info)
                 result[#result + 1] = { Frame = frameProxy(native), Native = native }
             end
             return result
@@ -10589,13 +10675,15 @@ local function adaptObsidian(library)
         function ui:SetMotionEnabled(value)
             window:SetAnimations({ ToggleWindow = value == true, TabSwitch = value == true, Dropdown = value == true })
         end
+        function ui:SetRainbowBorder(value) window:SetRainbowBorder(value) end
+        function ui:Notify(message) library:Notify({Title="Bones Hub",Description=message,Time=3}) end
         function ui:SetBootStep(title) if not self.Destroyed then window:SetFooter(title) end end
         function ui:FinishBootSplash() if not self.Destroyed then window:SetFooter(footer) end end
         function ui:SetSidebarUserStatus() end
         function ui:GetState()
             local total = 0
             for _, entry in pairs(self.Controls) do if not entry.Native.Destroyed then total += 1 end end
-            return { Library = "Obsidianplus", URL = UI_URL, Tabs = names, Controls = total, Visible = self:IsVisible(), External = true }
+            return { Library = "Obsidianplus Bones", URL = UI_URL, Tabs = names, Controls = total, Visible = self:IsVisible(), External = true, Layout = window:GetResponsiveState() }
         end
         function ui:Destroy()
             if self.Destroyed then return end
@@ -10614,18 +10702,13 @@ local function adaptObsidian(library)
     return factory
 end
 
+
 local function fetchObsidian()
     local source = game:HttpGet(UI_URL, true)
-    local oldIconURL = "https://gitlab.com/upio/lucide-roblox-direct/-/raw/main/source.lua"
-    local mirrorURL = "https://raw.githubusercontent.com/notpoiu/lucide-roblox-direct/04f2bbae632268b1c165b4e477340b1566606958/source.lua"
-    local first, last = source:find(oldIconURL, 1, true)
-    if first then source = source:sub(1, first - 1) .. mirrorURL .. source:sub(last + 1) end
-    source = source:gsub("if not FetchIcons then", 'if not FetchIcons or type(Icons) ~= "table" or type(Icons.GetAsset) ~= "function" then', 1)
-    local chunk, err = loadstring(source, "Obsidianplus external library")
+    local chunk, err = loadstring(source, "Bones Obsidian external library")
     if not chunk then error(err) end
     return chunk()
 end
-
 
 local function loadUILibrary()
     local completed, result, failure = false, nil, nil
@@ -10669,7 +10752,7 @@ mountInterface = function(page)
         if interfaceConnection then interfaceConnection:Disconnect() interfaceConnection = nil end
         if UI then UI:Destroy() end
         Controls = {}
-UI = library.new({ AppVersion = SCRIPT_VERSION, InterfaceMotion = Config.InterfaceMotion })
+UI = library.new({ AppVersion = SCRIPT_VERSION, InterfaceMotion = Config.InterfaceMotion, RainbowBorder = Config.UIRainbowBorder })
 TabLayout.Install(UI)
 UI:SetSidebarUserStatus(false)
 UI:SetBootStep("Building macro controls", 0.18, "main page")
@@ -10781,6 +10864,21 @@ UI:AddToggle(11, "Interface Motion", Config.InterfaceMotion ~= false, function(v
     if type(UI.SetMotionEnabled) == "function" then UI:SetMotionEnabled(Config.InterfaceMotion) end
     saveConfig()
 end)
+UI:AddToggle(11, "Rainbow Border", Config.UIRainbowBorder ~= false, function(value)
+    Config.UIRainbowBorder = value == true
+    UI:SetRainbowBorder(Config.UIRainbowBorder)
+    saveConfig()
+end)
+UI:AddDivider(11, "Configuration")
+UI:AddAlert(11, "Saved Settings", "Settings save automatically on this device. Use Save Settings to write them now.", "info")
+UI:AddButtonRow(11, {{ Text = "Save Settings", Callback = function()
+    local focused = game:GetService("UserInputService"):GetFocusedTextBox()
+    if focused and UI.Root and focused:IsDescendantOf(UI.Root) then focused:ReleaseFocus(true) end
+    task.defer(function()
+        local saved = saveConfig()
+        if UI then UI:Notify(saved and "Settings saved on this device." or "Could not save settings. File access is unavailable.") end
+    end)
+end }})
 UI:AddDivider(11, "Performance")
 Controls.ScanInterval = UI:AddInputNumber(11, "Biome Scanner Interval (Seconds)", {
     Min = 0.15, Max = 5, Default = Config.BiomeScanInterval, Placeholder = "0.5",
@@ -10842,6 +10940,7 @@ end
 local API = {}
 function API.SetUIMode(mode) return setUIMode(mode) end
 function API.GetUIState() return UI and UI:GetState() end
+function API.SaveConfiguration() return saveConfig() end
 function API.Start() startMacro() end
 function API.Stop() stopMacro() end
 function API.TestBiome(biome) return sendBiome(normalizeBiome(biome) or "WINDY") end
