@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.82"
+local SCRIPT_VERSION = "3.83"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 local previousBank = game:GetService("CoreGui"):FindFirstChild("BonesHubBankBridge")
 if previousBank then
@@ -169,6 +169,7 @@ local DEFAULT_CONFIG = {
     AutoDailyQuests = false, AutoClaimDailyRewards = false, DailyObbySupports = true, DailyObby = false,
     AutoWeatherPotions = false, PotionBiomes = {}, WeatherPotions = {}, WeatherPotionAmounts = {},
     AutoEquipment = false, EquipmentRecipes = {}, AutoDeleteAuras = false, DeleteAuras = {},
+    CharacterRecoveryVersion = 0, DailyObbyVersion = 0, BankObservation = {},
     AutoReexecute = true, AutoFish = false, AutoSellFish = false, EarlyFishing = false,
     HideFishingResults = true, AutoPotionCraft = false, PotionRecipes = {}, MacroRunning = false,
     AutoBankUpgrade = false,
@@ -350,6 +351,7 @@ end
 
 local function saveConfig()
     if not Alive then return false end
+    if UI and not UI.Destroyed and type(UI.SyncToggleStates)=="function" then UI:SyncToggleStates() end
     if type(writefile) ~= "function" then return false end
     local ok, err = pcall(function()
         if type(isfolder) == "function" and type(makefolder) == "function" and not isfolder(CONFIG_DIR) then
@@ -781,6 +783,7 @@ buildMerchantCard = function(data)
 end
 
 local function updateStatus()
+    if UI and not UI.Destroyed and type(UI.SyncToggleStates)=="function" then UI:SyncToggleStates() end
     pcall(function()
         local observed = currentBiome()
         local online = State.Running and "online" or "offline"
@@ -11151,13 +11154,48 @@ local function adaptObsidian(library)
         function ui:AddDivider(page, title)
             pending[page] = title
         end
+        local toggleKeys = {
+            ["Auto Fish"]="AutoFish", ["Safe Early Finish"]="EarlyFishing",
+            ["Hide Catch Result"]="HideFishingResults", ["Auto Sell When Full"]="AutoSellFish",
+            ["Auto Drink in Selected Weather"]="AutoWeatherPotions", ["Auto Memory Match"]="AutoMemoryParty",
+            ["Auto Controllers"]="AutoWeatherControllers", ["Auto Eden"]="AutoEden",
+            ["Start Combat"]="HalloweenAutoFarm", ["Auto Farm Orbs"]="HalloweenAutoOrbs",
+            ["Auto Claim Bounty Hunt"]="HalloweenAutoBounty", ["Combat Reward Webhook"]="HalloweenCombatAlerts",
+            ["Boss Spawn Webhook"]="HalloweenBossAlerts", ["Monster ESP"]="HalloweenESP",
+            ["Combat HUD"]="HalloweenCombatHUD", ["Auto Dodge Attacks"]="HalloweenAutoDodge",
+            ["Auto Merchant"]="AutoMerchant", ["Auto Craft"]="AutoPotionCraft",
+            ["Auto Craft Equipment"]="AutoEquipment", ["Auto Upgrade Bank"]="AutoBankUpgrade",
+            ["Auto Daily Quests"]="AutoDailyQuests", ["Auto Claim Daily Rewards"]="AutoClaimDailyRewards",
+            ["Auto Basic Blessing Obby"]="DailyObby", ["Obby Step Supports"]="DailyObbySupports",
+            ["Aura Equip Alerts"]="AuraEnabled", ["Aura @everyone"]="AuraPing",
+            ["Auto Delete Excess Auras"]="AutoDeleteAuras", ["Memory Match Webhooks"]="MemoryPartyWebhooks",
+            ["Auto Execute After Rejoin"]="AutoReexecute", ["Anti-AFK"]="AntiAfk",
+            ["Interface Motion"]="InterfaceMotion", ["Rainbow Border"]="UIRainbowBorder",
+            ["Session Digest"]="SessionDigest",
+        }
+        function ui:SyncToggleStates()
+            if self.Destroyed then return end
+            for _, wrapped in pairs(self.Controls) do
+                local key, native = wrapped.ConfigKey, wrapped.Native
+                if key and native and not native.Destroyed and type(Config[key])=="boolean" and native.Value~=Config[key] then
+                    wrapped:Set(Config[key])
+                end
+            end
+        end
         function ui:AddToggle(page, text, default, callback, tooltip)
             local wrapped
             local native = interactive(page, text):AddToggle(id(page, text), {
                 Text = text, Default = default == true, Tooltip = tooltip,
-                Callback = function(value) if wrapped and not wrapped.Quiet and not ui.Destroyed and callback then callback(value) scheduleSave() end end,
+                Callback = function(value)
+                    if not wrapped or wrapped.Quiet or ui.Destroyed or not callback then return end
+                    local ok, failure = pcall(callback, value)
+                    ui:SyncToggleStates()
+                    if not ok then error(failure) end
+                    scheduleSave()
+                end,
             })
             wrapped = control(page, text, native)
+            wrapped.ConfigKey = toggleKeys[text]
             return wrapped
         end
         function ui:AddInput(page, text, placeholder, callback)
