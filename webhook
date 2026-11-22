@@ -16,8 +16,13 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.80"
+local SCRIPT_VERSION = "3.81"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
+local previousBank = game:GetService("CoreGui"):FindFirstChild("BonesHubBankBridge")
+if previousBank then
+    ENV.__BONES_BANK_OBSERVATION = { Job = game.JobId, User = LocalPlayer.UserId,
+        Level = previousBank:GetAttribute("ObservedLevel"), Costs = previousBank:GetAttribute("CostSnapshot") }
+end
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
 end
@@ -164,7 +169,7 @@ local DEFAULT_CONFIG = {
     AutoDailyQuests = false, AutoClaimDailyRewards = false, DailyObbySupports = true, DailyObby = false,
     AutoWeatherPotions = false, PotionBiomes = {}, WeatherPotions = {}, WeatherPotionAmounts = {},
     AutoEquipment = false, EquipmentRecipes = {}, AutoDeleteAuras = false, DeleteAuras = {},
-    AutoReexecute = false, AutoFish = false, AutoSellFish = false, EarlyFishing = false,
+    AutoReexecute = true, AutoFish = false, AutoSellFish = false, EarlyFishing = false,
     HideFishingResults = true, AutoPotionCraft = false, PotionRecipes = {}, MacroRunning = false,
     AutoBankUpgrade = false,
     AutoWeatherControllers = false,
@@ -1239,6 +1244,55 @@ local AuraNotifications = (function()
     return controller
 end)()
 
+local CharacterSession = (function()
+    local self = { Generation = 0, Resets = 0 }
+    local model, human, dead, died, childAdded
+    local callbacks = {}
+    local function invalidate()
+        if dead then return end
+        dead = true
+        self.Generation += 1 self.Resets += 1
+        for _, callback in ipairs(callbacks) do
+            local ok, failure = pcall(callback)
+            if not ok then warn("[bones hub] Character recovery: " .. tostring(failure)) end
+        end
+    end
+    local function bind(nextModel)
+        if model == nextModel then return end
+        if model then invalidate() end
+        if died then died:Disconnect() died = nil end
+        if childAdded then childAdded:Disconnect() childAdded = nil end
+        model, human, dead = nextModel, nil, nextModel == nil
+        local function bindHuman(child)
+            if human or not child:IsA("Humanoid") then return end
+            human = child
+            died = child.Died:Connect(invalidate)
+            if child.Health <= 0 then invalidate() end
+        end
+        if model then
+            childAdded = model.ChildAdded:Connect(bindHuman)
+            local found = model:FindFirstChildOfClass("Humanoid")
+            if found then bindHuman(found) end
+        end
+    end
+    function self.OnReset(callback) callbacks[#callbacks + 1] = callback end
+    function self.Ready()
+        return not dead and model == LocalPlayer.Character and model and model.Parent ~= nil
+            and human and human.Health > 0 and model:FindFirstChild("HumanoidRootPart") ~= nil
+    end
+    function self.Destroy()
+        if died then died:Disconnect() end
+        if childAdded then childAdded:Disconnect() end
+        table.clear(callbacks)
+    end
+    Connections[#Connections + 1] = LocalPlayer.CharacterAdded:Connect(bind)
+    Connections[#Connections + 1] = LocalPlayer.CharacterRemoving:Connect(function(old)
+        if old == model then invalidate() bind(nil) end
+    end)
+    bind(LocalPlayer.Character)
+    return self
+end)()
+
 local MovementCoordinator = (function()
     local controller = {}
     local owner, ticket, serial = nil, nil, 0
@@ -1256,6 +1310,16 @@ local MovementCoordinator = (function()
     local function note(message, level)
         if type(log) == "function" then pcall(log, message, level) end
     end
+    CharacterSession.OnReset(function()
+        serial += 1
+        owner, ticket, ownerSince, ownerPriority = nil, nil, 0, 0
+        table.clear(queue)
+        local fish = game:GetService("CoreGui"):FindFirstChild("BonesHubFishingBridge")
+        if fish then
+            fish:SetAttribute("CraftHold", false) fish:SetAttribute("YieldAfterCatch", false)
+            fish:SetAttribute("MovementGranted", false) fish:SetAttribute("Paused", true)
+        end
+    end)
     local function priority(name) return priorities[name] or 25 end
     local function hold(name) return minimumHold[name] or 1 end
     local function lifetime(name) return ttl[name] or 90 end
@@ -1305,6 +1369,7 @@ local MovementCoordinator = (function()
     end
 
     local function refresh()
+        if not CharacterSession.Ready() then return nil end
         if owner and clock() - ownerSince > lifetime(owner) then
             stats.Expired += 1
             note("Scheduler released " .. owner .. " after " .. tostring(math.floor(clock() - ownerSince)) .. "s", "WARN")
@@ -1744,64 +1809,83 @@ local Navigation = (function()
         state.Status = failure
         return false, failure
     end
-    function controller.PathWalk(destination, valid, radius)
-        local model,humanoid,root=character()
-        if not root then return false,"Character unavailable" end
-        if (root.Position-destination).Magnitude>1000 then
-            local portals=game:GetService("CollectionService"):GetTagged("StellaPortal")
-            local entry,exit,best
-            for _,portal in ipairs(portals) do
-                local position=portal:IsA("Model") and portal:GetPivot().Position or portal:IsA("BasePart") and portal.Position
-                if position then
-                    if (position-root.Position).Magnitude<1000 and (position-destination).Magnitude>1000 then
-                        local distance=(position-root.Position).Magnitude
-                        if not best or distance<best then entry,best=position,distance end
-                    end
-                    if (position-destination).Magnitude<1000 then exit=position end
-                end
+    -- These anchors were measured from the native StellaPortal models. Prefer streamed geometry.
+    local mainPortal = Vector3.new(530.875, 115, -210.1912)
+    local cavePortal = Vector3.new(-4627.0713, 150.068, -249.2637)
+    function controller.InStellaCave(position)
+        return (position-cavePortal).Magnitude < 1000
+    end
+    local function portalPoint(portal)
+        if portal:IsA("BasePart") then return portal.Position end
+        if portal:IsA("Model") then
+            for _, part in ipairs(portal:GetDescendants()) do
+                if part:IsA("BasePart") and part.CanTouch and part.Name ~= "SoundPart" then return part.Position end
             end
-            if not entry or not exit then
-                state.Status="Region portal unavailable; waiting for map streaming"
-                return false,state.Status
-            end
-            local streamed=false
-            task.spawn(function()
-                pcall(function() LocalPlayer:RequestStreamAroundAsync(entry,2) end)
-                streamed=true
-            end)
-            local streamUntil=os.clock()+2.5
-            while not streamed and Alive and valid() and os.clock()<streamUntil do task.wait(0.05) end
-            if not Alive or not valid() then return false,"Stopped" end
-            state.Status="Walking to region portal"
-            local reached,reason=pathWalk(entry,function()
-                return valid() and LocalPlayer.Character==model and humanoid.Health>0 and (root.Position-entry).Magnitude<1000
-            end,2)
-
-            if not valid() or LocalPlayer.Character~=model or humanoid.Health<=0 then return false,"Stopped or character changed" end
-            if (root.Position-exit).Magnitude>300 then
-                if not reached then return false,reason end
-                state.Status="Crossing region portal"
-                local deadline=os.clock()+6
-                while Alive and valid() and LocalPlayer.Character==model and humanoid.Health>0 and not root.Anchored
-                    and os.clock()<deadline and (root.Position-exit).Magnitude>300 do
-                    command(humanoid,entry)
-                    task.wait(0.2)
-                end
-                if not valid() or LocalPlayer.Character~=model or humanoid.Health<=0 then return false,"Stopped or character changed" end
-                if (root.Position-exit).Magnitude>300 then
-                    if not root.Anchored then command(humanoid,root.Position) end
-                    state.Status="Region portal did not activate; shortcut may be locked"
-                    return false,state.Status
-                end
-            end
-            state.RegionTransfers=(state.RegionTransfers or 0)+1
-            state.Status="Waiting for region transfer to settle"
-            local settleUntil=os.clock()+4
-            while Alive and valid() and LocalPlayer.Character==model and humanoid.Health>0 and root.Anchored and os.clock()<settleUntil do task.wait(0.05) end
-            if not Alive or not valid() or LocalPlayer.Character~=model or humanoid.Health<=0 then return false,"Stopped or character changed" end
-            if root.Anchored then return false,"Region transfer still holds character; retry after release" end
+            return portal:GetPivot().Position
         end
-        return pathWalk(destination,valid,radius)
+    end
+    function controller.PathWalk(destination, valid, radius)
+        local model, humanoid, root = character()
+        if not root then return false, "Character unavailable" end
+        local function active()
+            return Alive and valid() and LocalPlayer.Character == model and humanoid.Health > 0
+        end
+        if (root.Position-destination).Magnitude > 1000 then
+            local fromCave, toCave = controller.InStellaCave(root.Position), controller.InStellaCave(destination)
+            if fromCave == toCave then return false, "No supported portal between these regions" end
+            local entry, exit = fromCave and cavePortal or mainPortal, toCave and cavePortal or mainPortal
+            local function refreshPortals()
+                for _, portal in ipairs(game:GetService("CollectionService"):GetTagged("StellaPortal")) do
+                    local position = portalPoint(portal)
+                    if position then
+                        if controller.InStellaCave(position) then
+                            cavePortal = position
+                        elseif (position-mainPortal).Magnitude < 500 then mainPortal = position end
+                    end
+                end
+                entry, exit = fromCave and cavePortal or mainPortal, toCave and cavePortal or mainPortal
+            end
+            refreshPortals()
+            local streamed = false
+            task.spawn(function()
+                pcall(function() LocalPlayer:RequestStreamAroundAsync(entry, 4) end)
+                streamed = true
+            end)
+            local streamUntil = os.clock()+4.5
+            while active() and not streamed and os.clock()<streamUntil do task.wait(0.05) end
+            if not active() then return false, "Stopped or character changed" end
+            refreshPortals()
+            state.Status = "Walking to region portal"
+            local reached, reason = pathWalk(entry, function()
+                return active() and (root.Position-entry).Magnitude<1000
+            end, 1)
+            if not active() then return false, "Stopped or character changed" end
+            -- A portal may transfer the character while pathWalk is still following its old route.
+            if (root.Position-exit).Magnitude > 300 then
+                if not reached then return false, reason end
+                state.Status = "Crossing region portal"
+                local deadline = os.clock()+12
+                while active() and os.clock()<deadline and (root.Position-exit).Magnitude>300 do
+                    if not root.Anchored then command(humanoid, entry) end
+                    task.wait(0.1)
+                end
+                if not active() then return false, "Stopped or character changed" end
+                if (root.Position-exit).Magnitude > 300 then
+                    state.Status = "Region portal did not activate; shortcut may be locked"
+                    return false, state.Status
+                end
+            end
+            state.RegionTransfers = (state.RegionTransfers or 0)+1
+            state.Status = "Waiting for region transfer to settle"
+            local settleUntil = os.clock()+12
+            while active() and root.Anchored and os.clock()<settleUntil do task.wait(0.05) end
+            if not active() then return false, "Stopped or character changed" end
+            if root.Anchored then return false, "Waiting for server region release" end
+        end
+        return pathWalk(destination, active, radius)
+    end
+    function controller.ReturnToMainWorld(valid)
+        return controller.PathWalk(mainPortal+Vector3.new(-8,0,0), valid, 3)
     end
     local function bridgePoints()
         local map = workspace:FindFirstChild("Map")
@@ -1963,8 +2047,13 @@ local Potion = (function()
         if humanoid and humanoid.Health > 0 and root then return character, humanoid, root end
     end
 
+    CharacterSession.OnReset(function()
+        epoch += 1 nextAttempt, nextAddOnlyAt = 0, 0
+        movingHumanoid = nil
+        status, lastError = "Waiting for respawn", nil
+    end)
     local function active(token)
-        return alive and Alive and epoch == token and not MovementCoordinator.Wants("Merchant")
+        return alive and Alive and CharacterSession.Ready() and epoch == token and not MovementCoordinator.Wants("Merchant")
     end
 
     local function callRemote(remote, token, ...)
@@ -2122,7 +2211,8 @@ local Potion = (function()
             setStatus("Walking to cauldron")
             arrived, movementError = travel(target, token, 9)
         end
-        if not arrived then setStatus("Movement paused", movementError) nextAttempt = os.clock() + 90 return end
+        if not active(token) then return end
+        if not arrived then setStatus("Movement paused", movementError) nextAttempt = os.clock() + 5 return end
         local function make()
             for _ = 1, 40 do
             if not active(token) then return end
@@ -2203,7 +2293,8 @@ local Potion = (function()
                 if not target then setStatus("Cauldron unavailable") nextAttempt = os.clock() + 60 return end
                 setStatus("Loading native potion recipes")
                 local arrived, reason = travel(target, token, 9)
-                if not arrived then setStatus("Recipe discovery paused", reason) nextAttempt = os.clock() + 60 return end
+                if not active(token) then return end
+                if not arrived then setStatus("Recipe discovery paused", reason) nextAttempt = os.clock() + 5 return end
                 local auxiliary = game:GetService("CoreGui"):FindFirstChild("BonesHubAutomationBridge")
                 if auxiliary then auxiliary:SetAttribute("RefreshPotionCatalog", (auxiliary:GetAttribute("RefreshPotionCatalog") or 0) + 1) end
                 local prompt = workspace.Cauldron:FindFirstChildWhichIsA("ProximityPrompt", true)
@@ -2218,7 +2309,7 @@ local Potion = (function()
     end
 
     local function launch(force)
-        if busy or not alive then return false end
+        if busy or not alive or not CharacterSession.Ready() then return false end
         manualOnce = force == true
         local craftReady, addable = false, false
         for _, name in ipairs(workRecipes()) do
@@ -2255,20 +2346,20 @@ local Potion = (function()
             return false
         end
         busy, navigationOwner, operationEpoch = true, "Potion", epoch
-        local token = epoch
+        local token, operationTicket = epoch, movementTicket
         task.spawn(function()
             local worker = coroutine.running()
             operationThreads[worker] = token
             local ok, err = pcall(cycle, token)
             operationThreads[worker] = nil
             if not ok then setStatus("Crafting error", tostring(err)) nextAttempt = os.clock() + 30 end
-            MovementCoordinator.Release("Potion", movementTicket)
+            MovementCoordinator.Release("Potion", operationTicket)
             movementTicket, movingHumanoid, navigationOwner, busy, manualOnce = nil, nil, nil, false, false
             if priorityTable and previousPriority then priorityTable.Potion = previousPriority end
             local fishingBridge = game:GetService("CoreGui"):FindFirstChild("BonesHubFishingBridge")
             if fishingBridge and fishingBridge:GetAttribute("CraftHold") == true then fishingBridge:SetAttribute("CraftHold", false) end
             if not inFlight and bridge and bridge.Parent then bridge:SetAttribute("MutationPending", false) end
-            nextAttempt = math.max(nextAttempt, os.clock() + 0.5)
+            nextAttempt = token == epoch and math.max(nextAttempt, os.clock() + 0.5) or 0
         end)
         return true
     end
@@ -2405,8 +2496,13 @@ local Potion = (function()
     end
 
     function controller.Destroy()
-        controller.SetEnabled(false)
-        alive = false
+        alive, epoch = false, epoch + 1
+        MovementCoordinator.Cancel("Potion")
+        MovementCoordinator.Release("Potion", movementTicket)
+        if movingHumanoid and movingHumanoid.Parent then
+            local root = movingHumanoid.Parent:FindFirstChild("HumanoidRootPart")
+            if root then pcall(function() movingHumanoid:MoveTo(root.Position) end) end
+        end
         if bridge then bridge:SetAttribute("Active", false) bridge:Destroy() bridge = nil end
     end
 
@@ -2423,13 +2519,14 @@ local Potion = (function()
         bridge:SetAttribute("Recipe", recipeName)
         bridge:SetAttribute("RecipesNeeded", HttpService:JSONEncode(workRecipes()))
         bridge.Parent = core
-        local ok, err = pcall(runner, actor, [=[
+        local observerSource = [=[
             if setthreadidentity then setthreadidentity(8) end
             local rs = game:GetService("ReplicatedStorage")
             local player = game:GetService("Players").LocalPlayer
             local bridge = game:GetService("CoreGui"):FindFirstChild("BonesHubPotionBridge")
             if not bridge then return end
-            local function alive() if setthreadidentity then setthreadidentity(8) end return bridge.Parent ~= nil and bridge:GetAttribute("Active") == true end
+            local observerGeneration = bridge:GetAttribute("ObserverGeneration")
+            local function alive() if setthreadidentity then setthreadidentity(8) end return bridge.Parent ~= nil and bridge:GetAttribute("Active") == true and bridge:GetAttribute("ObserverGeneration") == observerGeneration end
             local replicaConnection, ingredientConnection
             local ok, err = pcall(function()
                 local replicaController = require(rs.ReplicaController)
@@ -2462,6 +2559,7 @@ local Potion = (function()
                 end
                 local catalogText
                 while alive() do
+                    bridge:SetAttribute("Heartbeat", workspace:GetServerTimeNow())
                     if setthreadidentity then setthreadidentity(8) end
                     local resetSequence = bridge:GetAttribute("ResetSequence") or 0
                     if resetSequence ~= resetApplied then
@@ -2588,8 +2686,36 @@ local Potion = (function()
             if replicaConnection then replicaConnection:Disconnect() end
             if ingredientConnection then ingredientConnection:Disconnect() end
             if not ok and alive() then bridge:SetAttribute("Error", tostring(err)) end
-        ]=])
-        if not ok and bridge then bridge:SetAttribute("Error", tostring(err)) end
+            if bridge.Parent and bridge:GetAttribute("ObserverGeneration") == observerGeneration then bridge:SetAttribute("Stopped", true) end
+        ]=]
+        local nextBoot, started, launch, stopping = 0, 0, nil, false
+        while alive and Alive do
+            if not launch and os.clock() >= nextBoot then
+                actor = game:GetService("ReplicatedFirst"):FindFirstChild("ClientHandlers")
+                if actor then
+                    bridge:SetAttribute("ObserverGeneration", (bridge:GetAttribute("ObserverGeneration") or 0)+1)
+                    bridge:SetAttribute("Active", true) bridge:SetAttribute("Stopped", false)
+                    bridge:SetAttribute("Heartbeat", workspace:GetServerTimeNow())
+                    started = os.clock()
+                    launch = task.spawn(function()
+                        local ok, err = pcall(runner, actor, observerSource)
+                        if not ok and bridge and bridge.Parent then
+                            bridge:SetAttribute("Error", tostring(err)) bridge:SetAttribute("Stopped", true)
+                        end
+                    end)
+                end
+            elseif launch then
+                local stale = workspace:GetServerTimeNow() - (bridge:GetAttribute("Heartbeat") or 0) > 8
+                if not stopping and (bridge:GetAttribute("Stopped") == true or stale and os.clock()-started > 12) then
+                    bridge:SetAttribute("Active", false) stopping = true nextBoot = os.clock()+2
+                end
+                if stopping and os.clock() >= nextBoot then
+                    pcall(task.cancel, launch) launch, stopping = nil, false
+                    bridge:SetAttribute("ObserverRestarts", (bridge:GetAttribute("ObserverRestarts") or 0)+1)
+                end
+            end
+            task.wait(0.5)
+        end
     end)
 
     task.spawn(function()
@@ -2681,9 +2807,20 @@ local function recordCosts(level, ingredients)
     end
     table.sort(nextCosts, function(a, b) return a.Id < b.Id end)
     costs, costLevel = nextCosts, level
+    attribute("CostSnapshot", http:JSONEncode({ Level = level, Costs = nextCosts }))
 end
 local function discoverCosts(level, data)
     if costLevel == level and costs and #costs > 0 then return end
+    local saved = bridge:GetAttribute("CostSnapshot")
+    if type(saved) == "string" then
+        local ok, value = pcall(http.JSONDecode, http, saved)
+        if ok and type(value) == "table" and value.Level == level and type(value.Costs) == "table" then
+            local ingredients = {}
+            for _, item in ipairs(value.Costs) do ingredients[#ingredients+1] = { id=item.Id, amount=item.Required } end
+            recordCosts(level, ingredients)
+            if costLevel == level and costs and #costs > 0 then return end
+        end
+    end
     costs, costLevel = nil, nil
     local button = data.BankEnabled == false and store.repair_button or store.upgrade_button
     local callback = button and button.Callback
@@ -2706,8 +2843,36 @@ local function discoverCosts(level, data)
         end
     end
 end
+local function nativeStore(folder)
+    local getter = (debug and debug.getupvalues) or getupvalues
+    if type(getconnections) ~= "function" or type(getter) ~= "function" then return {} end
+    for _, name in ipairs({ "BankInitialized", "BankUpgraded" }) do
+        local event = folder:FindFirstChild(name)
+        if event then
+            local ok, connections = pcall(getconnections, event.OnClientEvent)
+            if ok then
+                for _, connection in ipairs(connections) do
+                    local callback = connection.Function
+                    if type(callback) == "function" then
+                        local success, values = pcall(getter, callback)
+                        if success then
+                            for _, value in pairs(values) do
+                                local candidate = type(value) == "table" and rawget(value, "store")
+                                if type(candidate) == "table" then return candidate end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return {}
+end
 local function initialize()
-    if rc and store and remote and remote.Parent and bankRemote.Parent == rs:FindFirstChild("Remote") then return true end
+    if rc and store and remote and remote.Parent and bankRemote.Parent == rs:FindFirstChild("Remote") then
+        if os.clock() >= nextDiscovery then nextDiscovery = os.clock()+3 store = nativeStore(bankRemote) end
+        return true
+    end
     if os.clock() < nextDiscovery then return false end
     nextDiscovery = os.clock() + 3
     local folder = rs:FindFirstChild("Remote")
@@ -2717,17 +2882,9 @@ local function initialize()
         status("Waiting for UpgradeBank remote")
         return false
     end
-    local ok, result = pcall(function()
-        return {
-            Replica = require(rs.ReplicaController),
-            Store = require(rs.Modules.UI.BankUI).store,
-        }
-    end)
-    if not active() then return false end
-    if not ok then status("Waiting for native bank data", tostring(result)) return false end
     for _, connection in ipairs(connections) do connection:Disconnect() end
     table.clear(connections)
-    rc, store, remote, bankRemote = result.Replica, result.Store, upgrade, folder
+    store, remote, bankRemote = nativeStore(folder), upgrade, folder
     costs, costLevel = nil, nil
     for _, name in ipairs({ "BankInitialized", "BankUpgraded" }) do
         local event = folder:FindFirstChild(name)
@@ -2739,6 +2896,10 @@ local function initialize()
             end)
         end
     end
+    local ok, result = pcall(require, rs.ReplicaController)
+    if not active() then return false end
+    if not ok then status("Waiting for native bank data", tostring(result)) return false end
+    rc = result
     return true
 end
 local function snapshot()
@@ -2752,15 +2913,19 @@ local function snapshot()
         status("Waiting for player bank replica")
         return
     end
-    local level = store.level
-    if not finite(level) or level % 1 ~= 0 or level < 0 or level > 7
-        or (data.BankEnabled and level == 0)
-        or (not data.BankEnabled and level ~= 0) then
-        attribute("DataReady", false)
-        status("Waiting for bank initialization")
-        return
+    local level = bridge:GetAttribute("ObservedLevel")
+    local source = "Server event"
+    if not finite(level) and bridge:GetAttribute("CachedBankCapacity") == data.BankCapacity
+        and bridge:GetAttribute("CachedBankEnabled") == data.BankEnabled then
+        level, source = bridge:GetAttribute("CachedBankLevel"), "Saved server observation"
     end
-    discoverCosts(level, data)
+    if not finite(level) then level, source = store.level, "Native UI" end
+    if not data.BankEnabled then level, source = 0, "Player replica" end
+    if not finite(level) or level % 1 ~= 0 or level < 0 or level > 7 or data.BankEnabled and level == 0 then
+        level, source = nil, "Waiting for server level"
+    end
+    if level then discoverCosts(level, data) end
+    attribute("LevelSource", source)
     local missing, materialSummary, signature = {}, {}, { tostring(level), tostring(data.BankEnabled) }
     local known = costLevel == level and costs ~= nil and #costs > 0
     if known then
@@ -2791,6 +2956,7 @@ local function snapshot()
     }
 end
 local function eligible(data)
+    if not finite(data.Level) then return false, "Bank detected; waiting for server level" end
     if data.Level >= 7 then return false, "Bank is already max level" end
     if not data.Known then return false, "Waiting for native upgrade costs" end
     if #data.Missing > 0 then
@@ -2805,7 +2971,7 @@ local function eligible(data)
     return true
 end
 local function confirmed(before, data)
-    return data.Level > before.Level or data.Capacity > before.Capacity
+    return finite(data.Level) and finite(before.Level) and data.Level > before.Level or data.Capacity > before.Capacity
         or (not before.Enabled and data.Enabled)
 end
 local function finish(success, message, timeout)
@@ -2916,6 +3082,8 @@ for _, connection in ipairs(connections) do pcall(function() connection:Disconne
             Running = bridge and bridge:GetAttribute("Running") == true,
             DataReady = bridge and bridge:GetAttribute("DataReady") == true,
             Level = bridge and bridge:GetAttribute("Level"),
+            LevelSource = bridge and bridge:GetAttribute("LevelSource"),
+            CostsKnown = bridge and bridge:GetAttribute("CostsKnown") == true,
             Balance = bridge and bridge:GetAttribute("Balance"),
             Capacity = bridge and bridge:GetAttribute("Capacity"),
             Materials = bridge and bridge:GetAttribute("Materials"),
@@ -2942,12 +3110,23 @@ for _, connection in ipairs(connections) do pcall(function() connection:Disconne
     task.spawn(function()
         local core = game:GetService("CoreGui")
         local old = core:FindFirstChild("BonesHubBankBridge")
+        local observed, observedCosts = old and old:GetAttribute("ObservedLevel"), old and old:GetAttribute("CostSnapshot")
         if old then old:SetAttribute("Active", false) old:Destroy() end
         if not living or not Alive then return end
         bridge = Instance.new("Folder")
         bridge.Name = "BonesHubBankBridge"
         bridge:SetAttribute("Active", true)
         bridge:SetAttribute("Enabled", enabled)
+        local seed = ENV.__BONES_BANK_OBSERVATION
+        if type(seed) == "table" and seed.Job == game.JobId and seed.User == LocalPlayer.UserId then
+            observed, observedCosts = observed or seed.Level, observedCosts or seed.Costs
+        end
+        local saved = Config.BankObservation
+        if type(saved) == "table" and saved.User == LocalPlayer.UserId and saved.PlaceVersion == game.PlaceVersion then
+            bridge:SetAttribute("CachedBankCapacity", saved.Capacity) bridge:SetAttribute("CachedBankEnabled", saved.Enabled)
+            bridge:SetAttribute("CachedBankLevel", saved.Level) observedCosts = observedCosts or saved.Costs
+        end
+        bridge:SetAttribute("ObservedLevel", observed) bridge:SetAttribute("CostSnapshot", observedCosts)
         bridge.Parent = core
         local actor = game:GetService("ReplicatedFirst"):FindFirstChild("ClientHandlers")
         local runner = ENV.run_on_actor or run_on_actor
@@ -2962,7 +3141,18 @@ for _, connection in ipairs(connections) do pcall(function() connection:Disconne
         end
     end)
     task.spawn(function()
+        local observationText
         while living and Alive do
+            if bridge and bridge.Parent and bridge:GetAttribute("DataReady") == true then
+                local level, source = bridge:GetAttribute("Level"), bridge:GetAttribute("LevelSource")
+                if type(level) == "number" and (source == "Server event" or source == "Saved server observation") then
+                    local saved = { User=LocalPlayer.UserId, PlaceVersion=game.PlaceVersion,
+                        Level=level, Capacity=bridge:GetAttribute("Capacity"), Enabled=bridge:GetAttribute("BankEnabled"),
+                        Costs=bridge:GetAttribute("CostSnapshot") }
+                    local text = HttpService:JSONEncode(saved)
+                    if text ~= observationText then observationText=text Config.BankObservation=saved saveConfig() end
+                end
+            end
             if rows then
                 local data = controller.GetState()
                 local values = {
@@ -4441,10 +4631,17 @@ function API.Destroy()
     if ENV.AutoEden == API then ENV.AutoEden = nil end
 end
 
+CharacterSession.OnReset(function()
+    epoch += 1 stopMovement() target, distance = nil, nil
+end)
 ENV.AutoEden = API
 task.spawn(function()
     local lastAttempt, completed = -math.huge, nil
+    local observedGeneration = CharacterSession.Generation
     while running do
+        if observedGeneration ~= CharacterSession.Generation then
+            observedGeneration = CharacterSession.Generation lastAttempt, completed = -math.huge, nil
+        end
         local ok, err = pcall(function()
             ensureSupports()
             if not enabled then return end
@@ -4897,6 +5094,10 @@ end)()
         return ok, err
     end
 
+    CharacterSession.OnReset(function()
+        cancel() nextAttempt = 0 table.clear(blocked)
+        navigation, movingHumanoid = false, nil
+    end)
     local function releaseMovement()
         pause(true)
         attribute("MovementGranted", false)
@@ -6908,14 +7109,20 @@ if not ok then attribute("Error", tostring(err)) end
         end
         return pathWalk(destination, valid, radius)
     end
+    CharacterSession.OnReset(function()
+        generation += 1 dailyGeneration += 1 dailyNext, equipmentNext = 0, 0
+        stop() clearSupports(true)
+    end)
     local function beginNavigation(owner, valid, callback)
+        if not CharacterSession.Ready() then return false end
         if navBusy then return false end
         local ticket = MovementCoordinator.Acquire(owner)
         if not ticket then return false end
         navBusy, navOwner, navTicket = true, owner, ticket
+        local characterGeneration = CharacterSession.Generation
         task.spawn(function()
             local ok, reason = pcall(callback, function()
-                return living and Alive and valid() and MovementCoordinator.IsOwner(owner, ticket) and not MovementCoordinator.Wants("Merchant")
+                return living and Alive and CharacterSession.Ready() and characterGeneration == CharacterSession.Generation and valid() and MovementCoordinator.IsOwner(owner, ticket) and not MovementCoordinator.Wants("Merchant")
             end)
             if not ok then
                 if owner == "Equipment" then equipmentStatus = tostring(reason) else dailyStatus = tostring(reason) end
@@ -7596,6 +7803,9 @@ local MerchantAutomation = (function()
         end
         return false
     end
+    CharacterSession.OnReset(function()
+        generation += 1
+    end)
     local function visit(id, merchant, group, products, token)
         visitStartedAt = os.clock()
         local deadline = os.clock() + 100
@@ -8275,7 +8485,11 @@ local HalloweenRules = (function()
         local hp = rules.Health(model)
         if hp and hp <= 0 then return false end
         if rules.IsOrb(model) then return model:GetAttribute("isLocked") ~= true end
-        return model.Parent == folder and type(model:GetAttribute("agentId")) == "number"
+        if not model:IsDescendantOf(workspace) then return false end
+        local agent = model:GetAttribute("agentId")
+        local identified = type(agent) == "number" or type(agent) == "string" and agent ~= ""
+        return identified and folder ~= nil and model:IsDescendantOf(folder)
+            or model.HasTag and model:HasTag("orbMinion") == true
     end
     function rules.Owned(data, enabled)
         local out, seen = {}, {}
@@ -9113,7 +9327,11 @@ local HalloweenRules = (function()
         local hp = rules.Health(model)
         if hp and hp <= 0 then return false end
         if rules.IsOrb(model) then return model:GetAttribute("isLocked") ~= true end
-        return model.Parent == folder and type(model:GetAttribute("agentId")) == "number"
+        if not model:IsDescendantOf(workspace) then return false end
+        local agent = model:GetAttribute("agentId")
+        local identified = type(agent) == "number" or type(agent) == "string" and agent ~= ""
+        return identified and folder ~= nil and model:IsDescendantOf(folder)
+            or model.HasTag and model:HasTag("orbMinion") == true
     end
     function rules.Owned(data, enabled)
         local out, seen = {}, {}
@@ -9538,7 +9756,7 @@ local ok, failure = pcall(function()
         local holder = bridge:FindFirstChild("Target")
         local target = holder and holder.Value
         local folder = workspace:FindFirstChild("NPCs")
-        if folder then for _, model in ipairs(folder:GetChildren()) do if model:IsA("Model") then watch(model) end end end
+        if folder then for _, model in ipairs(folder:GetDescendants()) do if model:IsA("Model") and HalloweenRules.Attackable(model,folder) then watch(model) end end end
         for model, at in pairs(pendingDeaths) do if now >= at then observe(model) pendingDeaths[model] = nil end end
         for model, connection in pairs(deathConnections) do if not model.Parent then connection:Disconnect() deathConnections[model] = nil end end
         combatLog.Sample(d,rewardBusy())
@@ -9867,8 +10085,8 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Casting", false)
         for _, model in ipairs(old) do remove(model) end
         npcFolder = folder
         if folder then
-            npcAdded = folder.ChildAdded:Connect(add) npcRemoved = folder.ChildRemoved:Connect(remove)
-            for _, model in ipairs(folder:GetChildren()) do add(model) end
+            npcAdded = folder.DescendantAdded:Connect(add) npcRemoved = folder.DescendantRemoving:Connect(function(item) if records[item] then remove(item) end end)
+            for _, model in ipairs(folder:GetDescendants()) do add(model) end
         end
     end
     local function trackTag(tag, index)
@@ -9897,6 +10115,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Casting", false)
         return out
     end
     local function choose(root)
+        for _, minion in ipairs(collection:GetTagged("orbMinion")) do if minion:IsA("Model") then add(minion) end end
         for _, orb in ipairs(collection:GetTagged("orb")) do if orb:IsA("Model") then orbs[orb]=true add(orb) end end
         for orb in pairs(orbs) do
             if not orb.Parent or not HalloweenRules.IsOrb(orb) then orbs[orb]=nil remove(orb) end
@@ -10114,6 +10333,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Casting", false)
         if npcAdded then npcAdded:Disconnect() end if npcRemoved then npcRemoved:Disconnect() end
         for _, connection in ipairs(connections) do connection:Disconnect() end
     end
+    local returning, returnAt = false, 0
     local function step()
         local now = workspace:GetServerTimeNow()
         local elapsed=math.clamp(os.clock()-lastStepAt,0,0.25) lastStepAt=os.clock()
@@ -10185,6 +10405,33 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Casting", false)
         attribute("DemandUpdatedAt", now)
         if MovementCoordinator.Wants("Merchant") or MovementCoordinator.GetState().Owner=="Merchant" then
             release() status="Yielding to merchant" return
+        end
+        if enabled() and root and Navigation.InStellaCave(root.Position) and not target then
+            attribute("Permit", false)
+            local owner = MovementCoordinator.GetState().Owner
+            if owner and owner ~= "Halloween" then status = "Waiting for cave task" return end
+            if returning then status = "Returning from Stella cave" return end
+            if os.clock() >= returnAt then
+                lease = lease or MovementCoordinator.AcquirePriority("Halloween")
+                if lease and MovementCoordinator.IsOwner("Halloween", lease) then
+                    returning = true
+                    local token, travelLease, travelModel = epoch, lease, model
+                    task.spawn(function()
+                        local ok, arrived, reason = pcall(Navigation.ReturnToMainWorld, function()
+                            return valid(token) and LocalPlayer.Character == travelModel and humanoid.Health > 0
+                                and MovementCoordinator.IsOwner("Halloween", travelLease) and not MovementCoordinator.Wants("Merchant")
+                        end)
+                        returning = false returnAt = os.clock() + 5 nextChoice = 0
+                        if valid(token) then
+                            status = ok and arrived and "Returned to main world" or "Cave return paused"
+                            if ok then errorText = reason else errorText = tostring(arrived) end
+                        end
+                        MovementCoordinator.Release("Halloween", travelLease)
+                        if lease == travelLease then lease = nil end
+                    end)
+                end
+            end
+            return
         end
         if not enabled() or not target or not targetRoot or not targetRoot.Parent or not root then
             if not (pending and lease) and (lease or MovementCoordinator.Wants("Halloween")) then release() end
@@ -10672,6 +10919,9 @@ if not ok then warn("[bones hub] Rejoin execution failed: " .. tostring(failure)
         UI:AddToggle(page, "Auto Execute After Rejoin", Config.AutoReexecute, controller.SetEnabled)
     end
     function controller.Start()
+        if Config.CharacterRecoveryVersion ~= 1 then
+            Config.CharacterRecoveryVersion = 1 Config.AutoReexecute = true saveConfig()
+        end
         prepare()
         pcall(function()
             local gui = game:GetService("GuiService")
@@ -11204,6 +11454,7 @@ end
 Config.UIMode = "Obsidian"
 local mountedInterface, interfaceFailure = mountInterface()
 if not mountedInterface then
+    CharacterSession.Destroy()
     ScriptCompatibility.Destroy()
     AuraNotifications.Destroy()
     BankAutomation.Destroy()
@@ -11251,6 +11502,7 @@ function API.GetSessionFeed() return { Stats = SessionFeed.Stats(), Uptime = Ses
 function API.SendSessionDigest() return sendDigest() end
 function API.SetAutoReexecute(value) return Reexecution.SetEnabled(value) end
 function API.GetReexecutionState() return Reexecution.GetState() end
+function API.GetCharacterRecoveryState() return { Ready = CharacterSession.Ready() == true, Generation = CharacterSession.Generation, Resets = CharacterSession.Resets } end
 function API.GetAutomationState() return Automation.GetState() end
 function API.RunBasicBlessingObby() return Automation.RunObbyOnce() end
 function API.OpenJakeWorkshop() return Automation.OpenJake() end
@@ -11319,6 +11571,7 @@ function API.Destroy()
     if not Alive then return end
     saveConfig()
     Alive = false
+    CharacterSession.Destroy()
     ScriptCompatibility.Destroy()
     AuraNotifications.Destroy()
     BankAutomation.Destroy()
