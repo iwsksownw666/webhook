@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.81"
+local SCRIPT_VERSION = "3.82"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 local previousBank = game:GetService("CoreGui"):FindFirstChild("BonesHubBankBridge")
 if previousBank then
@@ -5324,6 +5324,8 @@ end)()
             SavedSeconds = current.SavedSeconds, FinishStatus = current.FinishStatus,
             LastRewardLead = current.LastRewardLead, LastRestartDelay = bridge and bridge:GetAttribute("LastRestartDelay"),
             SuppressedResults = current.SuppressedResults,
+            TrashNotified = bridge and bridge:GetAttribute("TrashNotified") or 0,
+            LastTrashNotice = bridge and bridge:GetAttribute("LastTrashNotice"),
             DataReady = next(current) ~= nil, SaleReady = bridge and bridge:GetAttribute("SaleReady") == true,
             Phase = bridge and bridge:GetAttribute("Phase"),
             OperationUpdatedAt = bridge and bridge:GetAttribute("OperationUpdatedAt"),
@@ -5483,11 +5485,56 @@ local function data()
     end
 end
 
+local trashNotices, trashSeen, trashOrder, trashSequence = {}, {}, {}, 0
+local trashCoinBalance, trashCoinChanges = nil, {}
+local function sampleTrashCoins(current)
+    local coins = current and current.Coins
+    if type(coins) ~= "number" or coins ~= coins or coins < 0 or coins == math.huge then return end
+    local now = os.clock()
+    if trashCoinBalance and coins > trashCoinBalance then
+        trashCoinChanges[#trashCoinChanges+1] = { At=now, Amount=coins-trashCoinBalance }
+    end
+    trashCoinBalance = coins
+    while trashCoinChanges[1] and (now-trashCoinChanges[1].At>3 or #trashCoinChanges>16) do table.remove(trashCoinChanges,1) end
+end
+local function queueTrashNotice(value)
+    if not alive() or type(value) ~= "table" or value.rewardType ~= "Trash" then return end
+    local info = type(value.rewardInfo) == "table" and value.rewardInfo or nil
+    local uid = info and info.uid
+    if type(uid) == "string" and uid ~= "" then
+        if trashSeen[uid] then return end
+        trashSeen[uid] = true trashOrder[#trashOrder+1] = uid
+        if #trashOrder > 64 then trashSeen[table.remove(trashOrder,1)] = nil end
+    end
+    trashSequence += 1
+    local received = os.clock()
+    local notice = { Sequence=trashSequence, Name=info and type(info.id)=="string" and info.id:gsub("<.->", "") or nil }
+    task.spawn(function()
+        local deadline = received+2
+        repeat
+            sampleTrashCoins(data())
+            for _, change in ipairs(trashCoinChanges) do
+                if not change.Claimed and change.At >= received-0.5 then
+                    notice.Coins = change.Amount change.Claimed = true break
+                end
+            end
+            if notice.Coins or not alive() or os.clock()>=deadline then break end
+            task.wait(0.05)
+        until false
+        if not alive() then return end
+        trashNotices[#trashNotices+1] = notice
+        table.sort(trashNotices,function(a,b) return a.Sequence<b.Sequence end)
+        while #trashNotices>16 do table.remove(trashNotices,1) end
+        bridge:SetAttribute("TrashNotices",http:JSONEncode(trashNotices))
+    end)
+end
+
 local telemetryRunning = true
 task.spawn(function()
     while telemetryRunning and bridge.Parent and (alive() or ownedFishing) do
         local success, failure = pcall(function()
             local current = data()
+            sampleTrashCoins(current)
             bridge:SetAttribute("DataReady", current ~= nil)
             if not current then return end
             local amount = 0
@@ -5579,6 +5626,7 @@ listen(packets.playGame, function(params)
     session.waitUntil = os.clock() + 90
 end)
 listen(packets.reward, function(value, receivedAt)
+    queueTrashNotice(value)
     if not ownedFishing or not session or type(value) ~= "table" then return end
     local received = type(receivedAt) == "number" and receivedAt or workspace:GetServerTimeNow()
     FinishPolicy.Reward(session, received, type(value.rewardInfo) == "table")
@@ -5932,9 +5980,35 @@ end
         end
     end)
 
+    local lastTrashNotice = 0
+    local function showTrashNotices()
+        if not UI or UI.Destroyed or not bridge or not bridge.Parent then return end
+        local encoded = bridge:GetAttribute("TrashNotices")
+        if type(encoded) ~= "string" then return end
+        local ok, entries = pcall(HttpService.JSONDecode, HttpService, encoded)
+        if not ok or type(entries) ~= "table" then return end
+        for _, entry in ipairs(entries) do
+            if type(entry) == "table" and type(entry.Sequence) == "number" and entry.Sequence > lastTrashNotice then
+                local message = "Trash caught!"
+                if type(entry.Name) == "string" and entry.Name ~= "" then message = message .. " " .. entry.Name end
+                if type(entry.Coins) == "number" and entry.Coins == entry.Coins and entry.Coins >= 0 and entry.Coins < math.huge then
+                    message = message .. " | +" .. string.format("%.0f", entry.Coins) .. " coins"
+                else
+                    message = message .. " | Coin reward not confirmed"
+                end
+                local sent = pcall(UI.Notify, UI, message)
+                if not sent then return end
+                lastTrashNotice = entry.Sequence
+                bridge:SetAttribute("TrashNotified", lastTrashNotice)
+                bridge:SetAttribute("LastTrashNotice", message)
+            end
+        end
+    end
+
     task.spawn(function()
         local refreshAt, lastCount, lastCapacity, lastCoins = 0, nil, nil, nil
         while living and Alive do
+            pcall(showTrashNotices)
             if navigation and target and target:GetAttribute("occupied") then cancel() end
             if os.clock() >= refreshAt then
                 refreshAt = os.clock() + 2
