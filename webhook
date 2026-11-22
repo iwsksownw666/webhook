@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.78"
+local SCRIPT_VERSION = "3.79"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -121,7 +121,7 @@ end
 local CONFIG_DIR = "BiomeMacroConfigs"
 local CONFIG_FILE = CONFIG_DIR .. "/BonesHub_" .. tostring(LocalPlayer.UserId) .. ".json"
 local LEGACY_CONFIG_FILE = CONFIG_DIR .. "/Config_" .. tostring(LocalPlayer.UserId) .. ".json"
-local UI_URL = "https://raw.githubusercontent.com/iwsksownw666/webhook/main/ui/BonesObsidian-3.78.lua"
+local UI_URL = "https://raw.githubusercontent.com/iwsksownw666/webhook/main/ui/BonesObsidian-3.79.lua"
 local BIOME_ICON_IDS = {
     WINDY = 138169499467564, HELL = 89721298978404, CORRUPTION = 137622939436355,
     SNOWY = 109912975653138, RAINY = 137992545432987, NULL = 120277135407020,
@@ -376,6 +376,11 @@ local function loadConfig()
     end
 end
 loadConfig()
+-- Earlier releases had no UI for DailyObby; enable it once for existing configurations.
+if Config.DailyObbyVersion ~= 1 then
+    Config.DailyObby, Config.DailyObbyVersion = true, 1
+    saveConfig()
+end
 if Config.InterfaceStyleVersion ~= 5 or Config.UIMode ~= "Obsidian" then
     Config.UIMode, Config.InterfaceStyleVersion = "Obsidian", 5
     saveConfig()
@@ -5750,9 +5755,286 @@ end
     return controller
 end)()
 
+local ObbyRoute = {}
+ObbyRoute.Anchors = {
+    Vector3.new(112,92.5,-528.5), Vector3.new(171.5,96,-523.5),
+    Vector3.new(195.5,90.5,-570), Vector3.new(202.09,87,-599.79),
+    Vector3.new(208.5,95,-615.5), Vector3.new(208.5,98,-627.5),
+    Vector3.new(209.5,98,-650.5), Vector3.new(205,101,-655), Vector3.new(191,98,-659.5),
+    Vector3.new(170.5,97,-681.5), Vector3.new(158,97,-681),
+    Vector3.new(130.5,95,-675), Vector3.new(130.5,95,-681), Vector3.new(126,99,-684),
+    Vector3.new(120,99,-684), Vector3.new(112,105,-668),
+    Vector3.new(104,105,-657.5),
+    Vector3.new(69,102,-646.5), Vector3.new(58.5,112,-635),
+    Vector3.new(50.5,119,-634.5), Vector3.new(41,125,-636), Vector3.new(46,125,-622),
+    Vector3.new(49.5,128,-618.5),
+}
+local function flat(v) return Vector3.new(v.X,0,v.Z) end
+local function clearance(model,human,root)
+    local height=human.HipHeight+root.Size.Y/2
+    if human.HipHeight==0 then
+        local leg=model:FindFirstChild("Left Leg")
+        height+=leg and leg.Size.Y or 2
+    end
+    return height
+end
+function ObbyRoute.Create(context)
+    local self={Parts={},Statistics={Steps=0,Supports=0,MaxPartLength=0,Pullbacks=0,Jumps=0,FlatJumps=0,Commands=0,MovingSeconds=0,IdleSeconds=0},Cancelled=false}
+    local folder,characterAt
+    local function active()
+        return not self.Cancelled and context.Valid() and (not characterAt or context.Character()==characterAt)
+    end
+    local function geometry()
+        local map=workspace:FindFirstChild("Map")
+        if not map then return end
+        local include={}
+        for _,name in ipairs({"Ground","grass","leafygrass","temple"}) do
+            local group=map:FindFirstChild(name)
+            if group then include[#include+1]=group end
+        end
+        if #include==0 then return end
+        local ray=RaycastParams.new()
+        ray.FilterType=Enum.RaycastFilterType.Include
+        ray.FilterDescendantsInstances=include
+        ray.RespectCanCollide=true
+        return ray
+    end
+    local function surface(point,ray)
+        -- Cast from above the whole course. Starting inside a tall pillar misses its top.
+        local hit=workspace:Raycast(Vector3.new(point.X,160,point.Z),Vector3.new(0,-90,0),ray)
+        if hit and hit.Normal.Y>=0.65 and hit.Position.Y>=point.Y-8 then return hit.Position end
+    end
+    local function notify(status,stage,step)
+        if context.Status then context.Status(status,stage,step,self.Statistics) end
+    end
+    local function addPad(from,point)
+        if not folder then
+            folder=Instance.new("Folder") folder.Name="BonesHubDailyObbySupports" folder.Parent=workspace
+            self.Folder=folder
+        end
+        local p=Instance.new("Part")
+        p.Name="LocalStep" p.Anchored=true p.CanCollide=true p.CanTouch=false p.CanQuery=true
+        p.Material=Enum.Material.SmoothPlastic p.Color=Color3.fromRGB(180,145,70) p.Transparency=.45
+        if context.TestOnly then
+            local ok=pcall(function() p.CollisionGroup="BonesObbyLocalTest" end)
+            if not ok then p:Destroy() return nil end
+        end
+        local center=from:Lerp(point,.5)
+        local distance=(point-from).Magnitude
+        p.Size=Vector3.new(5,.6,math.min(4.5,distance+1))
+        local frame=CFrame.lookAt(center,point)
+        p.CFrame=frame-frame.UpVector*.3
+        p.Parent=folder
+        self.Parts[#self.Parts+1]=p
+        self.Statistics.Supports+=1 self.Statistics.MaxPartLength=math.max(self.Statistics.MaxPartLength,p.Size.Z)
+        return p
+    end
+    local function prune(root)
+        -- Keep nearby footing until the player is safely beyond it.
+        for i=#self.Parts,1,-1 do
+            local part=self.Parts[i]
+            if not part.Parent then table.remove(self.Parts,i)
+            elseif flat(part.Position-root.Position).Magnitude>14 then part:Destroy() table.remove(self.Parts,i) end
+        end
+    end
+    function self:Clear(force)
+        if not folder then return true end
+        local model,human,root=context.Character()
+        if root then
+            local ray=RaycastParams.new() ray.FilterType=Enum.RaycastFilterType.Exclude
+            ray.FilterDescendantsInstances={model,folder} ray.RespectCanCollide=true
+            local h=clearance(model,human,root)
+            local hit=workspace:Raycast(root.Position,Vector3.new(0,-h-1.2,0),ray)
+            if not hit then
+                if force then
+                    task.spawn(function()
+                        repeat task.wait(.5) until not folder or not folder.Parent or context.Character()~=model or self:Clear(false)
+                        if folder and folder.Parent and context.Character()~=model then folder:Destroy() folder=nil end
+                    end)
+                end
+                return false
+            end
+        end
+        folder:Destroy() folder=nil self.Folder=nil table.clear(self.Parts)
+        return true
+    end
+    function self:Release()
+        self.Cancelled=true
+        local _,human,root=context.Character()
+        if human and root then human:MoveTo(root.Position) end
+        if self:Clear(false) then return end
+        task.spawn(function()
+            while folder and folder.Parent do
+                task.wait(.5)
+                if context.Character()~=characterAt or self:Clear(false) then self:Clear(true) return end
+            end
+        end)
+    end
+    local function walkSegment(points,ray,stage,total)
+        local model,human,root=context.Character()
+        if not root then return false,"Character unavailable" end
+        local height=clearance(model,human,root)
+        local index,nextCommand,lastGoal=2,0,nil
+        local lastJump,lastJumpIndex=-math.huge,0
+        local forceJumpIndex, nextForcedJump=nil,0
+        local alternateLanding=false
+        local progressAt,best,previous,previousAt=os.clock(),math.huge,root.Position,os.clock()
+        local deadline=os.clock()+math.max(12,#points*1.5)
+        local function prepare(untilIndex)
+            for i=index,untilIndex do
+                local point=points[i]
+                if not point.Natural and not point.Pad then
+                    if context.Supports()==false then return false end
+                    point.Pad=addPad(points[i-1].Point,point.Point)
+                    if not point.Pad then return false end
+                end
+            end
+            return true
+        end
+        while active() and os.clock()<deadline do
+            if human.Health<=0 or not root.Parent then return false,"Character changed" end
+            local now=os.clock()
+            local travelled=flat(root.Position-previous).Magnitude
+            local dt=math.min(.2,now-previousAt)
+            if (root.Position-previous).Magnitude>14 then
+                self.Statistics.Pullbacks+=1
+                return false,"Character relocated; stop this route"
+            end
+            if travelled>.08 then self.Statistics.MovingSeconds+=dt else self.Statistics.IdleSeconds+=dt end
+            previous,previousAt=root.Position,now
+            local current=points[index]
+            local distance=flat(root.Position-current.Point).Magnitude
+            local feet=root.Position.Y-height
+            local standing=human.FloorMaterial~=Enum.Material.Air
+            local final=index==#points
+            local radius=final and 1.4 or 2.1
+            if distance<=radius and feet>=current.Point.Y-1.8 and feet<=current.Point.Y+8.5
+                and (not final or standing and math.abs(root.AssemblyLinearVelocity.Y)<4) then
+                self.Statistics.Steps+=1
+                prune(root)
+                if final then return true end
+                index+=1 current=points[index]
+                progressAt,best=now,math.huge
+                distance=flat(root.Position-current.Point).Magnitude
+            end
+            if not final and distance<3.5 and feet>current.Point.Y+2 and standing then
+                local nextPoint=points[index+1]
+                if flat(root.Position-nextPoint.Point).Magnitude<6 then
+                    self.Statistics.Steps+=1 index+=1 current=nextPoint
+                    progressAt,best=now,math.huge
+                    distance=flat(root.Position-current.Point).Magnitude
+                end
+            end
+            if feet<current.Point.Y-8 then return false,"Fell below current step" end
+            if distance>12 then return false,"Left current obby checkpoint" end
+            if distance<best-.2 then progressAt,best=now,distance end
+            if now-progressAt>3 then
+                if standing and now>=nextForcedJump then
+                    forceJumpIndex=index nextForcedJump=now+3.5 progressAt=now alternateLanding=true
+                else return false,"Current platform blocked" end
+            end
+            local last=index
+            local rise=current.Point.Y-feet
+            local needJump=rise>2.2 and rise<7 or forceJumpIndex==index
+            if needJump then
+                if alternateLanding and stage==total then
+                    last=#points
+                end
+                -- Aim inside the landing; tiny targets on an overhang make the avatar stop below it.
+                for j=alternateLanding and index or math.min(#points,index+2),index+1,-1 do
+                    if points[j].Natural and math.abs(points[j].Point.Y-current.Point.Y)<1
+                        and flat(points[j].Point-root.Position).Magnitude<10 then last=j break end
+                end
+            else
+                -- On a flat or short support ramp, keep the destination ahead of the avatar.
+                for j=index+1,math.min(#points,index+2) do
+                    if math.abs(points[j].Point.Y-points[j-1].Point.Y)>2 then break end
+                    last=j
+                end
+            end
+            if not prepare(last) then return false,"Enable Obby Step Supports for this gap" end
+            local goal=points[last].Point+Vector3.new(0,height,0)
+            local grounded=standing or root.AssemblyLinearVelocity.Y>-5 and root.AssemblyLinearVelocity.Y<3
+                and human:GetState()~=Enum.HumanoidStateType.Freefall
+            if needJump and grounded and distance<5.5 and now-lastJump>.9 then
+                if (rise>4 and distance<2) or (alternateLanding and stage==total) then
+                    local direction=flat(goal-root.Position)
+                    if direction.Magnitude>.01 then
+                        local back=root.Position-direction.Unit*2.5
+                        local floor=surface(Vector3.new(back.X,feet,back.Z),ray)
+                        if floor and math.abs(floor.Y-feet)<1 then
+                            human:MoveTo(floor+Vector3.new(0,height,0))
+                            self.Statistics.Commands+=1
+                            local untilAt=now+1.8
+                            while active() and flat(root.Position-floor).Magnitude>.8 and os.clock()<untilAt do task.wait(.04) end
+                        end
+                    end
+                end
+                human.Jump=true human:ChangeState(Enum.HumanoidStateType.Jumping)
+                self.Statistics.Jumps+=1
+                if rise<.5 then self.Statistics.FlatJumps+=1 end
+                lastJump,lastJumpIndex=os.clock(),index
+                if alternateLanding and last==#points then index=last progressAt,best=os.clock(),math.huge end
+                alternateLanding=false
+                forceJumpIndex=nil
+                task.wait(.05)
+            end
+            if now>=nextCommand and (not lastGoal or (lastGoal-goal).Magnitude>.7 or now-nextCommand>.7) then
+                human:MoveTo(goal)
+                self.Statistics.Commands+=1
+                nextCommand=now+.12 lastGoal=goal
+            end
+            notify("Obby stage "..(stage-1).." / "..total,stage,index-1)
+            task.wait(.03)
+        end
+        return false,active() and "Current platform timed out" or "Stopped"
+    end
+
+    function self:Walk(nodes)
+        local ray=geometry()
+        if not ray then return false,"Obby terrain not streamed" end
+        local model,human,root=context.Character()
+        if not root then return false,"Character unavailable" end
+        characterAt=model
+        for stage=2,#nodes do
+            if not active() then return false,"Stopped" end
+            local a,b=nodes[stage-1],nodes[stage]
+            local _,_,startRoot=context.Character()
+            if startRoot then
+                local startSurface=surface(a,ray)
+                if startSurface then a=startSurface end
+            end
+            local horizontal=flat(b-a).Magnitude
+            if horizontal>70 or math.abs(b.Y-a.Y)>14 then return false,"Invalid obby checkpoint segment" end
+            local count=math.max(1,math.ceil(horizontal/2.5))
+            local points={}
+            for i=0,count do
+                local expected=a:Lerp(b,i/count)
+                local actual=surface(expected,ray)
+                points[i+1]={Point=actual or expected,Natural=actual~=nil}
+            end
+            -- Small local steps approach the next ledge instead of jumping into its wall.
+            for i=#points-1,2,-1 do
+                local current,nextPoint=points[i],points[i+1]
+                local required=nextPoint.Point.Y-1.4
+                if current.Point.Y<required then
+                    current.Point=Vector3.new(current.Point.X,required,current.Point.Z) current.Natural=false
+                end
+            end
+            if points[2].Point.Y-a.Y>6.5 or points[2].Point.Y-a.Y< -9 then return false,"Next ledge needs a different approach" end
+            local ok,reason=walkSegment(points,ray,stage,#nodes-1)
+            if not ok then return false,reason end
+            notify("Obby checkpoint "..stage.." reached",stage,count)
+        end
+        return true
+    end
+    return self
+end
+
 local Automation = (function()
     local controller = {}
     local bridge, mounted, inventoryPages, supports
+    local obbyWalker
     local living, generation, dailyGeneration = true, 0, 0
     local navBusy, navOwner, navTicket, movingHumanoid = false, nil, nil, nil
     local encodedSnapshot, cachedSnapshot
@@ -6530,6 +6812,12 @@ if not ok then attribute("Error", tostring(err)) end
         if humanoid and root and movingHumanoid == humanoid and MovementCoordinator.IsOwner(navOwner, navTicket) then humanoid:MoveTo(root.Position) end
     end
     local function clearSupports(force)
+        if obbyWalker then
+            local cleared = obbyWalker:Clear(force)
+            supports = obbyWalker.Folder
+            if cleared then obbyWalker = nil end
+            return cleared
+        end
         if not supports then return end
         local model, _, root = character()
         if root and not force then
@@ -6570,73 +6858,22 @@ if not ok then attribute("Error", tostring(err)) end
         movingHumanoid = humanoid
         return Navigation.Walk(destination, valid, radius)
     end
-    local function buildObbySupport(startSurface, finishSurface)
-        clearSupports(true)
-        supports = Instance.new("Folder")
-        supports.Name = "BonesHubDailyObbySupports"
-        supports.Parent = workspace
-        local startPoint = startSurface - Vector3.new(0, 0.55, 0)
-        local finishPoint = finishSurface - Vector3.new(0, 0.55, 0)
-        local center = startPoint:Lerp(finishPoint, 0.5)
-        local part = Instance.new("Part")
-        part.Name, part.Anchored, part.CanCollide, part.CanTouch, part.CanQuery = "ObbySupport", true, true, false, true
-        part.Material, part.Transparency = Enum.Material.SmoothPlastic, 0.58
-        part.Size = Vector3.new(5.5, 1.1, (finishPoint - startPoint).Magnitude + 4)
-        part.CFrame = CFrame.lookAt(center, finishPoint)
-        part.Parent = supports
-        attribute("ObbySupportStart", startSurface)
-        attribute("ObbySupportEnd", finishSurface)
-    end
-    local function jumpObbySegment(finishSurface, valid)
-        local model, humanoid, root = character()
-        if not root then return false, "Character unavailable" end
-        movingHumanoid = humanoid
-        local destination = finishSurface + Vector3.new(0, 3, 0)
-        local flat = Vector3.new(destination.X - root.Position.X, 0, destination.Z - root.Position.Z)
-        local direction = flat.Magnitude > 0 and flat.Unit or Vector3.zero
-        local params = RaycastParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        params.FilterDescendantsInstances = supports and { model, supports } or { model }
-        params.RespectCanCollide = true
-        local deadline, best, lastProgress, nextMove = os.clock() + 9, math.huge, os.clock(), 0
-        while valid() and LocalPlayer.Character == model and humanoid.Health > 0 and os.clock() < deadline do
-            local offset = root.Position - destination
-            local horizontal = Vector3.new(offset.X, 0, offset.Z).Magnitude
-            if horizontal <= 4 and math.abs(offset.Y) <= 7 then movingHumanoid = nil return true end
-            local now = os.clock()
-            if horizontal < best - 0.25 then best, lastProgress = horizontal, now end
-            if now >= nextMove then humanoid:MoveTo(destination) nextMove = now + 0.35 end
-            if humanoid.FloorMaterial ~= Enum.Material.Air then
-                local ahead = workspace:Raycast(root.Position + direction * 2 + Vector3.new(0, 1, 0), Vector3.new(0, -6, 0), params)
-                if not ahead or finishSurface.Y > root.Position.Y - 2 and horizontal < 14 then humanoid.Jump = true end
-            end
-            if now - lastProgress > 2.8 then movingHumanoid = nil return false, "Jump stalled" end
-            task.wait(0.08)
-        end
-        movingHumanoid = nil
-        return false, valid() and "Jump timed out" or "Stopped"
-    end
     local function walkObbyRoute(nodes, valid)
-        for index = 2, #nodes do
-            if not valid() then return false, "Stopped" end
-            attribute("ObbyRouteStep", index)
-            dailyStatus = "Obby jump " .. tostring(index - 1) .. " / " .. tostring(#nodes - 1)
-            local moved, reason = jumpObbySegment(nodes[index], valid)
-            if not moved then
-                if not valid() then return false, reason end
-                local _, humanoid, root = character()
-                if not root or humanoid.FloorMaterial == Enum.Material.Air then return false, reason end
-                if Config.DailyObbySupports == false then return false, reason end
-                dailyStatus = "Obby jump stalled; adding short support"
-                local startSurface = Vector3.new(root.Position.X, math.max(nodes[index - 1].Y, root.Position.Y - 3), root.Position.Z)
-                buildObbySupport(startSurface, nodes[index])
-                moved, reason = movePoint(nodes[index] + Vector3.new(0, 3, 0), valid, 4, 9)
-                if not moved then return false, reason end
-                clearSupports()
-            end
-            task.wait(0.12)
-        end
-        return true
+        obbyWalker = ObbyRoute.Create({
+            Character = character, Valid = valid,
+            Supports = function() return Config.DailyObbySupports ~= false end,
+            Status = function(message, stage, step, statistics)
+                dailyStatus = message
+                attribute("ObbyRouteStep", stage) attribute("ObbyMicroStep", step)
+                attribute("ObbySupportCount", statistics.Supports)
+                attribute("ObbyMaxSupportLength", statistics.MaxPartLength)
+                supports = obbyWalker and obbyWalker.Folder
+            end,
+        })
+        local ok, reason = obbyWalker:Walk(nodes)
+        supports = obbyWalker.Folder
+        if not ok then obbyWalker:Release() end
+        return ok, reason
     end
     local function travel(destination, valid, radius)
         local _, _, root = character()
@@ -6758,16 +6995,16 @@ if not ok then attribute("Error", tostring(err)) end
             equipmentNext = math.max(equipmentNext, os.clock() + 5)
         end)
     end
-    local function obby(valid, quest)
-        if Config.DailyObby ~= true then
+    local function obby(valid, quest, manual)
+        if not manual and Config.DailyObby ~= true then
             dailyStatus = "Obby skipped"
             obbyNext = os.clock() + 600
             return
         end
         if obbyFailures >= 2 then
             obbyFailures = 0
-            dailyStatus = "Obby disabled after repeated failures"
-            obbyNext = os.clock() + 1800
+            dailyStatus = "Obby paused after route failure; retrying shortly"
+            obbyNext = os.clock() + 90
             return
         end
         local map = workspace:FindFirstChild("Map")
@@ -6776,17 +7013,16 @@ if not ok then attribute("Error", tostring(err)) end
         if not giver or not giver:IsA("BasePart") then dailyStatus = "Obby reward not streamed" dailyNext = os.clock() + 20 return end
         clearSupports()
         if supports then dailyStatus = "Walk off the previous support path" dailyNext = os.clock() + 15 return end
+        local before = snapshot()
+        local function blessingTimestamp()
+            local ok, buffs = pcall(require, ReplicatedStorage.Storage.Buffs)
+            if not ok or type(buffs) ~= "table" or type(buffs.GetState) ~= "function" then return end
+            local good, state = pcall(buffs.GetState, buffs, "Basic Blessing")
+            return good and type(state) == "table" and (tonumber(state.StartTime) or tonumber(state.ExpireTime)) or nil
+        end
+        local previousBlessing = blessingTimestamp()
         local target = giver.Position
-        local route = {
-            Vector3.new(112, 92, -528.5), Vector3.new(171.5, 96, -523.5),
-            Vector3.new(195.5, 89, -570), Vector3.new(202.09, 87, -599.79),
-            Vector3.new(208.5, 95, -615.5), Vector3.new(208.5, 98, -627.5),
-            Vector3.new(192, 90, -653), Vector3.new(158, 97, -681),
-            Vector3.new(130.5, 95, -675), Vector3.new(104, 96, -657.5),
-            Vector3.new(69, 102, -646.5), Vector3.new(58.5, 110, -628.5),
-            Vector3.new(50.5, 117, -634.5), Vector3.new(46, 125, -622),
-            Vector3.new(49.5, 132, -618.5),
-        }
+        local route = ObbyRoute.Anchors
         local _, _, root = character()
         if not root then return end
         if (root.Position - target).Magnitude > 14 or root.Position.Y < target.Y - 9 then
@@ -6811,12 +7047,18 @@ if not ok then attribute("Error", tostring(err)) end
         repeat
             task.wait(0.2)
             local current = snapshot()
-            local latest = taskAt(current, quest.Index)
+            local latest = quest and taskAt(current, quest.Index)
             confirmed = latest and latest.Id == quest.Id and latest.Progress > quest.Progress
+                or (function()
+                    local value = blessingTimestamp()
+                    return value ~= nil and (previousBlessing == nil or value > previousBlessing + 1)
+                end)()
         until confirmed or not valid() or os.clock() >= deadline
         obbyNext = os.clock() + (tonumber(giver:GetAttribute("Delay")) or 120)
-        dailyStatus = confirmed and "Obby progress confirmed" or "Obby unconfirmed; waiting for cooldown"
+        if confirmed then obbyFailures = 0 attribute("ObbyConfirmedAt", workspace:GetServerTimeNow()) end
+        dailyStatus = confirmed and "Obby reward confirmed" or "Obby reached; reward not confirmed yet"
         clearSupports()
+        attribute("ObbyLastSuccess", confirmed == true)
     end
     local function clearCollection()
         for _, connection in ipairs(collectConnections) do connection:Disconnect() end
@@ -7023,8 +7265,19 @@ if not ok then attribute("Error", tostring(err)) end
         UI:AddDivider(page, "Daily Quests")
         toggles.Daily = UI:AddToggle(page, "Auto Daily Quests", Config.AutoDailyQuests, function(value) controller.SetEnabled("Daily", value) end)
         toggles.Claim = UI:AddToggle(page, "Auto Claim Daily Rewards", Config.AutoClaimDailyRewards, function(value) controller.SetEnabled("Claim", value) end)
-        UI:AddToggle(page, "Obby Stuck Recovery", Config.DailyObbySupports ~= false, function(value) Config.DailyObbySupports = value == true if not value and navOwner ~= "Daily" then clearSupports(true) end saveConfig() end)
+        UI:AddToggle(page, "Auto Basic Blessing Obby", Config.DailyObby == true, function(value)
+            Config.DailyObby = value == true
+            dailyGeneration += 1 dailyNext, obbyNext = 0, 0
+            if not value and obbyWalker then obbyWalker.Cancelled = true end
+            saveConfig()
+        end)
+        UI:AddToggle(page, "Obby Step Supports", Config.DailyObbySupports ~= false, function(value) Config.DailyObbySupports = value == true if not value and navOwner ~= "Daily" then clearSupports(true) end saveConfig() end)
+        UI:AddButtonRow(page, {{ Text = "Run Basic Blessing Obby Once", Callback = function() controller.RunObbyOnce() end }})
         for _, name in ipairs({ "Daily Status", "Daily Reset", "Task 1", "Task 2", "Task 3", "Reward Status" }) do metrics[name] = UI:AddMetricRow(page, { { Label = name, Value = "Waiting for data" } })[1] end
+    end
+    function controller.RunObbyOnce()
+        if navBusy then return false, "Another task is moving" end
+        return beginNavigation("Daily", function() return Alive end, function(valid) obby(valid, nil, true) end)
     end
     function controller.OpenJake()
         if not bridge or not bridge.Parent then return false end
@@ -7083,6 +7336,9 @@ if not ok then attribute("Error", tostring(err)) end
             DailyEnabled = Config.AutoDailyQuests, ClaimEnabled = Config.AutoClaimDailyRewards,
             WeatherPotionAmounts = copy(Config.WeatherPotionAmounts), WeatherEnabled = Config.AutoWeatherPotions, EquipmentEnabled = Config.AutoEquipment, DeleteEnabled = Config.AutoDeleteAuras,
             Navigating = navBusy, MovementOwner = navOwner, Error = bridge and bridge:GetAttribute("Error"),
+            ObbyEnabled = Config.DailyObby == true, ObbyStep = bridge and bridge:GetAttribute("ObbyRouteStep"),
+            ObbyMicroStep = bridge and bridge:GetAttribute("ObbyMicroStep"),
+            ObbySupports = bridge and bridge:GetAttribute("ObbySupportCount"), ObbyConfirmedAt = bridge and bridge:GetAttribute("ObbyConfirmedAt"),
             JakeStatus = bridge and bridge:GetAttribute("JakeRecovery"),
             UseSent = bridge and bridge:GetAttribute("UseSent") or 0, PotionsUsed = bridge and bridge:GetAttribute("PotionsUsed") or 0,
             ClaimSent = bridge and bridge:GetAttribute("ClaimSent") or 0, ClaimsConfirmed = bridge and bridge:GetAttribute("ClaimsConfirmed") or 0,
@@ -10968,6 +11224,7 @@ function API.SendSessionDigest() return sendDigest() end
 function API.SetAutoReexecute(value) return Reexecution.SetEnabled(value) end
 function API.GetReexecutionState() return Reexecution.GetState() end
 function API.GetAutomationState() return Automation.GetState() end
+function API.RunBasicBlessingObby() return Automation.RunObbyOnce() end
 function API.OpenJakeWorkshop() return Automation.OpenJake() end
 function API.SetMerchantQuantity(merchant, name, value) return MerchantAutomation.SetQuantity(merchant, name, value) end
 function API.SetWeatherPotionQuantity(name, value) return Automation.SetPotionQuantity(name, value) end
