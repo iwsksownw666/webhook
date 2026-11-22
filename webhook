@@ -16,7 +16,7 @@ ENV.__BONES_HUB_BOOT_STARTED = bootStarted
 local API_KEY = "__BONES_HUB_MACRO"
 local LEGACY_API_KEY = "__SLA" .. "OQ_BIOME_MACRO"
 local UI_ROOT_NAME = "BonesHubUI"
-local SCRIPT_VERSION = "3.79"
+local SCRIPT_VERSION = "3.80"
 local LEGACY_UI_ROOT_NAME = "Sla" .. "oqUI"
 if type(ENV[API_KEY]) == "table" and type(ENV[API_KEY].Destroy) == "function" then
     pcall(ENV[API_KEY].Destroy)
@@ -1292,7 +1292,7 @@ local MovementCoordinator = (function()
         return ticket
     end
     local function fishingBusy(nextOwner)
-        if nextOwner~="Merchant" and nextOwner~="Halloween" then return false end
+        if nextOwner~="Merchant" and nextOwner~="Halloween" and nextOwner~="Daily" then return false end
         local b=game:GetService("CoreGui"):FindFirstChild("BonesHubFishingBridge")
         if not b or b:GetAttribute("Active")~=true then return false end
         -- Publish the handoff before checking the round, closing the instant-recast race.
@@ -1476,7 +1476,7 @@ local Navigation = (function()
         local best, bestScore
 
         local checked = 0
-        for _, distance in ipairs({ 4, 7 }) do
+        for _, distance in ipairs({ 4, 7, 10, 14 }) do
             for _, angle in ipairs({ 90, -90, 135, -135, 180, 45, -45 }) do
                 if not active() or root.Anchored or os.clock() >= deadline then return false end
                 checked += 1
@@ -1511,6 +1511,13 @@ local Navigation = (function()
         return flat(root.Position-start).Magnitude > 1
     end
 
+    function controller.Recover(destination, valid)
+        local model, humanoid, root = character()
+        if not model or root.Anchored then return false end
+        return escape(model, humanoid, root, destination, function()
+            return Alive and valid() and LocalPlayer.Character == model and humanoid.Health > 0
+        end, os.clock() + 4)
+    end
     function controller.TryStep(model, humanoid, root, destination)
         if root.Anchored or humanoid.Health <= 0 or humanoid.FloorMaterial == Enum.Material.Air then return false end
         if stepHumanoid == humanoid and os.clock() - stepAt < 0.8 then return false end
@@ -1663,7 +1670,6 @@ local Navigation = (function()
                         local top = blocker.Position.Y
                         local landing = workspace:Raycast(Vector3.new(blocker.Position.X, top + 3.2, blocker.Position.Z), Vector3.new(0, -4.5, 0), ray)
                         if landing and landing.Normal.Y >= 0.7 and top - (root.Position.Y - height) <= 4 then
-                            jumpLast, jumpCount = -math.huge, 0
                             if requestJump(humanoid, root, position) then statusJumpRescues += 1 end
                         end
                     end
@@ -4522,7 +4528,7 @@ local FishingAutomation = (function()
     local controller = {}
     local bridge, metrics, selector
     local enabled, autoSell, early, living = Config.AutoFish == true, Config.AutoSellFish == true, Config.EarlyFishing == true, true
-    local taskEnabled, forceOff = false, Config.AutoFish ~= true
+    local taskEnabled, forceOff = false, false
     local areas, blocked = {}, {}
     local epoch, nextAttempt, sellSequence = 0, 0, 0
     local sellRequested, selling, saleFault = false, false, false
@@ -4598,8 +4604,9 @@ local FishingAutomation = (function()
     function controller.SetTaskEnabled(value)
         value = value == true and not forceOff
         if taskEnabled == value then return end
+        local wasEnabled = enabled or taskEnabled
         taskEnabled = value
-        cancel()
+        if wasEnabled ~= (enabled or taskEnabled) then cancel() end
         if bridge then bridge:SetAttribute("Enabled", (enabled or taskEnabled) and not forceOff) end
     end
 
@@ -9954,7 +9961,6 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Casting", false)
     end
     local function moveDirect(humanoid, root, goal, urgent)
         if Navigation.TryStep then Navigation.TryStep(LocalPlayer.Character, humanoid, root, goal) end
-        assistStep(humanoid, root, goal)
         if urgent or not moveGoal or (moveGoal - goal).Magnitude > 2.5 or os.clock() - lastCommand > 1.5 then
             if os.clock() - lastCommand >= 0.15 or urgent then
                 humanoid:MoveTo(goal) lastCommand, moveGoal = os.clock(), goal
@@ -9994,8 +10000,10 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Casting", false)
             local hit=workspace:Raycast(candidate+Vector3.new(0,10,0),Vector3.new(0,-60,0),params)
             if hit and hit.Normal.Y>=0.65 then
                 local standing=hit.Position+Vector3.new(0,3,0)
-                if math.abs(standing.Y-point.Position.Y)<=(bridge and bridge:GetAttribute("AttackMaxHeight") or 6) and not workspace:Raycast(standing,point.Position-standing,params) then
+                if math.abs(standing.Y-point.Position.Y)<=(bridge and bridge:GetAttribute("AttackMaxHeight") or 6) then
                     fallback=fallback or hit.Position
+                    local sightBlocked=workspace:Raycast(standing,point.Position-standing,params)
+                    if sightBlocked then continue end
                     local direct=groundGoal(candidate,model,root)
                     if direct and (direct-root.Position).Magnitude<=60 then
                         local samples=math.max(1,math.ceil((direct-root.Position).Magnitude/6))
@@ -10148,10 +10156,11 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Casting", false)
                     humanoid:MoveTo(forced)
                     lastCommand, moveGoal = os.clock(), forced
                 end
-                if humanoid and stuckCount % 2 == 0 then humanoid.Jump = true end
+                if humanoid and forced and stuckCount % 2 == 0 and Navigation.TryStep then
+                    Navigation.TryStep(model, humanoid, root, forced)
+                end
                 if stuckCount >= 3 then
-                    unreachable[target] = os.clock() + 3
-                    target, targetRoot = nil, nil
+                    forcePathUntil = os.clock() + 15
                     stuckCount = 0
                     approachPhase = (approachPhase + 1) % 8
                     status = "Target unreachable; picking another"
@@ -10358,9 +10367,10 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Casting", false)
             humanoid:MoveTo(root.Position)
             routeReason=lastRecovery
             if combatWatch.Failures>=3 then
-                unreachable[target]=os.clock()+12 combatHoldUntil=os.clock()+12
-                target,targetRoot=nil,nil attribute("Permit",false)
-                status="Temporarily skipping unresponsive target" return
+                combatWatch.Failures=0
+                approachPhase=(approachPhase+1)%8 forcePathUntil=os.clock()+15
+                attribute("Permit",false)
+                status="Repositioning for the same target" return
             end
         end
 
@@ -10378,7 +10388,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Casting", false)
             lastRecovery="Pursuit stalled; changing approach route" routeReason=lastRecovery
             humanoid:MoveTo(root.Position) status="Recovering stalled pursuit"
             if directStalls>=3 then
-                unreachable[target]=os.clock()+3 target,targetRoot=nil,nil nextChoice=0 directStalls=0 attribute("Permit",false)
+                approachPhase=(approachPhase+1)%8 nextChoice=0 directStalls=0 attribute("Permit",false)
             end
         elseif not moving and os.clock()-lastProgressAt > 1.5 then
             moveEpoch += 1 moving=false nextChase=os.clock()+0.4
@@ -10387,7 +10397,7 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Casting", false)
             lastProgressAt=os.clock() lastPosition=root.Position
             routeReason="Direct route stalled; switching to pathfinding" status="Finding another route"
             if directStalls >= 3 then
-                unreachable[target]=os.clock()+2 target,targetRoot=nil,nil lastPosition=nil directStalls=0
+                approachPhase=(approachPhase+1)%8 lastPosition=nil directStalls=0
                 attribute("Permit",false)
             end
         elseif not moving and os.clock() >= nextChase then
@@ -10395,7 +10405,12 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Casting", false)
             if goal and bridge:GetAttribute("NeedsApproach")==true and Vector3.new(goal.X-root.Position.X,0,goal.Z-root.Position.Z).Magnitude<3.5 then
                 approachPhase=(approachPhase+1)%8 goal,direct=chaseGoal(model,root,targetRoot,range)
             end
-            if not goal then unreachable[target]=os.clock()+3 target,targetRoot=nil,nil attribute("Permit",false) status="Finding reachable ground" return end
+            if not goal then
+                approachPhase=(approachPhase+1)%8 nextChase=os.clock()+1
+                attribute("Permit",false) status="Finding another approach to "..HalloweenRules.Label(target)
+                routeReason="No suitable attack position; retrying"
+                return
+            end
             if HalloweenRules.Danger(goal, warnings, Config.HalloweenDodgeMargin, now) > 0 then
                 if not approachBlockedSince then approachBlockedSince = os.clock() end
                 if os.clock() - approachBlockedSince < 3 then attribute("Permit", false) status = "Waiting for attack area to clear" return end
@@ -10418,7 +10433,20 @@ attr("DataReady", false) attr("InventoryReserved", false) attr("Casting", false)
                     lastPosition,lastProgressAt=root.Position,os.clock()
                     if not worked or not reached then
                         routeReason=tostring(not worked and reached or reason or "Route incomplete")
-                        if target==selected then unreachable[selected]=os.clock()+2 target,targetRoot=nil,nil attribute("Permit",false) end
+                        if target==selected then
+                            approachPhase=(approachPhase+1)%8 forcePathUntil=os.clock()+15 nextChase=os.clock()+.4
+                            attribute("Permit",false)
+                            moving=true
+                            local recovered=Navigation.Recover(goal,function()
+                                return valid(token) and target==selected and MovementCoordinator.IsOwner("Halloween",lease)
+                                    and not MovementCoordinator.Wants("Merchant")
+                            end)
+                            if moveEpoch==serial then
+                                moving=false
+                                routeReason=recovered and "Moved around obstacle; retrying target" or "Route blocked; retrying another approach"
+                                lastPosition,lastProgressAt=root.Position,os.clock()
+                            end
+                        end
                     else routeReason="Arrived" directStalls=0 end
                 end
             end)
